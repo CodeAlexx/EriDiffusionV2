@@ -11,7 +11,8 @@ reference/
 /cache/
 /Samples/
 
-# Markdown — only README.md ships with the public repo. Local design /
-# audit / handoff notes stay on disk but aren't tracked.
+# Markdown — local design / audit / handoff notes stay on disk but
+# aren't tracked. Explicit exceptions for documentation that ships.
 *.md
 !README.md
+!PARITY_SIMPLETUNER.md
