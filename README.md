@@ -23,20 +23,31 @@ Identical hardware, dataset (118-sample eri2 at 512 with aspect bucketing), LoRA
 
 ## Trainers
 
-| Model | Binaries (under `crates/eridiffusion-cli/src/bin/`) | Status |
-| --- | --- | --- |
-| Z-Image | `train_zimage`, `prepare_zimage`, `sample_zimage` | end-to-end |
-| ERNIE-Image | `train_ernie`, `prepare_ernie`, `sample_ernie` | end-to-end |
-| **Klein (FLUX.2)** | `train_klein`, `prepare_klein`, `sample_klein` | **head-to-head verified** |
-| FLUX.1 | `train_flux`, `prepare_flux`, `sample_flux` | works |
-| SD3.5 Medium | `train_sd35`, `prepare_sd35`, `sample_sd35` | works |
-| SDXL | `train_sdxl`, `prepare_sdxl`, `sample_sdxl` | works |
-| Anima (Cosmos-Predict2 + LLM-Adapter) | `train_anima`, `prepare_anima`, `sample_anima` | rank-32 smoke clean |
-| Qwen-Image-2512 | `train_qwenimage`, `prepare_qwenimage`, `sample_qwenimage` | end-to-end |
-| LTX-2 | `train_ltx2`, `prepare_ltx2`, `sample_ltx2` | works |
-| ACE-Step | `train_acestep` | model port; needs Python prep tensors |
-| Chroma | model + sampler ported | trainer binary on demand |
-| Wan 2.x | blocked — needs `inference_flame::wan22_dit` lifted | — |
+> **⚠ Status note (2026-05-15):** the May 15 flame-core redesign (R1a–R2c)
+> introduced breaking changes to the launcher, dispatcher, and autograd —
+> static-slab allocator, range-aware BF16 trap, frozen-weight gradient
+> skip in `Op::MatMul` / `Op::Mul` / `RmsNorm`, OT-style conductor offload
+> policy, checkpoint-recompute prefetch hook, raw-CudaSlice drop wiring,
+> and several BF16 alloc routing fixes. Only **Klein 9B** has been
+> re-verified end-to-end against the new stack. Every other trainer in
+> the table below worked against the pre-R1a flame-core; their status is
+> **carry-over and untested under the current flame-core**. Re-verification
+> per model is the next round of work.
+
+| Model | Binaries (under `crates/eridiffusion-cli/src/bin/`) | Last known status | Verified against current flame-core? |
+| --- | --- | --- | --- |
+| **Klein (FLUX.2)** | `train_klein`, `prepare_klein`, `sample_klein` | head-to-head vs OT, 100 steps, May 15 | ✅ verified |
+| Z-Image | `train_zimage`, `prepare_zimage`, `sample_zimage` | end-to-end (pre-R1a) | ❓ untested |
+| ERNIE-Image | `train_ernie`, `prepare_ernie`, `sample_ernie` | end-to-end (pre-R1a) | ❓ untested |
+| FLUX.1 | `train_flux`, `prepare_flux`, `sample_flux` | works (pre-R1a) | ❓ untested |
+| SD3.5 Medium | `train_sd35`, `prepare_sd35`, `sample_sd35` | works (pre-R1a) | ❓ untested |
+| SDXL | `train_sdxl`, `prepare_sdxl`, `sample_sdxl` | works (pre-R1a) | ❓ untested |
+| Anima (Cosmos-Predict2 + LLM-Adapter) | `train_anima`, `prepare_anima`, `sample_anima` | rank-32 smoke clean (pre-R1a) | ❓ untested |
+| Qwen-Image-2512 | `train_qwenimage`, `prepare_qwenimage`, `sample_qwenimage` | end-to-end (pre-R1a) | ❓ untested |
+| LTX-2 | `train_ltx2`, `prepare_ltx2`, `sample_ltx2` | works (pre-R1a) | ❓ untested |
+| ACE-Step | `train_acestep` | model port; needs Python prep tensors | ❓ untested |
+| Chroma | model + sampler ported | trainer binary on demand | ❓ untested |
+| Wan 2.x | blocked — needs `inference_flame::wan22_dit` lifted | — | n/a |
 
 LoRA, LoCon, LoHa, LoKr (via the in-repo LyCORIS port) are supported across all trainers that have shipped. Full fine-tune is supported on most, but LoRA is the production target.
 
