@@ -4,16 +4,9 @@ Pure-Rust diffusion-model training framework. Built on [`flame-core`](https://gi
 
 ## Why
 
-OneTrainer and SimpleTuner are the open-source reference points. Both are PyTorch. EriDiffusion takes the same trainer shape (data prep → tape → forward → loss → backward → optimizer → sample/save) and re-implements it in Rust against custom CUDA kernels, with the explicit goal of **matching or exceeding** the reference trainers on wall-clock per step.
+A pure-Rust trainer for diffusion models, against custom CUDA kernels, with no Python on the runtime path. The full pipeline — data prep, autograd, optimizer, sampler, save/resume — lives in this repo and `flame-core`. The design target is large-model LoRA training on a single 24 GB consumer GPU at wall-clock parity with the fastest established trainers.
 
-As of 2026-05-15, on a 24 GB consumer GPU, Klein 9B (FLUX.2-klein-base-9B) LoRA training:
-
-| Trainer | Pure-training s/step (steady, 100 steps) | Total wall (100 steps, incl. setup) |
-| --- | --- | --- |
-| OneTrainer | 2.79 s/step | 574 s |
-| **EriDiffusion v2** | **2.30 s/step** (−18%) | **271 s** (2.12× faster end-to-end) |
-
-Identical hardware, dataset (118-sample eri2 at 512 with aspect bucketing), LoRA r16/α16, AdamW (β1=0.9, β2=0.999, ε=1e-8, wd=0.01), lr 3e-5, batch 1, bf16, 100 steps, `--offload`. See [`flame-core/docs/FLAME_MODULES.md`](https://github.com/CodeAlexx/Flame/blob/main/docs/FLAME_MODULES.md) → `offload/mod.rs` for telemetry.
+As of 2026-05-15, on a 24 GB consumer GPU, Klein 9B (FLUX.2-klein-base-9B) LoRA training runs at **2.30 s/step steady-state** (steps 11–100, 100-step run), **271 s total wall** including model load + offloader init + Adam prewarm. Settings: dataset 118 samples at 512 with aspect bucketing, LoRA r16/α16, AdamW (β1=0.9, β2=0.999, ε=1e-8, wd=0.01), lr 3e-5, batch 1, bf16, `--offload`. See [`flame-core/docs/FLAME_MODULES.md`](https://github.com/CodeAlexx/Flame/blob/main/docs/FLAME_MODULES.md) → `offload/mod.rs` for telemetry.
 
 ## Companion repos
 
@@ -26,7 +19,7 @@ Identical hardware, dataset (118-sample eri2 at 512 with aspect bucketing), LoRA
 > **⚠ Status note (2026-05-15):** the May 15 flame-core redesign (R1a–R2c)
 > introduced breaking changes to the launcher, dispatcher, and autograd —
 > static-slab allocator, range-aware BF16 trap, frozen-weight gradient
-> skip in `Op::MatMul` / `Op::Mul` / `RmsNorm`, OT-style conductor offload
+> skip in `Op::MatMul` / `Op::Mul` / `RmsNorm`, resident-set conductor offload
 > policy, checkpoint-recompute prefetch hook, raw-CudaSlice drop wiring,
 > and several BF16 alloc routing fixes. Only **Klein 9B** has been
 > re-verified end-to-end against the new stack. Every other trainer in
@@ -36,7 +29,7 @@ Identical hardware, dataset (118-sample eri2 at 512 with aspect bucketing), LoRA
 
 | Model | Binaries (under `crates/eridiffusion-cli/src/bin/`) | Last known status | Verified against current flame-core? |
 | --- | --- | --- | --- |
-| **Klein (FLUX.2)** | `train_klein`, `prepare_klein`, `sample_klein` | head-to-head vs OT, 100 steps, May 15 | ✅ verified |
+| **Klein (FLUX.2)** | `train_klein`, `prepare_klein`, `sample_klein` | 100-step Klein 9B + offload, May 15 | ✅ verified |
 | Z-Image | `train_zimage`, `prepare_zimage`, `sample_zimage` | end-to-end (pre-R1a) | ❓ untested |
 | ERNIE-Image | `train_ernie`, `prepare_ernie`, `sample_ernie` | end-to-end (pre-R1a) | ❓ untested |
 | FLUX.1 | `train_flux`, `prepare_flux`, `sample_flux` | works (pre-R1a) | ❓ untested |
@@ -49,7 +42,7 @@ Identical hardware, dataset (118-sample eri2 at 512 with aspect bucketing), LoRA
 | Chroma | model + sampler ported | trainer binary on demand | ❓ untested |
 | Wan 2.x | blocked — needs `inference_flame::wan22_dit` lifted | — | n/a |
 
-LoRA, LoCon, LoHa, LoKr (via the in-repo LyCORIS port) are supported across all trainers that have shipped. Full fine-tune is supported on most, but LoRA is the production target.
+LoRA is the production target across all trainers that have shipped. **LyCORIS variants** (LoCon, LoHa, LoKr) are wired in via the in-repo `crates/eridiffusion-core/src/lycoris.rs` port, but the layer is still under active work and not yet end-to-end functional on every trainer — treat LyCORIS support as in-progress. Full fine-tune is supported on most trainers.
 
 ## What's actually in this repo
 
@@ -138,7 +131,7 @@ target/release/train_klein \
 
 ## Performance & memory innovations
 
-What gives EDv2 its current edge over OT on this hardware:
+What drives EDv2's current per-step wall on this hardware:
 
 ### 1. Static-slab allocator with strict-reset guard (R1a–R2c, May 2026)
 
@@ -146,9 +139,9 @@ Transient per-step BF16/F32 allocations land in a single large `cudaMalloc`'d sl
 
 Adam `m`/`v` is **pre-warmed** before the slab env-flag activates so optimizer state lands in the legacy pool. The pre-warm hook (`Adam::ensure_state_initialized` / `AdamW::ensure_state_initialized`) is called from `train_klein.rs` right before `FLAME_USE_STATIC_SLAB=1` is set.
 
-### 2. OT-style resident-set offloader (R2c-perf)
+### 2. Resident-set conductor for block offloading (R2c-perf)
 
-`flame_core::offload::BlockOffloader` replaces the original two-slot ping-pong with a conductor modelled on OneTrainer's `LayerOffloadConductor`:
+`flame_core::offload::BlockOffloader` replaces the original two-slot ping-pong with a resident-set conductor policy:
 
 - Knows forward AND backward traversal — pre-stages block N-1 during backward replay of block N.
 - Fractional VRAM budget instead of fixed slot count (`FLAME_BLOCK_OFFLOAD_SLOTS` is now a ceiling, not the policy itself).
