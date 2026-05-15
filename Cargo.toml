@@ -6,7 +6,12 @@ members = [
 ]
 
 [workspace.dependencies]
-flame-core = { path = "../flame-core" }
+# Pinned to flame-core 26.15.1 (R1a–R2c — OT-static-slab redesign).
+# This minor version is the ABI gate: a breaking flame-core change must
+# bump MINOR (e.g. 26.16.x) and EDv2 must be updated accordingly in
+# lockstep. The `path` keeps local-dev fast; the `version` constraint
+# is enforced by Cargo against flame-core's own [package] version.
+flame-core = { path = "../flame-core", version = "=26.15.1" }
 lycoris-rs = { path = "../eri-lycoris/lycoris-rs" }
 cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
 serde = { version = "1", features = ["derive"] }
