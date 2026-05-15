@@ -13,7 +13,7 @@ As of 2026-05-15, on a 24 GB consumer GPU, Klein 9B (FLUX.2-klein-base-9B) LoRA 
 - [`flame-core`](https://github.com/CodeAlexx/Flame) — tensor library, autograd v3, CUDA kernels, optimizer states, block offloader, static-slab allocator. EDv2 is its biggest consumer.
 - [`inference-flame`](https://github.com/CodeAlexx/inference-flame) — inference-only counterpart. Shares model definitions with EDv2 trainers.
 - [`cudarc-pinctx`](https://github.com/CodeAlexx/cudarc-pinctx) — vendored cudarc 0.11.9 + flame-core-specific patches (external-pointer Drop hook, sync-alloc escape hatch, pinned-context plumbing).
-
+This also applies to flame-inference, some may work some may not. a massive speed gains across the entire engine.
 ## Trainers
 
 > **⚠ Status note (2026-05-15):** the May 15 flame-core redesign (R1a–R2c)
