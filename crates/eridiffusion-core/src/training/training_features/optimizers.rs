@@ -8,13 +8,13 @@
 //! allocators.
 //!
 //! Tensor-level implementations (no fused CUDA kernels) — same path quality
-//! as the pre-fused PyTorch references. AdamW8bit is a partial port: state
-//! is quantized between steps to reduce host memory, but the math runs in
-//! F32 (no custom 8-bit kernel). Documented at the AdamW8bit struct.
+//! as the pre-fused PyTorch references. AdamW8bit dispatches into a fused
+//! NVRTC kernel in `flame_core::adam8bit_kernel` for bnb 0.49.2 parity; see
+//! the doc-comment on `AdamW8bit` for the storage layout and numerics.
 //!
 //! All implementations follow the algorithms verbatim; references inline.
 
-use flame_core::{parameter::Parameter, DType, Result, Tensor, TensorId};
+use flame_core::{parameter::Parameter, DType, Error, Result, Shape, Tensor, TensorId};
 use std::collections::{hash_map::Entry, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -146,9 +146,13 @@ impl Optimizer {
         weight_decay: f32,
     ) -> Self {
         match kind {
-            OptimizerKind::AdamW => {
-                Self::AdamW(flame_core::adam::AdamW::new(lr, beta1, beta2, eps, weight_decay))
-            }
+            OptimizerKind::AdamW => Self::AdamW(flame_core::adam::AdamW::new(
+                lr,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+            )),
             OptimizerKind::Adafactor => Self::Adafactor(Adafactor::new(lr, eps, weight_decay)),
             OptimizerKind::AdamW8bit => {
                 Self::AdamW8bit(AdamW8bit::new(lr, beta1, beta2, eps, weight_decay))
@@ -160,9 +164,9 @@ impl Optimizer {
             OptimizerKind::StableAdamW => {
                 Self::StableAdamW(StableAdamW::new(lr, beta1, beta2, eps, weight_decay))
             }
-            OptimizerKind::RAdamScheduleFree => Self::RAdamScheduleFree(
-                RAdamScheduleFree::new(lr, beta1, beta2, eps, weight_decay),
-            ),
+            OptimizerKind::RAdamScheduleFree => {
+                Self::RAdamScheduleFree(RAdamScheduleFree::new(lr, beta1, beta2, eps, weight_decay))
+            }
             OptimizerKind::AdamWScheduleFree => {
                 let base = AdamWBase::new(lr, beta1, beta2, eps);
                 Self::AdamWScheduleFree(ScheduleFreeWrapper::new(base, beta1, weight_decay))
@@ -441,7 +445,9 @@ impl Adafactor {
                         e.insert(zeros)
                     }
                 };
-                let new_v = v.mul_scalar(beta2t)?.add(&g_sq.mul_scalar(one_minus_beta2t)?)?;
+                let new_v = v
+                    .mul_scalar(beta2t)?
+                    .add(&g_sq.mul_scalar(one_minus_beta2t)?)?;
                 *v = new_v.detach()?;
                 let v = self.exp_avg_sq.get(&id).unwrap();
                 v.rsqrt()?.mul(&grad_f32)?
@@ -509,33 +515,49 @@ fn rms_scalar(x: &Tensor) -> Result<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// AdamW8bit (partial port)
+// AdamW8bit (bitsandbytes 0.49.2 parity port)
 // ---------------------------------------------------------------------------
 
-/// Host-RAM-frugal AdamW with 8-bit-quantized optimizer state in host memory.
+/// Block-wise dynamic-LUT 8-bit AdamW. Bit-exact-equivalent (modulo BF16
+/// noise on the grad upcast) to bitsandbytes 0.49.2 `optim.AdamW8bit`
+/// (non-paged): **256-element blocks**, two 256-entry dynamic-exponent
+/// qmaps (signed for `m`, unsigned for `v`), fused NVRTC kernel does
+/// dequant + AdamW step + requant in one launch with **no host
+/// round-trip**.
 ///
-/// **HONEST LABEL — read before using.** This implementation is *not* a
-/// performance optimization. With the current design it is **slower than
-/// `flame_core::adam::AdamW`** because every step:
+/// Use for trainers where Python-bnb numerical match matters (v16c-style
+/// parity work) or where VRAM headroom is the constraint (e.g. Wan 2.2
+/// 14B+14B per `feedback_wan22_quant_exception`). Paged variant
+/// (CUDA UM spill to pinned CPU) is a separate variant; not implemented.
 ///
-/// 1. Dequantizes `m` and `v` from a host `Vec<i8>` back to a fresh device
-///    `Tensor` (one PCIe H→D round-trip per param).
-/// 2. Runs the AdamW math at full F32 on-device.
-/// 3. Re-quantizes `m` and `v` back to host int8 (one PCIe D→H round-trip).
+/// State per parameter (`n = param.numel()`):
 ///
-/// VRAM behavior is identical to `AdamW` during the step (full F32 m/v
-/// are materialized) — the savings are entirely in **host RAM** between
-/// steps. The intended use case is trainers with multi-billion-parameter
-/// frozen blocks paged through pinned host memory: keeping optimizer
-/// state quantized stops it from fighting the block-offload cache for
-/// system RAM. **If you don't have that pressure, prefer `AdamW`.**
+/// | Buffer       | Type / size                  | Role |
+/// |--------------|------------------------------|------|
+/// | `m_codes`    | `CudaSlice<u8>` × `n`        | First-moment 8-bit codes (indexed into signed LUT). |
+/// | `v_codes`    | `CudaSlice<u8>` × `n`        | Second-moment 8-bit codes (indexed into unsigned LUT). |
+/// | `m_absmax`   | `CudaSlice<f32>` × `ceil(n/256)` | Per-block scale for `m`. |
+/// | `v_absmax`   | `CudaSlice<f32>` × `ceil(n/256)` | Per-block scale for `v`. |
+/// | `master_f32` | `Option<Tensor<F32>>` × `n`  | Master copy of the param at F32 precision. Lazily allocated only when the param storage is **not** F32 (i.e. BF16). |
 ///
-/// Real bitsandbytes 8-bit AdamW does block-wise dynamic 8-bit quantization
-/// inside a custom CUDA kernel that never round-trips through host. We
-/// don't have that kernel. Implementing it requires writing an NVRTC or
-/// `.cu` kernel (per `flame-core/CLAUDE.md` conventions); when that exists
-/// this struct should be rewritten to use it and this docstring's
-/// "slower than AdamW" warning can be removed.
+/// Per-device, shared across all params, allocated lazily on first step:
+///
+/// | `qmap_signed`   | `CudaSlice<f32>` × 256 | `create_dynamic_map(true)`  |
+/// | `qmap_unsigned` | `CudaSlice<f32>` × 256 | `create_dynamic_map(false)` |
+///
+/// VRAM per parameter relative to F32-state `AdamW`:
+/// `(1 + 1) * n` bytes (codes) + `2 * ceil(n/256) * 4` bytes (absmax)
+/// = ~2.03 bytes/elem vs ~8 bytes/elem for F32 m/v. For BF16 params we
+/// also keep a 4-byte/elem F32 master shadow, bringing the total to
+/// ~6 bytes/elem — still a saving vs the F32-master + F32-m/v path
+/// (4 + 8 = 12 bytes/elem) used by `AdamW` on BF16 params.
+///
+/// Equivalent to bnb's reference behavior: bnb stores master weights at
+/// F32 in `param.data` (PyTorch mixed-precision convention). Our trainers
+/// store params at BF16, so the F32 master shadow is held inside the
+/// optimizer and the BF16 param tensor is regenerated each step via a
+/// BF16↔F32 cast — matching the precision that bnb's F32 param.data
+/// gets after the kernel update.
 pub struct AdamW8bit {
     pub lr: f32,
     beta1: f32,
@@ -543,46 +565,37 @@ pub struct AdamW8bit {
     eps: f32,
     weight_decay: f32,
     t: u32,
-    m_quant: HashMap<TensorId, QuantizedState>,
-    v_quant: HashMap<TensorId, QuantizedState>,
+    /// Per-parameter on-device state. Keyed by `Parameter::id()` which is
+    /// pinned across `set_data` writes (see `Parameter::set_data`).
+    state: HashMap<TensorId, AdamW8bitState>,
+    /// Device-resident qmaps. Allocated on first step from the host
+    /// `create_dynamic_map` output. We assume single-device training (every
+    /// param shares a device); this matches every other optimizer in this
+    /// file. If the device of the first stepped param changes between calls
+    /// we re-upload — cheap (256 floats), correct.
+    qmaps: Option<DeviceQmaps>,
 }
 
-struct QuantizedState {
-    /// Host int8 storage (`i8` for signed first moment, `u8` for unsigned
-    /// second moment — but stored as `i8` because the max-absolute-value
-    /// quantization handles both cases with a single sign-aware scale).
-    data: Vec<i8>,
-    scale: f32,
-    shape: Vec<usize>,
+/// Per-device dynamic LUTs. `device` is the cudarc handle of the device the
+/// LUTs were uploaded to; if a later step sees a different device we
+/// reupload (single-device training assumption).
+struct DeviceQmaps {
+    device: std::sync::Arc<cudarc::driver::CudaDevice>,
+    qmap_signed: cudarc::driver::CudaSlice<f32>,
+    qmap_unsigned: cudarc::driver::CudaSlice<f32>,
 }
 
-impl QuantizedState {
-    fn quantize(t: &Tensor) -> Result<Self> {
-        let host = if t.dtype() == DType::F32 {
-            t.to_vec()?
-        } else {
-            t.to_dtype(DType::F32)?.to_vec()?
-        };
-        let absmax = host.iter().fold(0.0f32, |a, &b| a.max(b.abs())).max(1.0e-30);
-        let scale = absmax / 127.0;
-        let data: Vec<i8> = host
-            .iter()
-            .map(|&x| (x / scale).round().clamp(-127.0, 127.0) as i8)
-            .collect();
-        Ok(Self {
-            data,
-            scale,
-            shape: t.shape().dims().to_vec(),
-        })
-    }
-
-    fn dequantize(
-        &self,
-        device: std::sync::Arc<cudarc::driver::CudaDevice>,
-    ) -> Result<Tensor> {
-        let host: Vec<f32> = self.data.iter().map(|&q| q as f32 * self.scale).collect();
-        Tensor::from_vec(host, flame_core::Shape::from_dims(&self.shape), device)
-    }
+/// On-device per-parameter state. Lifetimes mirror the optimizer instance —
+/// dropped together when the optimizer is dropped.
+struct AdamW8bitState {
+    m_codes: cudarc::driver::CudaSlice<u8>,
+    v_codes: cudarc::driver::CudaSlice<u8>,
+    m_absmax: cudarc::driver::CudaSlice<f32>,
+    v_absmax: cudarc::driver::CudaSlice<f32>,
+    /// F32 master copy. Used only when the param's storage dtype is not F32
+    /// (i.e. BF16). For F32 params we operate on the param's tensor
+    /// directly. `None` until the first step initializes it from the param.
+    master_f32: Option<Tensor>,
 }
 
 impl AdamW8bit {
@@ -594,9 +607,33 @@ impl AdamW8bit {
             eps,
             weight_decay,
             t: 0,
-            m_quant: HashMap::new(),
-            v_quant: HashMap::new(),
+            state: HashMap::new(),
+            qmaps: None,
         }
+    }
+
+    /// Ensure `self.qmaps` is populated for `device`. Reuploads on device
+    /// change (rare; one alloc per device-switch).
+    fn ensure_qmaps(
+        &mut self,
+        device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<()> {
+        let needs_upload = match &self.qmaps {
+            Some(q) => !std::sync::Arc::ptr_eq(&q.device, device),
+            None => true,
+        };
+        if needs_upload {
+            let qs = flame_core::adam8bit_kernel::create_dynamic_map(true);
+            let qu = flame_core::adam8bit_kernel::create_dynamic_map(false);
+            let qmap_signed = flame_core::adam8bit_kernel::upload_qmap(device, &qs)?;
+            let qmap_unsigned = flame_core::adam8bit_kernel::upload_qmap(device, &qu)?;
+            self.qmaps = Some(DeviceQmaps {
+                device: device.clone(),
+                qmap_signed,
+                qmap_unsigned,
+            });
+        }
+        Ok(())
     }
 
     pub fn step(&mut self, params: &[Parameter]) -> Result<()> {
@@ -606,66 +643,101 @@ impl AdamW8bit {
 
         for p in params {
             let Some(grad) = p.grad() else { continue };
-            let grad_f32 = if grad.dtype() == DType::F32 {
-                grad
-            } else {
-                grad.to_dtype(DType::F32)?
-            };
 
             let id = p.id();
-            // Dequantize moments from host int8 into device F32, or zero-init.
-            let mut m = match self.m_quant.get(&id) {
-                Some(q) => q.dequantize(grad_f32.device().clone())?,
-                None => Tensor::zeros_dtype(
-                    grad_f32.shape().clone(),
-                    DType::F32,
-                    grad_f32.device().clone(),
-                )?,
-            };
-            let mut v = match self.v_quant.get(&id) {
-                Some(q) => q.dequantize(grad_f32.device().clone())?,
-                None => Tensor::zeros_dtype(
-                    grad_f32.shape().clone(),
-                    DType::F32,
-                    grad_f32.device().clone(),
-                )?,
-            };
+            let p_tensor = p.tensor()?;
+            let n = p_tensor.shape().elem_count();
+            let device = p_tensor.device().clone();
 
-            // m = beta1 * m + (1 - beta1) * g
-            m = m.mul_scalar(self.beta1)?
-                .add(&grad_f32.mul_scalar(1.0 - self.beta1)?)?;
-            // v = beta2 * v + (1 - beta2) * g²
-            v = v.mul_scalar(self.beta2)?
-                .add(&grad_f32.square()?.mul_scalar(1.0 - self.beta2)?)?;
+            self.ensure_qmaps(&device)?;
 
-            let m_hat = m.div_scalar(bc1)?;
-            let v_hat = v.div_scalar(bc2)?;
-            let denom = v_hat.sqrt()?.add_scalar(self.eps)?;
-            let update = m_hat.div(&denom)?.mul_scalar(self.lr)?;
-
-            let p_data = p.tensor()?;
-            let p_f32 = if p_data.dtype() == DType::F32 {
-                p_data
-            } else {
-                p_data.to_dtype(DType::F32)?
-            };
-            let mut new_p = p_f32;
-            if self.weight_decay != 0.0 {
-                let scale = 1.0 - self.weight_decay * self.lr;
-                new_p = new_p.mul_scalar(scale)?;
+            // Lazily allocate per-param state on first sighting.
+            if !self.state.contains_key(&id) {
+                let (m_codes, v_codes, m_absmax, v_absmax) =
+                    flame_core::adam8bit_kernel::alloc_state(&device, n)?;
+                self.state.insert(
+                    id,
+                    AdamW8bitState {
+                        m_codes,
+                        v_codes,
+                        m_absmax,
+                        v_absmax,
+                        master_f32: None,
+                    },
+                );
             }
-            new_p = new_p.sub(&update)?;
-            let target_dtype = p.dtype()?;
-            let cast_back = if target_dtype == DType::F32 {
-                new_p
-            } else {
-                new_p.to_dtype(target_dtype)?
-            };
-            p.set_data(cast_back.detach()?)?;
 
-            // Re-quantize state for next step.
-            self.m_quant.insert(id, QuantizedState::quantize(&m)?);
-            self.v_quant.insert(id, QuantizedState::quantize(&v)?);
+            // For non-F32 params we need an F32 master shadow. Build it from
+            // the current param the first time we see it, and refresh from
+            // the param on every subsequent step start in case external code
+            // wrote to the param between steps (e.g. checkpoint reload).
+            // Actually no: re-uploading from BF16 each step would *lose*
+            // master precision (BF16 round-trip kills the small updates
+            // we accumulated). Initialize once from the param, then keep the
+            // F32 master as the source of truth and only sync BF16 param ←
+            // F32 master at the end of each step. This matches bnb's
+            // assumption that `param.data` is the F32 master.
+            let param_is_f32 = p_tensor.dtype() == DType::F32;
+            if !param_is_f32 && self.state[&id].master_f32.is_none() {
+                let master = p_tensor.to_dtype(DType::F32)?.detach()?;
+                self.state.get_mut(&id).unwrap().master_f32 = Some(master);
+            }
+
+            // Run the fused kernel against the right F32 tensor.
+            let qmaps = self
+                .qmaps
+                .as_ref()
+                .expect("ensure_qmaps populated above");
+            let state = self.state.get_mut(&id).expect("state inserted above");
+
+            // Borrow split: kernel needs &mut to the master F32 tensor and
+            // &mut to the four state slices, plus &refs to qmaps. Take the
+            // master out, run kernel, put it back.
+            let mut working = if param_is_f32 {
+                p_tensor.clone()
+            } else {
+                state
+                    .master_f32
+                    .take()
+                    .expect("master_f32 initialized above for non-F32 params")
+            };
+
+            flame_core::adam8bit_kernel::adam8bit_step_bnb(
+                &mut working,
+                &grad,
+                &mut state.m_codes,
+                &mut state.v_codes,
+                &mut state.m_absmax,
+                &mut state.v_absmax,
+                &qmaps.qmap_signed,
+                &qmaps.qmap_unsigned,
+                self.lr,
+                self.beta1,
+                self.beta2,
+                self.eps,
+                self.weight_decay,
+                bc1,
+                bc2,
+            )?;
+
+            // Write back: F32 param is mutated in place by the kernel and the
+            // Parameter still holds the same backing storage, so we just
+            // need to refresh the cached clone. BF16 param needs an explicit
+            // cast from the F32 master.
+            if param_is_f32 {
+                // `working` is a clone of `p.tensor()?`; since both share the
+                // underlying F32 storage that the kernel wrote, the param
+                // already sees the update. But `Parameter::set_data` pins
+                // self.id and requires_grad, so we still call it to keep the
+                // tensor handle's id stable across optimizer steps.
+                p.set_data(working.detach()?)?;
+            } else {
+                let target_dtype = p.dtype()?;
+                let bf16 = working.to_dtype(target_dtype)?;
+                p.set_data(bf16.detach()?)?;
+                // Put the F32 master back for next step.
+                state.master_f32 = Some(working);
+            }
         }
         Ok(())
     }
@@ -876,7 +948,13 @@ impl Prodigy {
             *s_entry = s_new.detach()?;
 
             // d_denom += |s|.sum()  (L1 norm)
-            let s_abs_sum = self.s.get(&id).unwrap().abs()?.sum_all()?.to_vec1::<f32>()?;
+            let s_abs_sum = self
+                .s
+                .get(&id)
+                .unwrap()
+                .abs()?
+                .sum_all()?
+                .to_vec1::<f32>()?;
             d_denom += s_abs_sum.first().copied().unwrap_or(0.0) as f64;
         }
 
@@ -1202,11 +1280,7 @@ impl StableAdamW {
             // back into our F32 second-moment tensor and trips the F32-only
             // slice access in downstream reductions. `clamp` casts the
             // scalar to the *source* tensor's dtype, keeping things F32.
-            let v_for_rms = self
-                .exp_avg_sq
-                .get(&id)
-                .unwrap()
-                .clamp(eps_p2, f32::MAX)?;
+            let v_for_rms = self.exp_avg_sq.get(&id).unwrap().clamp(eps_p2, f32::MAX)?;
             let rms_inner = grad_f32.square()?.div(&v_for_rms)?.mean_all()?;
             let rms_val = rms_inner.to_vec1::<f32>()?;
             let rms = rms_val
@@ -1395,14 +1469,22 @@ impl RAdamScheduleFree {
             let Some(z) = self.z.get(&id) else { continue }; // unseen param: no z, skip
             let p_data = p.tensor()?;
             let p_dtype = p_data.dtype();
-            let p_f32 = if p_dtype == DType::F32 { p_data } else { p_data.to_dtype(DType::F32)? };
+            let p_f32 = if p_dtype == DType::F32 {
+                p_data
+            } else {
+                p_data.to_dtype(DType::F32)?
+            };
             // Stash the current y (F32, detached).
             self.eval_stash.insert(id, p_f32.detach()?);
             // Compute x = y * (1/beta1) + z * (1 - 1/beta1).
             let x = p_f32
                 .mul_scalar(inv_beta1)?
                 .add(&z.mul_scalar(one_minus_inv)?)?;
-            let cast = if p_dtype == DType::F32 { x } else { x.to_dtype(p_dtype)? };
+            let cast = if p_dtype == DType::F32 {
+                x
+            } else {
+                x.to_dtype(p_dtype)?
+            };
             p.set_data(cast.detach()?)?;
         }
         Ok(())
@@ -1416,9 +1498,15 @@ impl RAdamScheduleFree {
         }
         for p in params {
             let id = p.id();
-            let Some(y) = self.eval_stash.remove(&id) else { continue };
+            let Some(y) = self.eval_stash.remove(&id) else {
+                continue;
+            };
             let p_dtype = p.dtype()?;
-            let cast = if p_dtype == DType::F32 { y } else { y.to_dtype(p_dtype)? };
+            let cast = if p_dtype == DType::F32 {
+                y
+            } else {
+                y.to_dtype(p_dtype)?
+            };
             p.set_data(cast.detach()?)?;
         }
         self.eval_stash.clear();
@@ -1447,9 +1535,8 @@ impl RAdamScheduleFree {
         };
         // degenerated_to_sgd=False → rt=-1 below threshold, skipping the SGD fallback
         let rt = if n_sma >= 4.0 {
-            (one_minus_b2t * (n_sma - 4.0) / (n_sma_max - 4.0)
-                * (n_sma - 2.0) / n_sma
-                * n_sma_max / (n_sma_max - 2.0))
+            (one_minus_b2t * (n_sma - 4.0) / (n_sma_max - 4.0) * (n_sma - 2.0) / n_sma * n_sma_max
+                / (n_sma_max - 2.0))
                 .sqrt()
         } else {
             -1.0
@@ -1723,12 +1810,20 @@ impl<B: ScheduleFreeBase> ScheduleFreeWrapper<B> {
             let Some(z) = self.z.get(&id) else { continue };
             let p_data = p.tensor()?;
             let p_dtype = p_data.dtype();
-            let p_f32 = if p_dtype == DType::F32 { p_data } else { p_data.to_dtype(DType::F32)? };
+            let p_f32 = if p_dtype == DType::F32 {
+                p_data
+            } else {
+                p_data.to_dtype(DType::F32)?
+            };
             self.eval_stash.insert(id, p_f32.detach()?);
             let x = p_f32
                 .mul_scalar(inv_m)?
                 .add(&z.mul_scalar(one_minus_inv)?)?;
-            let cast = if p_dtype == DType::F32 { x } else { x.to_dtype(p_dtype)? };
+            let cast = if p_dtype == DType::F32 {
+                x
+            } else {
+                x.to_dtype(p_dtype)?
+            };
             p.set_data(cast.detach()?)?;
         }
         self.train_mode = false;
@@ -1742,9 +1837,15 @@ impl<B: ScheduleFreeBase> ScheduleFreeWrapper<B> {
         }
         for p in params {
             let id = p.id();
-            let Some(y) = self.eval_stash.remove(&id) else { continue };
+            let Some(y) = self.eval_stash.remove(&id) else {
+                continue;
+            };
             let p_dtype = p.dtype()?;
-            let cast = if p_dtype == DType::F32 { y } else { y.to_dtype(p_dtype)? };
+            let cast = if p_dtype == DType::F32 {
+                y
+            } else {
+                y.to_dtype(p_dtype)?
+            };
             p.set_data(cast.detach()?)?;
         }
         self.eval_stash.clear();
@@ -1896,9 +1997,18 @@ mod tests {
     #[test]
     fn parses_kind_strings() {
         assert_eq!(OptimizerKind::parse("AdamW").unwrap(), OptimizerKind::AdamW);
-        assert_eq!(OptimizerKind::parse("adafactor").unwrap(), OptimizerKind::Adafactor);
-        assert_eq!(OptimizerKind::parse("adamw8bit").unwrap(), OptimizerKind::AdamW8bit);
-        assert_eq!(OptimizerKind::parse("Prodigy").unwrap(), OptimizerKind::Prodigy);
+        assert_eq!(
+            OptimizerKind::parse("adafactor").unwrap(),
+            OptimizerKind::Adafactor
+        );
+        assert_eq!(
+            OptimizerKind::parse("adamw8bit").unwrap(),
+            OptimizerKind::AdamW8bit
+        );
+        assert_eq!(
+            OptimizerKind::parse("Prodigy").unwrap(),
+            OptimizerKind::Prodigy
+        );
         assert_eq!(OptimizerKind::parse("LION").unwrap(), OptimizerKind::Lion);
         // New variants with their accepted spellings.
         assert_eq!(
@@ -2013,7 +2123,12 @@ mod tests {
         Parameter::new(t.requires_grad_(true))
     }
 
-    fn set_grad(p: &Parameter, data: Vec<f32>, shape: Vec<usize>, device: std::sync::Arc<CudaDevice>) {
+    fn set_grad(
+        p: &Parameter,
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        device: std::sync::Arc<CudaDevice>,
+    ) {
         let g = Tensor::from_vec(data, Shape::from_dims(&shape), device).unwrap();
         p.set_grad(g).unwrap();
     }
@@ -2198,16 +2313,8 @@ mod tests {
         assert!(init_rms > 1e-3, "guard: init_rms must exceed eps_param");
 
         // A's deltas should be larger than B's (B uses lr * RMS(p) ≈ lr * 0.196).
-        let delta_a: f32 = a
-            .iter()
-            .zip(init.iter())
-            .map(|(x, i)| (x - i).abs())
-            .sum();
-        let delta_b: f32 = b
-            .iter()
-            .zip(init.iter())
-            .map(|(x, i)| (x - i).abs())
-            .sum();
+        let delta_a: f32 = a.iter().zip(init.iter()).map(|(x, i)| (x - i).abs()).sum();
+        let delta_b: f32 = b.iter().zip(init.iter()).map(|(x, i)| (x - i).abs()).sum();
         assert!(
             delta_a > delta_b * 2.0,
             "scale_parameter=true should reduce step size; |Δa|={}, |Δb|={}",
@@ -2218,13 +2325,15 @@ mod tests {
 
     /// AdamW8bit ≈ AdamW within a quantization-noise tolerance.
     ///
-    /// **Empirical finding from this test**: with N=4 params, mixed-sign
-    /// `[0.1, -0.2, 0.3, -0.4]` grads, and 3 steps, the worst-case
-    /// per-element drift is ≈ 1.3e-4 (quantizing a 4-element `v` tensor
-    /// where absmax is dominated by one element forces the others to
-    /// quantize at low effective precision). We allow up to 5e-4 to leave
-    /// headroom — the test still catches algorithmic divergence (which
-    /// would be O(lr · grad) ≈ O(1e-3) per step).
+    /// **Tolerance source**: the dynamic-LUT requant is logarithmic near
+    /// zero (most LUT entries cluster around very small magnitudes — see
+    /// `create_dynamic_map`), so for small mixed-sign updates the per-step
+    /// drift from a true F32 AdamW is well below 1e-4 per element. We
+    /// allow 5e-4 after 3 steps to leave headroom against compounded
+    /// requant noise and to keep the test stable across any future LUT-
+    /// closest-code tiebreak change in the kernel. Algorithmic divergence
+    /// (wrong betas / wrong order of WD) would be O(lr · grad) ≈ O(1e-3)
+    /// per step, well above this bound.
     #[test]
     fn adamw8bit_close_to_adamw() {
         let Some(device) = cuda_or_skip() else { return };
@@ -2328,7 +2437,11 @@ mod tests {
         set_grad(&p, vec![-0.5], vec![1], device.clone());
         opt.step(&[p.clone()]).unwrap();
         let got = p.tensor().unwrap().to_vec().unwrap();
-        assert!((got[0] - 1.01).abs() < 1e-6, "Lion expected 1.01, got {}", got[0]);
+        assert!(
+            (got[0] - 1.01).abs() < 1e-6,
+            "Lion expected 1.01, got {}",
+            got[0]
+        );
     }
 
     /// `debias_beta` matches the simplified form `(β^t - β) / (β^t - 1)`.
@@ -2397,8 +2510,7 @@ mod tests {
             }
             // exp_avg_sq.mul_(beta2_hat).addcmul_(grad, grad, value=1-beta2_hat)
             for i in 0..4 {
-                exp_avg_sq[i] =
-                    exp_avg_sq[i] * beta2_hat + grad[i] * grad[i] * (1.0 - beta2_hat);
+                exp_avg_sq[i] = exp_avg_sq[i] * beta2_hat + grad[i] * grad[i] * (1.0 - beta2_hat);
             }
             // rms = sqrt(mean(g² / max(v, eps²))).max(1)
             let rms_inner: f32 = (0..4)
@@ -2470,9 +2582,9 @@ mod tests {
             let one_minus_b2t = 1.0 - beta2_pow;
             let n_sma = n_sma_max - 2.0 * t as f64 * beta2_pow / one_minus_b2t;
             let rt = if n_sma >= 4.0 {
-                (one_minus_b2t * (n_sma - 4.0) / (n_sma_max - 4.0)
-                    * (n_sma - 2.0) / n_sma
-                    * n_sma_max / (n_sma_max - 2.0))
+                (one_minus_b2t * (n_sma - 4.0) / (n_sma_max - 4.0) * (n_sma - 2.0) / n_sma
+                    * n_sma_max
+                    / (n_sma_max - 2.0))
                     .sqrt()
             } else {
                 -1.0
