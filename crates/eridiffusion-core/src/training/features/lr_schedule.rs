@@ -146,9 +146,9 @@ pub fn dispatch_lr(
         LrScheduler::Constant => constant_lr(base_lr, step, warmup_steps),
         LrScheduler::Linear => linear_lr(base_lr, step, total_steps, warmup_steps, min_factor),
         LrScheduler::Cosine => cosine_lr(base_lr, step, total_steps, warmup_steps, min_factor),
-        LrScheduler::CosineWithRestarts => cosine_restarts_lr(
-            base_lr, step, total_steps, warmup_steps, min_factor, cycles,
-        ),
+        LrScheduler::CosineWithRestarts => {
+            cosine_restarts_lr(base_lr, step, total_steps, warmup_steps, min_factor, cycles)
+        }
         LrScheduler::Polynomial => {
             polynomial_lr(base_lr, step, total_steps, warmup_steps, min_factor, 2.0)
         }
@@ -167,7 +167,15 @@ pub fn dispatch(
     min_factor: f32,
     cycles: f32,
 ) -> f32 {
-    dispatch_lr(&scheduler, base_lr, step, total_steps, warmup, min_factor, cycles)
+    dispatch_lr(
+        &scheduler,
+        base_lr,
+        step,
+        total_steps,
+        warmup,
+        min_factor,
+        cycles,
+    )
 }
 
 /// Parse a CLI string like "constant" / "cosine" into [`LrScheduler`], with
@@ -209,8 +217,12 @@ mod tests {
                 let base = 3e-5_f32;
                 let new_v = dispatch_lr(
                     &LrScheduler::Constant,
-                    base, step, /*total*/ 3000, warmup,
-                    /*min_factor*/ 0.0, /*cycles*/ 1.0,
+                    base,
+                    step,
+                    /*total*/ 3000,
+                    warmup,
+                    /*min_factor*/ 0.0,
+                    /*cycles*/ 1.0,
                 );
                 let old_v = constant_with_warmup(base, step, warmup);
                 assert_eq!(new_v.to_bits(), old_v.to_bits());
@@ -239,7 +251,10 @@ mod tests {
         let mut prev = f32::INFINITY;
         for step in (0..=total).step_by(50) {
             let v = linear_lr(base, step, total, warmup, 0.0);
-            assert!(v <= prev + 1e-6, "linear not monotone at {step}: {v} > {prev}");
+            assert!(
+                v <= prev + 1e-6,
+                "linear not monotone at {step}: {v} > {prev}"
+            );
             prev = v;
         }
     }
@@ -254,13 +269,22 @@ mod tests {
         let warmup = 0;
         // 1/4 progress = mid of cycle 0, cos(pi*0.5) = 0 → factor 0.5.
         let v_quarter = cosine_restarts_lr(base, 250, total, warmup, 0.0, 2.0);
-        assert!((v_quarter - 0.5).abs() < 1e-4, "v_quarter ≈ 0.5: got {v_quarter}");
+        assert!(
+            (v_quarter - 0.5).abs() < 1e-4,
+            "v_quarter ≈ 0.5: got {v_quarter}"
+        );
         // 3/4 progress = mid of cycle 1, factor 0.5 again.
         let v_three_q = cosine_restarts_lr(base, 750, total, warmup, 0.0, 2.0);
-        assert!((v_three_q - 0.5).abs() < 1e-4, "v_three_q ≈ 0.5: got {v_three_q}");
+        assert!(
+            (v_three_q - 0.5).abs() < 1e-4,
+            "v_three_q ≈ 0.5: got {v_three_q}"
+        );
         // Just before each cycle boundary, factor ≈ 0 (deep minimum).
         let v_pre_half = cosine_restarts_lr(base, 499, total, warmup, 0.0, 2.0);
-        assert!(v_pre_half < 0.05, "v_pre_half should be near 0: {v_pre_half}");
+        assert!(
+            v_pre_half < 0.05,
+            "v_pre_half should be near 0: {v_pre_half}"
+        );
     }
 
     #[test]

@@ -29,6 +29,9 @@ nvml-wrapper = "0.10"
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 # Used by encoders/umt5.rs for FP16-on-disk → BF16 conversion path.
 half = "2"
+# Used by sensenova_u1::promote_unfreeze for v16c-style regex-driven
+# trainable-parameter promotion (LoRA + partial-FT recipes).
+regex = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

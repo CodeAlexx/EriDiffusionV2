@@ -89,11 +89,17 @@ impl CausalConv3d {
             kernel_size,
             Some(stride),
             Some(padding),
-            None, None, true,
+            None,
+            None,
+            true,
             device,
         )
         .map_err(|e| crate::EriDiffusionError::Model(format!("CausalConv3d Conv3d::new: {e:?}")))?;
-        Ok(Self { conv, kernel_size, causal: true })
+        Ok(Self {
+            conv,
+            kernel_size,
+            causal: true,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -111,7 +117,8 @@ impl CausalConv3d {
             // (See feedback_flame_conv3d_contiguous.md.)
             Tensor::cat(&[&pad, x], 2)?.contiguous()?
         };
-        self.conv.forward(&padded)
+        self.conv
+            .forward(&padded)
             .map_err(|e| crate::EriDiffusionError::Model(format!("CausalConv3d::forward: {e:?}")))
     }
 }
@@ -142,16 +149,24 @@ impl Ltx2Vae {
         let weights = if ckpt.exists() {
             flame_core::serialization::load_file(ckpt, &device)?
         } else {
-            log::warn!("Ltx2Vae::load: {} does not exist; using empty weights (stub).", ckpt.display());
+            log::warn!(
+                "Ltx2Vae::load: {} does not exist; using empty weights (stub).",
+                ckpt.display()
+            );
             HashMap::new()
         };
 
         // Try canonical key names; fall back to (0, 1).
         let mut stats_loaded = false;
         let latents_mean = match weights.get("latents_mean").cloned() {
-            Some(t) => { stats_loaded = true; t.to_dtype(DType::F32)? },
+            Some(t) => {
+                stats_loaded = true;
+                t.to_dtype(DType::F32)?
+            }
             None => Tensor::zeros_dtype(
-                Shape::from_dims(&[LTX2_LATENT_CHANNELS]), DType::F32, device.clone(),
+                Shape::from_dims(&[LTX2_LATENT_CHANNELS]),
+                DType::F32,
+                device.clone(),
             )?,
         };
         let latents_std = match weights.get("latents_std").cloned() {
@@ -172,7 +187,13 @@ impl Ltx2Vae {
                  wrong target distribution. AUDIT RISK #1."
             );
         }
-        Ok(Self { device, latents_mean, latents_std, weights, stats_loaded })
+        Ok(Self {
+            device,
+            latents_mean,
+            latents_std,
+            weights,
+            stats_loaded,
+        })
     }
 
     /// Image-as-frame encode bootstrap.
@@ -189,13 +210,15 @@ impl Ltx2Vae {
         let dims = image.shape().dims();
         if dims.len() != 4 || dims[1] != 3 {
             return Err(crate::EriDiffusionError::Model(format!(
-                "encode_image_as_frame expects [1,3,H,W], got {:?}", dims
+                "encode_image_as_frame expects [1,3,H,W], got {:?}",
+                dims
             )));
         }
         let (b, h, w) = (dims[0], dims[2], dims[3]);
         if h % LTX2_SPATIAL_COMPRESSION != 0 || w % LTX2_SPATIAL_COMPRESSION != 0 {
             return Err(crate::EriDiffusionError::Model(format!(
-                "image H={} W={} must each be divisible by {}", h, w, LTX2_SPATIAL_COMPRESSION
+                "image H={} W={} must each be divisible by {}",
+                h, w, LTX2_SPATIAL_COMPRESSION
             )));
         }
         let h_lat = h / LTX2_SPATIAL_COMPRESSION;
@@ -206,8 +229,7 @@ impl Ltx2Vae {
              Replace with real 4-stage causal-3D encode for real training.",
             shape.dims()
         );
-        let raw = Tensor::randn(shape, 0.0, 1.0, self.device.clone())?
-            .to_dtype(DType::BF16)?;
+        let raw = Tensor::randn(shape, 0.0, 1.0, self.device.clone())?.to_dtype(DType::BF16)?;
         // Apply per-channel normalize so the cached latent has the same stats
         // a real-encoded one would (caller uses these to scale targets).
         self.normalize(&raw)
@@ -224,7 +246,8 @@ impl Ltx2Vae {
         let dims = latents.shape().dims();
         if dims.len() != 5 || dims[1] != LTX2_LATENT_CHANNELS {
             return Err(crate::EriDiffusionError::Model(format!(
-                "decode_video expects [B,128,F',h,w], got {:?}", dims
+                "decode_video expects [B,128,F',h,w], got {:?}",
+                dims
             )));
         }
         let (b, _c, fp, hp, wp) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
@@ -247,7 +270,8 @@ impl Ltx2Vae {
         let dims = x.shape().dims().to_vec();
         if dims.len() != 5 || dims[1] != LTX2_LATENT_CHANNELS {
             return Err(crate::EriDiffusionError::Model(format!(
-                "normalize expects [B,128,F,H,W], got {:?}", dims
+                "normalize expects [B,128,F,H,W], got {:?}",
+                dims
             )));
         }
         let mean_b = self
@@ -269,7 +293,8 @@ impl Ltx2Vae {
         let dims = x.shape().dims().to_vec();
         if dims.len() != 5 || dims[1] != LTX2_LATENT_CHANNELS {
             return Err(crate::EriDiffusionError::Model(format!(
-                "denormalize expects [B,128,F,H,W], got {:?}", dims
+                "denormalize expects [B,128,F,H,W], got {:?}",
+                dims
             )));
         }
         let mean_b = self

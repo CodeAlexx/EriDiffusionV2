@@ -93,7 +93,7 @@ fn group_norm_nchw(
 fn vae_log_stage(name: &str, t: &Tensor) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let stats_on = std::env::var("SDXL_STAGE_DEBUG").is_ok();
-    let save_on  = std::env::var("VAE_SAVE_STAGES").is_ok();
+    let save_on = std::env::var("VAE_SAVE_STAGES").is_ok();
     if !stats_on && !save_on {
         return;
     }
@@ -281,11 +281,7 @@ fn linear_3d(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
 }
 
 impl AttnBlock {
-    fn from_weights(
-        w: &HashMap<String, Tensor>,
-        prefix: &str,
-        channels: usize,
-    ) -> Result<Self> {
+    fn from_weights(w: &HashMap<String, Tensor>, prefix: &str, channels: usize) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
             w.get(key)
                 .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
@@ -518,7 +514,9 @@ pub struct LdmVAEDecoder {
 /// Diffusers:  decoder.conv_norm_out.*              → LDM: decoder.norm_out.*
 fn remap_diffusers_to_ldm(w: HashMap<String, Tensor>) -> HashMap<String, Tensor> {
     // Check if keys are diffusers-format (presence of "mid_block" or "up_blocks")
-    let is_diffusers = w.keys().any(|k| k.contains("mid_block") || k.contains("up_blocks"));
+    let is_diffusers = w
+        .keys()
+        .any(|k| k.contains("mid_block") || k.contains("up_blocks"));
     if !is_diffusers {
         return w;
     }
@@ -647,7 +645,10 @@ impl LdmVAEDecoder {
             };
             w.insert(k, val_bf16);
         }
-        println!("[LdmVAE] Loaded {} decoder weight tensors (cast to BF16)", w.len());
+        println!(
+            "[LdmVAE] Loaded {} decoder weight tensors (cast to BF16)",
+            w.len()
+        );
         // Remap diffusers-format keys to LDM-format if needed
         let w = remap_diffusers_to_ldm(w);
         Self::from_weights(w, in_channels, scaling_factor, shift_factor, device)
@@ -675,15 +676,8 @@ impl LdmVAEDecoder {
         // Optional post_quant_conv: 1x1 Conv(in_channels, in_channels) applied
         // pre-decoder. Present in SDXL/SD 1.5 VAE, absent in Z-Image VAE.
         let post_quant_conv = if w.contains_key("post_quant_conv.weight") {
-            let mut c = Conv2d::new_with_bias(
-                in_channels,
-                in_channels,
-                1,
-                1,
-                0,
-                device.clone(),
-                true,
-            )?;
+            let mut c =
+                Conv2d::new_with_bias(in_channels, in_channels, 1, 1, 0, device.clone(), true)?;
             c.copy_weight_from(get("post_quant_conv.weight")?)?;
             c.copy_bias_from(get("post_quant_conv.bias")?)?;
             println!("[LdmVAE] post_quant_conv loaded");
@@ -693,7 +687,8 @@ impl LdmVAEDecoder {
         };
 
         // conv_in: in_channels -> 512ch
-        let mut conv_in = Conv2d::new_with_bias(in_channels, top_ch, 3, 1, 1, device.clone(), true)?;
+        let mut conv_in =
+            Conv2d::new_with_bias(in_channels, top_ch, 3, 1, 1, device.clone(), true)?;
         conv_in.copy_weight_from(get("decoder.conv_in.weight")?)?;
         conv_in.copy_bias_from(get("decoder.conv_in.bias")?)?;
 
@@ -760,7 +755,8 @@ impl LdmVAEDecoder {
         vae_log_stage("vae:0:z_input", z);
 
         // Undo VAE encode-time normalization: z = z / scale_factor + shift_factor
-        let z = z.mul_scalar(1.0 / self.scaling_factor)?
+        let z = z
+            .mul_scalar(1.0 / self.scaling_factor)?
             .add_scalar(self.shift_factor)?;
         vae_log_stage("vae:0:z_rescaled", &z);
 

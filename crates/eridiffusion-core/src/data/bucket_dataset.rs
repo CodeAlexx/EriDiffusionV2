@@ -143,7 +143,14 @@ impl BucketPlan {
             .into_iter()
             .map(|(key, indices)| Bucket { key, indices })
             .collect();
-        buckets.sort_by_key(|b| (b.key.latent_h, b.key.latent_w, b.key.latent_c, b.key.text_seq));
+        buckets.sort_by_key(|b| {
+            (
+                b.key.latent_h,
+                b.key.latent_w,
+                b.key.latent_c,
+                b.key.text_seq,
+            )
+        });
         Ok(Self { buckets })
     }
 
@@ -238,7 +245,10 @@ fn read_bucket_key(path: &Path) -> Result<BucketKey> {
         Error::InvalidInput(format!("{}: missing latent in header", path.display()))
     })?;
     let text_shape = read_shape(obj, "text_embedding").ok_or_else(|| {
-        Error::InvalidInput(format!("{}: missing text_embedding in header", path.display()))
+        Error::InvalidInput(format!(
+            "{}: missing text_embedding in header",
+            path.display()
+        ))
     })?;
     if latent_shape.len() != 4 {
         return Err(Error::InvalidInput(format!(

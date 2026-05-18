@@ -29,7 +29,11 @@ pub fn enabled(env_var: &str) -> bool {
 /// so debug prints never crash training.
 pub fn l2_norm(t: &Tensor) -> f32 {
     let try_norm = || -> flame_core::Result<f32> {
-        let f32 = if t.dtype() == DType::F32 { t.clone() } else { t.to_dtype(DType::F32)? };
+        let f32 = if t.dtype() == DType::F32 {
+            t.clone()
+        } else {
+            t.to_dtype(DType::F32)?
+        };
         let sq = f32.square()?.mean()?;
         let n = f32.shape().dims().iter().product::<usize>() as f32;
         Ok((sq.to_vec()?[0] * n).sqrt())
@@ -41,22 +45,52 @@ pub fn l2_norm(t: &Tensor) -> f32 {
 /// Cheap when called sparsely (only at probe sites).
 pub fn stats(t: &Tensor) -> TensorStats {
     let try_stats = || -> flame_core::Result<TensorStats> {
-        let f32 = if t.dtype() == DType::F32 { t.clone() } else { t.to_dtype(DType::F32)? };
+        let f32 = if t.dtype() == DType::F32 {
+            t.clone()
+        } else {
+            t.to_dtype(DType::F32)?
+        };
         let v = f32.to_vec()?;
         let n = v.len();
-        let mut nan = 0usize; let mut inf = 0usize;
-        let mut sum = 0f64; let mut sum_sq = 0f64;
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        let mut sum = 0f64;
+        let mut sum_sq = 0f64;
         let mut abs_max = 0f32;
         for &x in &v {
-            if x.is_nan() { nan += 1; continue; }
-            if x.is_infinite() { inf += 1; continue; }
-            sum += x as f64; sum_sq += (x as f64) * (x as f64);
-            if x.abs() > abs_max { abs_max = x.abs(); }
+            if x.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if x.is_infinite() {
+                inf += 1;
+                continue;
+            }
+            sum += x as f64;
+            sum_sq += (x as f64) * (x as f64);
+            if x.abs() > abs_max {
+                abs_max = x.abs();
+            }
         }
         let valid = (n - nan - inf) as f64;
-        let mean = if valid > 0.0 { (sum / valid) as f32 } else { f32::NAN };
-        let var = if valid > 1.0 { (sum_sq / valid - (sum / valid).powi(2)).max(0.0) as f32 } else { 0.0 };
-        Ok(TensorStats { count: n, nan, inf, mean, std: var.sqrt(), abs_max })
+        let mean = if valid > 0.0 {
+            (sum / valid) as f32
+        } else {
+            f32::NAN
+        };
+        let var = if valid > 1.0 {
+            (sum_sq / valid - (sum / valid).powi(2)).max(0.0) as f32
+        } else {
+            0.0
+        };
+        Ok(TensorStats {
+            count: n,
+            nan,
+            inf,
+            mean,
+            std: var.sqrt(),
+            abs_max,
+        })
     };
     try_stats().unwrap_or(TensorStats::error())
 }
@@ -73,11 +107,20 @@ pub struct TensorStats {
 
 impl TensorStats {
     fn error() -> Self {
-        Self { count: 0, nan: 0, inf: 0, mean: f32::NAN, std: 0.0, abs_max: 0.0 }
+        Self {
+            count: 0,
+            nan: 0,
+            inf: 0,
+            mean: f32::NAN,
+            std: 0.0,
+            abs_max: 0.0,
+        }
     }
     pub fn fmt_compact(&self) -> String {
-        format!("n={} nan={} inf={} mean={:+.3e} std={:.3e} max|·|={:.3e}",
-            self.count, self.nan, self.inf, self.mean, self.std, self.abs_max)
+        format!(
+            "n={} nan={} inf={} mean={:+.3e} std={:.3e} max|·|={:.3e}",
+            self.count, self.nan, self.inf, self.mean, self.std, self.abs_max
+        )
     }
 }
 
@@ -108,7 +151,10 @@ pub fn lora_grad_summary(
             entry.add(l2_norm(g), &stats(g));
         } else {
             let key = format!("{class}.A");
-            by_class.entry(key).or_insert_with(ClassGradSummary::new).add_missing();
+            by_class
+                .entry(key)
+                .or_insert_with(ClassGradSummary::new)
+                .add_missing();
         }
 
         // Lora B
@@ -119,7 +165,10 @@ pub fn lora_grad_summary(
             entry.add(l2_norm(g), &stats(g));
         } else {
             let key = format!("{class}.B");
-            by_class.entry(key).or_insert_with(ClassGradSummary::new).add_missing();
+            by_class
+                .entry(key)
+                .or_insert_with(ClassGradSummary::new)
+                .add_missing();
         }
     }
 
@@ -143,20 +192,32 @@ pub struct ClassGradSummary {
 impl ClassGradSummary {
     fn new() -> Self {
         Self {
-            n_adapters: 0, n_missing: 0,
-            norm_min: f32::INFINITY, norm_max: 0.0, norm_mean: 0.0,
-            total_nan: 0, total_inf: 0, abs_max_overall: 0.0,
+            n_adapters: 0,
+            n_missing: 0,
+            norm_min: f32::INFINITY,
+            norm_max: 0.0,
+            norm_mean: 0.0,
+            total_nan: 0,
+            total_inf: 0,
+            abs_max_overall: 0.0,
         }
     }
     fn add(&mut self, norm: f32, st: &TensorStats) {
         self.n_adapters += 1;
-        if norm < self.norm_min { self.norm_min = norm; }
-        if norm > self.norm_max { self.norm_max = norm; }
+        if norm < self.norm_min {
+            self.norm_min = norm;
+        }
+        if norm > self.norm_max {
+            self.norm_max = norm;
+        }
         // Online mean: (old_mean * (n-1) + new) / n
         let n = self.n_adapters as f32;
         self.norm_mean = self.norm_mean * (n - 1.0) / n + norm / n;
-        self.total_nan += st.nan; self.total_inf += st.inf;
-        if st.abs_max > self.abs_max_overall { self.abs_max_overall = st.abs_max; }
+        self.total_nan += st.nan;
+        self.total_inf += st.inf;
+        if st.abs_max > self.abs_max_overall {
+            self.abs_max_overall = st.abs_max;
+        }
     }
     fn add_missing(&mut self) {
         self.n_missing += 1;
@@ -164,9 +225,14 @@ impl ClassGradSummary {
     pub fn fmt_compact(&self) -> String {
         format!(
             "n={:>3} miss={} norm[min={:.2e} mean={:.2e} max={:.2e}] nan={} inf={} max|·|={:.2e}",
-            self.n_adapters, self.n_missing,
-            self.norm_min, self.norm_mean, self.norm_max,
-            self.total_nan, self.total_inf, self.abs_max_overall,
+            self.n_adapters,
+            self.n_missing,
+            self.norm_min,
+            self.norm_mean,
+            self.norm_max,
+            self.total_nan,
+            self.total_inf,
+            self.abs_max_overall,
         )
     }
 }
@@ -179,8 +245,12 @@ pub fn print_lora_grad_summary(
     grads: &GradientMap,
 ) {
     let summary = lora_grad_summary(adapters, class_keys, grads);
-    eprintln!("--- [debug step {}] LoRA grad summary ({} adapters across {} classes) ---",
-        step, adapters.len(), class_keys.len());
+    eprintln!(
+        "--- [debug step {}] LoRA grad summary ({} adapters across {} classes) ---",
+        step,
+        adapters.len(),
+        class_keys.len()
+    );
     for (class, s) in &summary {
         eprintln!("  {:<20} {}", class, s.fmt_compact());
     }

@@ -40,6 +40,21 @@ impl ParameterEma {
         self.decay
     }
 
+    /// Mutate the per-step decay. Trainers that compute decay from a
+    /// non-diffusers schedule (e.g. AsymFlow's Karras curve in `train_asymflow`)
+    /// call this BEFORE `update()` instead of going through `update_with_schedule`.
+    ///
+    /// Added for A3 (AsymFlow trainer) — the existing `update_with_schedule`
+    /// is hard-coded to the diffusers power-decay curve via `EmaConfig`, and
+    /// AsymFlow needs LakonLab's Karras `(1 - 1/t)^(gamma+1)` formula
+    /// (`asymflow_milestone_plan.md` §1 TBD #2; mirror of `ema_hook.py:135-138`).
+    /// Keeping the alternative curve out of `EmaConfig` preserves byte-equivalence
+    /// for the 12 existing `EmaConfig {...}` literal call sites in the other
+    /// trainers (struct-update syntax not in use).
+    pub fn set_decay(&mut self, decay: f32) {
+        self.decay = decay;
+    }
+
     /// Apply one EMA update step. Call after `optimizer.step`.
     pub fn update(&mut self, params: &[Parameter]) -> Result<()> {
         if self.decay <= 0.0 {

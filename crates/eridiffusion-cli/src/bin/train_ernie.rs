@@ -10,137 +10,204 @@
 //!   4. Forward → [B,128,h,w]; target = noise - clean (rectified flow).
 //!   5. Loss = mean MSE in F32 (loss_weight_fn=CONSTANT, mse_strength=1.0 default).
 use clap::Parser;
-use std::path::PathBuf;
-use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
-use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
-use eridiffusion_core::training::ema::ParameterEma;
-use eridiffusion_core::training::features::ema_advanced::EmaConfig;
-use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
-use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
-use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
-use std::str::FromStr as _;
 use eridiffusion_core::debug as dbg;
 use eridiffusion_core::encoders::{mistral3b::Mistral3bEncoder, vae::KleinVaeDecoder};
+use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::{ErnieModel, TrainableModel};
 use eridiffusion_core::sampler::ernie_sampler;
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
+use eridiffusion_core::training::ema::ParameterEma;
+use eridiffusion_core::training::features::ema_advanced::EmaConfig;
+use eridiffusion_core::training::features::{
+    loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop,
+};
+use eridiffusion_core::training::training_features::timestep_dist::{
+    TimestepConfig, TimestepDistribution,
+};
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
+use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
+use std::path::PathBuf;
+use std::str::FromStr as _;
 
 /// Class names for the 7 LoRA modules per ERNIE layer (must mirror
 /// `ErnieModel::load`'s adapter creation order: Q, K, V, out, gate, up, down).
 const ERNIE_LORA_CLASSES: [&str; 7] = [
-    "self_attn.to_q", "self_attn.to_k", "self_attn.to_v", "self_attn.to_out",
-    "mlp.gate_proj", "mlp.up_proj", "mlp.linear_fc2",
+    "self_attn.to_q",
+    "self_attn.to_k",
+    "self_attn.to_v",
+    "self_attn.to_out",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.linear_fc2",
 ];
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
-const LOGIT_NORMAL_BIAS: f32 = 0.0;       // TrainConfig.noising_bias default
-const LOGIT_NORMAL_SCALE: f32 = 1.0;      // noising_weight + 1.0 = 0.0 + 1.0
-const TIMESTEP_SHIFT: f32 = 1.0;          // TrainConfig.timestep_shift default
-const SEED: u64 = 42;                     // memory: feedback_default_seed_42 — fixed across step
+const LOGIT_NORMAL_BIAS: f32 = 0.0; // TrainConfig.noising_bias default
+const LOGIT_NORMAL_SCALE: f32 = 1.0; // noising_weight + 1.0 = 0.0 + 1.0
+const TIMESTEP_SHIFT: f32 = 1.0; // TrainConfig.timestep_shift default
+const SEED: u64 = 42; // memory: feedback_default_seed_42 — fixed across step
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] config: PathBuf,
-    #[arg(long)] cache_dir: PathBuf,
-    #[arg(long, default_value = "100")] steps: usize,
-    #[arg(long, default_value = "16")] rank: usize,
-    #[arg(long, default_value = "1.0")] lora_alpha: f64,
-    #[arg(long, default_value = "3e-4")] lr: f32,
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    cache_dir: PathBuf,
+    #[arg(long, default_value = "100")]
+    steps: usize,
+    #[arg(long, default_value = "16")]
+    rank: usize,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f64,
+    #[arg(long, default_value = "3e-4")]
+    lr: f32,
     /// Resume LoRA weights only (no optimizer state).
-    #[arg(long, conflicts_with = "resume_full")] resume_lora: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_full")]
+    resume_lora: Option<PathBuf>,
     /// Full resume: LoRA weights + AdamW (m, v, t) + step counter.
-    #[arg(long, conflicts_with = "resume_lora")] resume_full: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_lora")]
+    resume_full: Option<PathBuf>,
     /// Periodic + final save mode. Default `full` (LoRA + AdamW + step) for
     /// resumable runs. `weights` writes legacy weights-only files.
-    #[arg(long, default_value = "full")] save_mode: String,
-    #[arg(long, default_value = "output")] output_dir: PathBuf,
+    #[arg(long, default_value = "full")]
+    save_mode: String,
+    #[arg(long, default_value = "output")]
+    output_dir: PathBuf,
 
     // ── Periodic save + sample (every N steps) ─────────────────────────
     /// Save a LoRA checkpoint AND render a sample image every N steps.
     /// `0` disables.
-    #[arg(long, default_value = "0")] sample_every: usize,
-    #[arg(long, default_value = "")] sample_prompt: String,
-    #[arg(long, default_value = "")] sample_neg_prompt: String,
+    #[arg(long, default_value = "0")]
+    sample_every: usize,
+    #[arg(long, default_value = "")]
+    sample_prompt: String,
+    #[arg(long, default_value = "")]
+    sample_neg_prompt: String,
     /// ERNIE Klein-VAE safetensors (single full file; see prepare_ernie's --vae-ckpt).
-    #[arg(long)] sample_vae: Option<PathBuf>,
+    #[arg(long)]
+    sample_vae: Option<PathBuf>,
     /// Mistral-3B text encoder checkpoint (matches prepare_ernie --text-ckpt).
-    #[arg(long)] sample_text_ckpt: Option<PathBuf>,
+    #[arg(long)]
+    sample_text_ckpt: Option<PathBuf>,
     /// Tokenizer.json path for the Mistral-3B encoder.
-    #[arg(long)] sample_tokenizer: Option<PathBuf>,
-    #[arg(long, default_value = "1024")] sample_size: usize,
-    #[arg(long, default_value = "20")] sample_steps: usize,
-    #[arg(long, default_value = "4.0")] sample_cfg: f32,
-    #[arg(long, default_value = "42")] sample_seed: u64,
+    #[arg(long)]
+    sample_tokenizer: Option<PathBuf>,
+    #[arg(long, default_value = "1024")]
+    sample_size: usize,
+    #[arg(long, default_value = "20")]
+    sample_steps: usize,
+    #[arg(long, default_value = "4.0")]
+    sample_cfg: f32,
+    #[arg(long, default_value = "42")]
+    sample_seed: u64,
 
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
-    #[arg(long)] min_snr_gamma: Option<f32>,
-    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    #[arg(long)]
+    min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    caption_dropout_probability: f32,
     /// Path to a single cache file produced by `prepare_ernie` from an empty-
     /// caption sample. When `--caption-dropout-probability > 0`, the trainer
     /// loads `text_embedding` + `text_real_len` from this file and swaps them
     /// in with probability `p` per step. If unset and dropout > 0, the feature
     /// is disabled with a warning (preserves prior behaviour).
-    #[arg(long)] null_text_cache: Option<PathBuf>,
-    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
-    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
-    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
-    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
-    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
-    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    #[arg(long)]
+    null_text_cache: Option<PathBuf>,
+    #[arg(long, default_value_t = 1.0)]
+    noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)]
+    gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)]
+    huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lr_min_factor: f32,
+    #[arg(long)]
+    validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    validation_every_steps: u64,
+    #[arg(long, num_args = 0..)]
+    multi_backend_weights: Vec<f32>,
     /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
     /// trainers accept-and-warn until per-model wiring lands.
-    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    #[arg(long, num_args = 0..)]
+    multi_backend_cache_dirs: Vec<std::path::PathBuf>,
     /// Phase 2: validation prompt library JSON (Klein-only wiring; other
     /// trainers accept-and-warn).
-    #[arg(long)] validation_prompts_file: Option<std::path::PathBuf>,
-    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    #[arg(long)]
+    validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)]
+    masked_loss_weight: f32,
     /// Master switch for EMA shadow. See train_klein.rs for full doc.
     /// Default off → byte-identical to pre-flag commits.
-    #[arg(long, default_value_t = false)] ema: bool,
-    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
-    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
-    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
-    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
-    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
+    #[arg(long, default_value_t = false)]
+    ema: bool,
+    #[arg(long, default_value_t = 1.0)]
+    ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)]
+    ema_power: f32,
+    #[arg(long, default_value_t = 0)]
+    ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)]
+    ema_min_decay: f32,
+    #[arg(long, default_value_t = 0.9999)]
+    ema_max_decay: f32,
     /// Swap shadow → live params at sample/save time.
-    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+    #[arg(long, default_value_t = false)]
+    ema_validation_swap: bool,
     /// Pyramid / multi-resolution noise: number of additional resolution
     /// levels to mix into the per-step training noise. `0` (default) is a
     /// no-op — byte-identical to no-multires.
-    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
+    #[arg(long, default_value_t = 0)]
+    multires_noise_iterations: usize,
     /// Per-level discount factor for `--multires-noise-iterations`.
-    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+    #[arg(long, default_value_t = 0.3)]
+    multires_noise_discount: f32,
     /// Multi-distribution timestep bias strategy. `none` is byte-identical.
-    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
-    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    #[arg(long, default_value = "none")]
+    timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)]
+    timestep_bias_range_max: f32,
     /// Timestep distribution. `logit_normal` (default — ERNIE preset),
     /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
-    #[arg(long, default_value = "logit_normal")] timestep_distribution: String,
+    #[arg(long, default_value = "logit_normal")]
+    timestep_distribution: String,
     /// Distribution-specific weight knob (default 0.0 — ERNIE preset).
-    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    #[arg(long, default_value_t = 0.0)]
+    noising_weight: f32,
     /// Distribution-specific bias knob (default 0.0 — ERNIE preset).
-    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
-    #[arg(long)] tread_route_pattern: Option<String>,
+    #[arg(long, default_value_t = 0.0)]
+    noising_bias: f32,
+    #[arg(long)]
+    tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
-    #[arg(long, default_value = "adamw")] optimizer: String,
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
 
     // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
-    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
-    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
-    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
-    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    #[arg(long, num_args = 0..)]
+    multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
     /// Phase 5: LR scheduler family. Default `constant` + `warmup_steps=0` is
     /// byte-equivalent to prior fixed-LR behaviour.
-    #[arg(long, default_value = "constant")] lr_scheduler: String,
+    #[arg(long, default_value = "constant")]
+    lr_scheduler: String,
     /// Phase 5: linear LR warmup steps. Default 0 keeps prior behaviour.
-    #[arg(long, default_value_t = 0)] warmup_steps: usize,
+    #[arg(long, default_value_t = 0)]
+    warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
-    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+    #[arg(long, default_value_t = 1.0)]
+    lr_cycles: f32,
 
     // ── LyCORIS algo selection (Phase 2b) ──
     //
@@ -152,58 +219,77 @@ struct Args {
     /// a no-op. `full` and `oft` build successfully but their `forward_delta`
     /// is incompatible with ernie's `base + delta_on_input` call pattern;
     /// Phase 2c will wire merge-into-base.
-    #[arg(long, default_value = "lora")] algo: String,
+    #[arg(long, default_value = "lora")]
+    algo: String,
     /// LoKr Kronecker split factor (ignored for non-LoKr).
-    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    #[arg(long, default_value_t = 16)]
+    lokr_factor: i32,
     /// OFT/BOFT block size (ignored for non-OFT/BOFT).
-    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    #[arg(long, default_value_t = 32)]
+    oft_block_size: usize,
     /// OFT Cayley-Neumann series term count.
-    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    #[arg(long, default_value_t = 5)]
+    oft_neumann_terms: usize,
     /// Tucker decomposition for non-1×1 conv kernels (ernie is linear-only).
-    #[arg(long, default_value_t = false)] use_tucker: bool,
+    #[arg(long, default_value_t = false)]
+    use_tucker: bool,
     /// LoKr only: factorize both W1 and W2 (default false: only W2).
-    #[arg(long, default_value_t = false)] decompose_both: bool,
+    #[arg(long, default_value_t = false)]
+    decompose_both: bool,
     /// Enable DoRA (weight-decomposed LoRA).
-    #[arg(long, default_value_t = false)] dora: bool,
+    #[arg(long, default_value_t = false)]
+    dora: bool,
     /// DoRA magnitude axis (`true` = lycoris-upstream).
-    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
-    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    #[arg(long, default_value_t = true)]
+    dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)]
+    dora_eps: f32,
     /// PEFT/SimpleTuner `--lora_init_type`. Applies to LoCon (the LoRA path)
     /// only. Choices: `default | gaussian | pissa | olora | loftq`. The
     /// PISSA/OLoRA/LoftQ variants parse but error at adapter construction
     /// because flame-core does not yet expose SVD/QR.
-    #[arg(long, default_value = "default")] lora_init_type: String,
+    #[arg(long, default_value = "default")]
+    lora_init_type: String,
     /// SimpleTuner-style `lycoris_config preset.json`. Optional; per-target
     /// `module_algo_map` overrides apply during adapter construction.
-    #[arg(long)] lycoris_config: Option<PathBuf>,
+    #[arg(long)]
+    lycoris_config: Option<PathBuf>,
     /// SimpleTuner-parity perturbed-normal LoKr init. Phase 2b ernie:
     /// no-op stub (ERNIE base weights live in BlockOffloader pinned RAM,
     /// not resident at swap time — same situation as qwenimage). A warning
     /// is logged when scale > 0; Phase 2c will plumb the resident weight
     /// map into this path.
-    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    #[arg(long, default_value_t = 0.0)]
+    init_lokr_norm: f32,
     /// SimpleTuner / ai-toolkit `network.conv` — per-LyCORIS rank for
     /// CONV-layer targets (separate from linear `--rank`). `0` (default)
     /// = fall back to linear rank. Inert when no conv targets are wired
     /// in the model bundle (current state on all EDv2 trainers).
-    #[arg(long, default_value_t = 0)] conv_rank: usize,
+    #[arg(long, default_value_t = 0)]
+    conv_rank: usize,
     /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
     /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
-    #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
+    #[arg(long, default_value_t = 0.0)]
+    conv_alpha: f32,
     /// Per-element dropout on the adapter delta (training only).
-    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lora_dropout: f32,
     /// Per-rank Bernoulli on the down-projection intermediate.
-    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    rank_dropout: f32,
     /// Per-step Bernoulli on the entire adapter.
-    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    module_dropout: f32,
     /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
-    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
+    #[arg(long, default_value_t = false)]
+    rank_dropout_scale: bool,
 
     // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
     /// Route the backward pass through `AutogradContext::backward_v2`
     /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
-    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
 }
 
 /// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
@@ -291,11 +377,19 @@ fn main() -> anyhow::Result<()> {
     config.tread_route_pattern = args.tread_route_pattern.clone();
 
     let model_base = std::path::Path::new(&config.base_model_name);
-    let shards: Vec<PathBuf> = (1..=2).map(|i|
-        model_base.join("transformer").join(format!("diffusion_pytorch_model-0000{i}-of-00002.safetensors"))
-    ).collect();
+    let shards: Vec<PathBuf> = (1..=2)
+        .map(|i| {
+            model_base.join("transformer").join(format!(
+                "diffusion_pytorch_model-0000{i}-of-00002.safetensors"
+            ))
+        })
+        .collect();
 
-    log::info!("Loading Ernie transformer (rank={} alpha={})...", args.rank, args.lora_alpha);
+    log::info!(
+        "Loading Ernie transformer (rank={} alpha={})...",
+        args.rank,
+        args.lora_alpha
+    );
     let mut model = ErnieModel::load(&shards, &config, device.clone())?;
 
     // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
@@ -327,8 +421,8 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("--lora_init_type: {e}"))?,
         ..LycorisBundleConfig::default()
     };
-    let lyc_config = lyc_config
-        .with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
+    let lyc_config =
+        lyc_config.with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
     if algo != LycorisAlgo::None {
         log::info!(
             "[ernie] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
@@ -347,7 +441,8 @@ fn main() -> anyhow::Result<()> {
                 algo.as_str()
             );
         }
-        model.swap_lycoris_bundle(&lyc_config)
+        model
+            .swap_lycoris_bundle(&lyc_config)
             .map_err(|e| anyhow::anyhow!("LyCORIS bundle swap: {e}"))?;
         if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
             // Phase 2c — perturbed-normal LoKr init. Walks lycoris_adapters
@@ -369,7 +464,12 @@ fn main() -> anyhow::Result<()> {
         }
         // Suppress unused-warnings for dropout flags until LycorisLinear
         // exposes a per-call dropout knob (Phase 2c).
-        let _ = (args.lora_dropout, args.rank_dropout, args.module_dropout, args.rank_dropout_scale);
+        let _ = (
+            args.lora_dropout,
+            args.rank_dropout,
+            args.module_dropout,
+            args.rank_dropout_scale,
+        );
     } else {
         log::info!("[ernie] algo='lora' (legacy LoRALinear path, byte-identical)");
     }
@@ -380,8 +480,8 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No trainable parameters — TrainingMethod::Lora produced empty param list");
     }
 
-    let opt_kind = OptimizerKind::parse(&args.optimizer)
-        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    let opt_kind =
+        OptimizerKind::parse(&args.optimizer).map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
     log::info!("[ERNIE] optimizer={}", opt_kind.as_str());
     // Phase 1: caption_dropout. ERNIE has no inline encoder, so the user
     // supplies a `--null-text-cache` produced by `prepare_ernie` on a single
@@ -393,8 +493,11 @@ fn main() -> anyhow::Result<()> {
         match args.null_text_cache.as_ref() {
             Some(p) => match flame_core::serialization::load_file(p, &device) {
                 Ok(s) => {
-                    let nt = s.get("text_embedding")
-                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
+                    let nt = s
+                        .get("text_embedding")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--null-text-cache missing 'text_embedding'")
+                        })?
                         .to_dtype(DType::BF16)?;
                     let nrl: Option<usize> = if let Some(rl_t) = s.get("text_real_len") {
                         let rl = rl_t.to_dtype(DType::F32)?.to_vec()?[0] as usize;
@@ -482,7 +585,10 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     if let Some(resume_path) = args.resume_lora.as_ref() {
-        log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
+        log::info!(
+            "Resuming LoRA weights only (no optimizer state) from {}",
+            resume_path.display()
+        );
         model.load_weights(&resume_path.to_string_lossy())?;
     }
 
@@ -493,7 +599,13 @@ fn main() -> anyhow::Result<()> {
         let named = model.named_parameters();
         checkpoint::apply_lora_weights(&loaded, &named)?;
         if let Optimizer::AdamW(ref mut adam) = opt {
-            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha as f32)?;
+            checkpoint::apply_to_optimizer(
+                &loaded,
+                adam,
+                &named,
+                args.rank,
+                args.lora_alpha as f32,
+            )?;
         } else {
             log::warn!(
                 "[resume-full] non-AdamW resume not yet implemented for {:?}; LoRA weights restored, optimizer state reset",
@@ -502,7 +614,10 @@ fn main() -> anyhow::Result<()> {
         }
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
-            log::warn!("Resumed step ({start_step}) >= --steps ({}) — nothing to do.", args.steps);
+            log::warn!(
+                "Resumed step ({start_step}) >= --steps ({}) — nothing to do.",
+                args.steps
+            );
             return Ok(());
         }
         log::info!("Continuing from step {start_step}/{}", args.steps);
@@ -528,9 +643,10 @@ fn main() -> anyhow::Result<()> {
 
     // Phase 2: validation harness — held-out cache + cadence. None at default
     // (validation_every_steps == 0) → no harness, no branch, byte-identical.
-    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
-        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
-    {
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) = (
+        args.validation_dataset_dir.as_ref(),
+        args.validation_every_steps,
+    ) {
         if n > 0 {
             let v = ValidationLoop::new(dir, n)?;
             log::info!(
@@ -550,7 +666,9 @@ fn main() -> anyhow::Result<()> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
     let debug_grads_enabled = dbg::enabled("ERNIE_DEBUG_GRADS");
     if debug_grads_enabled {
-        log::info!("ERNIE_DEBUG_GRADS=1 — per-step LoRA grad summaries enabled at steps 0/1/2/100/200/...");
+        log::info!(
+            "ERNIE_DEBUG_GRADS=1 — per-step LoRA grad summaries enabled at steps 0/1/2/100/200/..."
+        );
     }
 
     // ── Periodic-sample setup ────────────────────────────────────────────
@@ -558,11 +676,17 @@ fn main() -> anyhow::Result<()> {
     // VAE is loaded lazily per sample (small, cheap).
     let periodic = args.sample_every > 0;
     let (sample_cap, sample_uncond, sample_vae_path) = if periodic {
-        let te_path = args.sample_text_ckpt.as_ref()
+        let te_path = args
+            .sample_text_ckpt
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-text-ckpt"))?;
-        let tok_path = args.sample_tokenizer.as_ref()
+        let tok_path = args
+            .sample_tokenizer
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-tokenizer"))?;
-        let vae_path = args.sample_vae.as_ref()
+        let vae_path = args
+            .sample_vae
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-vae"))?
             .clone();
         const ERNIE_MAX_LEN: usize = 512;
@@ -573,10 +697,15 @@ fn main() -> anyhow::Result<()> {
         let encode = |text: &str| -> anyhow::Result<Vec<i32>> {
             let e = tok.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
             let mut ids: Vec<i32> = e.get_ids().iter().map(|&x| x as i32).collect();
-            if ids.len() > ERNIE_MAX_LEN { ids.truncate(ERNIE_MAX_LEN); }
+            if ids.len() > ERNIE_MAX_LEN {
+                ids.truncate(ERNIE_MAX_LEN);
+            }
             Ok(ids)
         };
-        let (cond_ids, unc_ids) = (encode(&args.sample_prompt)?, encode(&args.sample_neg_prompt)?);
+        let (cond_ids, unc_ids) = (
+            encode(&args.sample_prompt)?,
+            encode(&args.sample_neg_prompt)?,
+        );
         let te = Mistral3bEncoder::load(te_path.to_str().unwrap(), &device)?;
         let cap = te.encode_with_pad(&cond_ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
         let unc = te.encode_with_pad(&unc_ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
@@ -584,12 +713,18 @@ fn main() -> anyhow::Result<()> {
         let unc_len = unc_ids.len().max(1);
         let cap_trim = cap.narrow(1, 0, cap_len)?.contiguous()?;
         let unc_trim = unc.narrow(1, 0, unc_len)?.contiguous()?;
-        log::info!("[sample-setup] cap={:?} uncond={:?}; dropping text encoder",
-            cap_trim.shape().dims(), unc_trim.shape().dims());
+        log::info!(
+            "[sample-setup] cap={:?} uncond={:?}; dropping text encoder",
+            cap_trim.shape().dims(),
+            unc_trim.shape().dims()
+        );
         drop(te);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
-        log::info!("[sample-setup] periodic sample enabled (every {} steps).", args.sample_every);
+        log::info!(
+            "[sample-setup] periodic sample enabled (every {} steps).",
+            args.sample_every
+        );
         (Some(cap_trim), Some(unc_trim), Some(vae_path))
     } else {
         (None, None, None)
@@ -603,8 +738,16 @@ fn main() -> anyhow::Result<()> {
         let out_path = args.output_dir.join("sample_step0_base.png");
         log::info!("[sample step=0] BASELINE → {}", out_path.display());
         if let Err(e) = ernie_inline_sample(
-            &mut model, cap, unc, vae_path, &out_path,
-            args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed, &device,
+            &mut model,
+            cap,
+            unc,
+            vae_path,
+            &out_path,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            args.sample_seed,
+            &device,
         ) {
             log::warn!("[sample step=0] failed: {e}");
         }
@@ -613,8 +756,14 @@ fn main() -> anyhow::Result<()> {
     let board = BoardWriter::open(
         &args.output_dir,
         BoardWriter::new_session_id(),
-        if start_step > 0 { Some(start_step as u64) } else { None },
-    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+        if start_step > 0 {
+            Some(start_step as u64)
+        } else {
+            None
+        },
+    )
+    .map_err(|e| log::warn!("board.db open failed: {e}"))
+    .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
     }
@@ -675,11 +824,8 @@ fn main() -> anyhow::Result<()> {
         // Continuous timestep in [0, 1000) is what the transformer's sin/cos sees.
         let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
         // Default-off: Strategy::None → returns raw_t unchanged.
-        let t_continuous = timestep_bias::apply_bias(
-            raw_t,
-            NUM_TRAIN_TIMESTEPS as f32,
-            &timestep_bias_cfg,
-        );
+        let t_continuous =
+            timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
         let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
         let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
 
@@ -706,20 +852,23 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let noisy = perturbed_noise.mul_scalar(sigma)?
+        let noisy = perturbed_noise
+            .mul_scalar(sigma)?
             .add(&latent.mul_scalar(1.0 - sigma)?)?;
         let target = clean_noise.sub(&latent)?;
-        let timestep = Tensor::from_vec(
-            vec![t_continuous],
-            Shape::from_dims(&[1]),
-            device.clone(),
-        )?;
+        let timestep =
+            Tensor::from_vec(vec![t_continuous], Shape::from_dims(&[1]), device.clone())?;
 
         if step == 0 {
             let l_dims = latent.shape().dims().to_vec();
             let t_dims = txt.shape().dims().to_vec();
-            log::info!("step 0 | latent={:?} text={:?} sigma={:.4} (idx={})",
-                l_dims, t_dims, sigma, sigma_idx);
+            log::info!(
+                "step 0 | latent={:?} text={:?} sigma={:.4} (idx={})",
+                l_dims,
+                t_dims,
+                sigma,
+                sigma_idx
+            );
         }
 
         let pred = model.forward(&noisy, &txt, &timestep)?;
@@ -728,7 +877,8 @@ fn main() -> anyhow::Result<()> {
         if pred.shape().dims() != target.shape().dims() {
             anyhow::bail!(
                 "predicted flow shape {:?} != target {:?} — model.forward output mismatch",
-                pred.shape().dims(), target.shape().dims()
+                pred.shape().dims(),
+                target.shape().dims()
             );
         }
 
@@ -782,10 +932,8 @@ fn main() -> anyhow::Result<()> {
         // pattern".  See flame-core/docs/TRAINER_DIAGNOSTICS.md.
         if step == 1 {
             let named = model.named_parameters();
-            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = named
-                .iter()
-                .map(|(n, p)| (n.as_str(), p))
-                .collect();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
             let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
             if report.is_clean() {
                 log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
@@ -806,7 +954,11 @@ fn main() -> anyhow::Result<()> {
         // `[OT_DEBUG step=N] t=T loss(pre-scale)=L | pred[mean=… std=… max|·|=…] target[…]`.
         // Side-by-side `diff` against an upstream Python run on the same dataset
         // immediately surfaces forward / loss-magnitude divergence.
-        if debug_grads_enabled || std::env::var("OT_DEBUG_STATS").map_or(false, |v| !matches!(v.as_str(), "0"|""|"false"|"FALSE")) {
+        if debug_grads_enabled
+            || std::env::var("OT_DEBUG_STATS").map_or(false, |v| {
+                !matches!(v.as_str(), "0" | "" | "false" | "FALSE")
+            })
+        {
             let p_st = dbg::stats(&pred);
             let t_st = dbg::stats(&target);
             eprintln!(
@@ -822,17 +974,25 @@ fn main() -> anyhow::Result<()> {
         // identity (verified vs OT preset).
         const CLIP_GRAD_NORM: f32 = 1.0;
         // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.
-        let grad_refs: Vec<&flame_core::Tensor> = params
-            .iter()
-            .filter_map(|p| grads.get(p.id()))
-            .collect();
-        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
-            .item()? as f32;
+        let grad_refs: Vec<&flame_core::Tensor> =
+            params.iter().filter_map(|p| grads.get(p.id())).collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
         // Match OT_DEBUG_STATS line in upstream Python so a `grep grad_norm_pre_clip` diffs cleanly.
-        if debug_grads_enabled || std::env::var("OT_DEBUG_STATS").map_or(false, |v| !matches!(v.as_str(), "0"|""|"false"|"FALSE")) {
-            eprintln!("[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}", step, total_norm);
+        if debug_grads_enabled
+            || std::env::var("OT_DEBUG_STATS").map_or(false, |v| {
+                !matches!(v.as_str(), "0" | "" | "false" | "FALSE")
+            })
+        {
+            eprintln!(
+                "[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}",
+                step, total_norm
+            );
         }
-        let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
+        let scale = if total_norm > CLIP_GRAD_NORM {
+            CLIP_GRAD_NORM / total_norm
+        } else {
+            1.0
+        };
         for param in &params {
             if let Some(g) = grads.get(param.id()) {
                 let g_scaled = if scale < 1.0 {
@@ -865,7 +1025,9 @@ fn main() -> anyhow::Result<()> {
             opt.zero_grad(&params);
             if let Some(ref mut e) = ema {
                 e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
-                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
+                    .map_err(|err| {
+                        anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1)
+                    })?;
             }
         }
         AutogradContext::clear();
@@ -873,8 +1035,15 @@ fn main() -> anyhow::Result<()> {
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
             "ERNIE-lora",
-            step, args.steps, cache_files.len(), 1,
-            loss_val, total_norm, cur_lr, t_start, board.as_ref(),
+            step,
+            args.steps,
+            cache_files.len(),
+            1,
+            loss_val,
+            total_norm,
+            cur_lr,
+            t_start,
+            board.as_ref(),
         );
 
         // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
@@ -928,12 +1097,14 @@ fn main() -> anyhow::Result<()> {
                     // uses its OWN run-side RNG so it does not perturb the
                     // training-side seeded sequence (byte invariance).
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let t_continuous = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    let t_continuous =
+                        timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
                     let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
                     let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
                     let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?
                         .to_dtype(DType::BF16)?;
-                    let v_noisy = v_noise.mul_scalar(sigma)?
+                    let v_noisy = v_noise
+                        .mul_scalar(sigma)?
                         .add(&v_lat.mul_scalar(1.0 - sigma)?)?;
                     let v_target = v_noise.sub(&v_lat)?;
                     let v_timestep = Tensor::from_vec(
@@ -948,7 +1119,8 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                     };
-                    let v_loss = v_pred.to_dtype(DType::F32)?
+                    let v_loss = v_pred
+                        .to_dtype(DType::F32)?
                         .sub(&v_target.to_dtype(DType::F32)?)?
                         .square()?
                         .mean()?;
@@ -978,14 +1150,17 @@ fn main() -> anyhow::Result<()> {
         let step_num = step + 1;
         // EMA swap: when --ema --ema-validation-swap, save and sample see
         // EMA-averaged weights. Backup is restored at the end of this block.
-        let ema_backup = if periodic && step_num % args.sample_every == 0
+        let ema_backup = if periodic
+            && step_num % args.sample_every == 0
             && step_num < args.steps
             && args.ema_validation_swap
         {
             if let Some(ref e) = ema {
                 let _g = AutogradContext::no_grad();
-                Some(e.swap_with_live(&params)
-                    .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
+                Some(
+                    e.swap_with_live(&params)
+                        .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?,
+                )
             } else {
                 None
             }
@@ -993,12 +1168,19 @@ fn main() -> anyhow::Result<()> {
             None
         };
         if periodic && step_num % args.sample_every == 0 && step_num < args.steps {
-            let mid_ckpt = args.output_dir.join(format!("ernie_lora_step{step_num}.safetensors"));
+            let mid_ckpt = args
+                .output_dir
+                .join(format!("ernie_lora_step{step_num}.safetensors"));
             if save_mode_full {
                 if let Optimizer::AdamW(ref adam) = opt {
                     let header = CkptHeader::from_adamw(
-                        "train_ernie", step_num as u64, adam,
-                        args.rank, args.lora_alpha as f32, SEED, String::new(),
+                        "train_ernie",
+                        step_num as u64,
+                        adam,
+                        args.rank,
+                        args.lora_alpha as f32,
+                        SEED,
+                        String::new(),
                     );
                     let named = model.named_parameters();
                     if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, adam, &header) {
@@ -1024,8 +1206,16 @@ fn main() -> anyhow::Result<()> {
             let sample_out = args.output_dir.join(format!("sample_step{step_num}.png"));
             log::info!("[sample step={step_num}] → {}", sample_out.display());
             if let Err(e) = ernie_inline_sample(
-                &mut model, cap, unc, vae_path, &sample_out,
-                args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed, &device,
+                &mut model,
+                cap,
+                unc,
+                vae_path,
+                &sample_out,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_seed,
+                &device,
             ) {
                 log::warn!("[sample step={step_num}] failed: {e}");
             }
@@ -1041,23 +1231,41 @@ fn main() -> anyhow::Result<()> {
     if args.ema_validation_swap {
         if let Some(ref e) = ema {
             let _g = AutogradContext::no_grad();
-            let _ = e.swap_with_live(&params)
+            let _ = e
+                .swap_with_live(&params)
                 .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
             log::info!("[ema] swapped EMA shadow into live params for final save + sample");
         }
     }
 
     let trained = args.steps - start_step;
-    let avg_loss = if trained > 0 { total_loss / trained as f32 } else { 0.0 };
-    log::info!("Training complete: {trained} new steps (total={}), avg loss={:.4}", args.steps, avg_loss);
-    if let Some(b) = &board { b.set_status("completed"); }
+    let avg_loss = if trained > 0 {
+        total_loss / trained as f32
+    } else {
+        0.0
+    };
+    log::info!(
+        "Training complete: {trained} new steps (total={}), avg loss={:.4}",
+        args.steps,
+        avg_loss
+    );
+    if let Some(b) = &board {
+        b.set_status("completed");
+    }
 
-    let ckpt = args.output_dir.join(format!("ernie_lora_{}steps.safetensors", args.steps));
+    let ckpt = args
+        .output_dir
+        .join(format!("ernie_lora_{}steps.safetensors", args.steps));
     if save_mode_full {
         if let Optimizer::AdamW(ref adam) = opt {
             let header = CkptHeader::from_adamw(
-                "train_ernie", args.steps as u64, adam,
-                args.rank, args.lora_alpha as f32, SEED, String::new(),
+                "train_ernie",
+                args.steps as u64,
+                adam,
+                args.rank,
+                args.lora_alpha as f32,
+                SEED,
+                String::new(),
             );
             let named = model.named_parameters();
             if let Err(e) = checkpoint::save_full(&ckpt, &named, adam, &header) {
@@ -1087,11 +1295,25 @@ fn main() -> anyhow::Result<()> {
         let cap = sample_cap.as_ref().unwrap();
         let unc = sample_uncond.as_ref().unwrap();
         let vae_path = sample_vae_path.as_ref().unwrap();
-        let sample_out = args.output_dir.join(format!("sample_step{}.png", args.steps));
-        log::info!("[sample step={} FINAL] → {}", args.steps, sample_out.display());
+        let sample_out = args
+            .output_dir
+            .join(format!("sample_step{}.png", args.steps));
+        log::info!(
+            "[sample step={} FINAL] → {}",
+            args.steps,
+            sample_out.display()
+        );
         if let Err(e) = ernie_inline_sample(
-            &mut model, cap, unc, vae_path, &sample_out,
-            args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed, &device,
+            &mut model,
+            cap,
+            unc,
+            vae_path,
+            &sample_out,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            args.sample_seed,
+            &device,
         ) {
             log::warn!("[sample final] failed: {e}");
         }
@@ -1121,8 +1343,8 @@ fn ernie_inline_sample(
     use rand::SeedableRng;
     let _rng = rand::rngs::StdRng::seed_from_u64(seed);
     let latent_shape = Shape::from_dims(&[1, 128, h_lat, w_lat]);
-    let mut latent = Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
+    let mut latent =
+        Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?.to_dtype(DType::BF16)?;
 
     for step in 0..steps {
         let sigma = sigmas[step];
@@ -1145,7 +1367,11 @@ fn ernie_inline_sample(
 
     let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
     let dims = img.shape().dims();
-    let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
+    let (c, h, w) = if dims.len() == 4 {
+        (dims[1], dims[2], dims[3])
+    } else {
+        (3, dims[0], dims[1])
+    };
     let mut buf = vec![0u8; h * w * 3];
     for y in 0..h {
         for x in 0..w {

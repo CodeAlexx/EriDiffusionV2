@@ -24,36 +24,54 @@ use flame_core::{DType, Shape, Tensor};
 #[derive(Parser)]
 struct Args {
     /// Single prompt. Mutually exclusive with `--prompts-file`.
-    #[arg(long)] prompt: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
     /// Newline-separated prompts file for batch sampling. Blank lines and
     /// `#`-prefixed comments are skipped. Requires `--output-dir`. Encoder
     /// loads once for all prompts; DiT and VAE each load once total.
-    #[arg(long)] prompts_file: Option<PathBuf>,
-    #[arg(long, default_value = "")] negative_prompt: String,
-    #[arg(long, default_value = "ltx2_sample.png")] output: PathBuf,
+    #[arg(long)]
+    prompts_file: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    negative_prompt: String,
+    #[arg(long, default_value = "ltx2_sample.png")]
+    output: PathBuf,
     /// Multi-prompt output directory. Required with `--prompts-file`.
     /// Files are written as `sample_001.png`, `sample_002.png`, ...
-    #[arg(long)] output_dir: Option<PathBuf>,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
     /// Directory of safetensors shards for the LTX-2 transformer.
-    #[arg(long)] transformer_dir: PathBuf,
+    #[arg(long)]
+    transformer_dir: PathBuf,
     /// LTX-2 video VAE checkpoint.
-    #[arg(long)] vae_path: PathBuf,
+    #[arg(long)]
+    vae_path: PathBuf,
     /// Gemma-3 text encoder directory.
-    #[arg(long)] text_ckpt_dir: PathBuf,
+    #[arg(long)]
+    text_ckpt_dir: PathBuf,
     /// Tokenizer.json path for Gemma-3.
-    #[arg(long)] tokenizer_path: PathBuf,
-    #[arg(long, default_value = "256")] size: usize,
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    #[arg(long, default_value = "256")]
+    size: usize,
     /// Number of latent frames. Bootstrap default = 1 (image-as-frame).
     /// Real video must satisfy `(num_frames - 1) % 8 == 0` (1, 9, 17, 25, ...).
-    #[arg(long, default_value = "1")] frames: usize,
-    #[arg(long, default_value = "20")] steps: usize,
-    #[arg(long, default_value = "5.0")] guidance: f32,
-    #[arg(long, default_value = "42")] seed: u64,
-    #[arg(long, default_value = "24.0")] fps: f32,
+    #[arg(long, default_value = "1")]
+    frames: usize,
+    #[arg(long, default_value = "20")]
+    steps: usize,
+    #[arg(long, default_value = "5.0")]
+    guidance: f32,
+    #[arg(long, default_value = "42")]
+    seed: u64,
+    #[arg(long, default_value = "24.0")]
+    fps: f32,
     /// Optional trained LoRA to overlay.
-    #[arg(long)] lora_path: Option<PathBuf>,
-    #[arg(long, default_value = "16")] lora_rank: usize,
-    #[arg(long, default_value = "1.0")] lora_alpha: f64,
+    #[arg(long)]
+    lora_path: Option<PathBuf>,
+    #[arg(long, default_value = "16")]
+    lora_rank: usize,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -70,15 +88,27 @@ fn main() -> anyhow::Result<()> {
         );
     }
     if args.size % 32 != 0 {
-        anyhow::bail!("--size {} must be divisible by 32 (LTX-2 spatial compression)", args.size);
+        anyhow::bail!(
+            "--size {} must be divisible by 32 (LTX-2 spatial compression)",
+            args.size
+        );
     }
 
     let h_lat = args.size / 32;
     let w_lat = args.size / 32;
-    let f_lat = if args.frames == 1 { 1 } else { 1 + (args.frames - 1) / 8 };
+    let f_lat = if args.frames == 1 {
+        1
+    } else {
+        1 + (args.frames - 1) / 8
+    };
     log::info!(
         "Size {}x{} (frames={}) → latent {}x{} (f_lat={})",
-        args.size, args.size, args.frames, h_lat, w_lat, f_lat
+        args.size,
+        args.size,
+        args.frames,
+        h_lat,
+        w_lat,
+        f_lat
     );
 
     // Resolve prompt list. Single-prompt mode keeps the legacy
@@ -89,7 +119,8 @@ fn main() -> anyhow::Result<()> {
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
-            content.lines()
+            content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
@@ -111,13 +142,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 1. Encode prompts.
-    log::info!("[1/4] Text encoding {} prompt(s) + uncond...", prompts.len());
+    log::info!(
+        "[1/4] Text encoding {} prompt(s) + uncond...",
+        prompts.len()
+    );
     let tokenizer = tokenizers::Tokenizer::from_file(&args.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     let te = Gemma3Encoder::load(&args.text_ckpt_dir, device.clone())
         .map_err(|e| anyhow::anyhow!("Gemma3Encoder::load: {e}"))?;
     let encode = |text: &str| -> anyhow::Result<Tensor> {
-        let e = tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let e = tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ids: Vec<i32> = e.get_ids().iter().map(|&x| x as i32).collect();
         if ids.len() > eridiffusion_core::encoders::gemma3::GEMMA3_PROMPT_LEN {
             ids.truncate(eridiffusion_core::encoders::gemma3::GEMMA3_PROMPT_LEN);
@@ -125,12 +161,20 @@ fn main() -> anyhow::Result<()> {
         let pad_n = eridiffusion_core::encoders::gemma3::GEMMA3_PROMPT_LEN - ids.len();
         let mut padded = vec![0i32; pad_n];
         padded.extend_from_slice(&ids);
-        te.encode(&padded).map_err(|e| anyhow::anyhow!("encode: {e}"))
+        te.encode(&padded)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))
     };
-    let conds: Vec<Tensor> = prompts.iter().enumerate()
+    let conds: Vec<Tensor> = prompts
+        .iter()
+        .enumerate()
         .map(|(i, p)| {
             let c = encode(p)?;
-            log::info!("  prompt {}/{}: cond shape={:?}", i + 1, prompts.len(), c.shape().dims());
+            log::info!(
+                "  prompt {}/{}: cond shape={:?}",
+                i + 1,
+                prompts.len(),
+                c.shape().dims()
+            );
             Ok(c)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -155,12 +199,20 @@ fn main() -> anyhow::Result<()> {
     model.num_frames = f_lat;
     if let Some(lp) = &args.lora_path {
         model.load_weights(lp.to_str().unwrap())?;
-        log::info!("  Applied LoRA from {:?} (rank={}, alpha={})",
-            lp, args.lora_rank, args.lora_alpha);
+        log::info!(
+            "  Applied LoRA from {:?} (rank={}, alpha={})",
+            lp,
+            args.lora_rank,
+            args.lora_alpha
+        );
     }
 
     // 3. Denoise — once per prompt, all latents collected.
-    log::info!("[3/4] Denoising {} prompt(s) × {} steps...", conds.len(), args.steps);
+    log::info!(
+        "[3/4] Denoising {} prompt(s) × {} steps...",
+        conds.len(),
+        args.steps
+    );
     let n_tokens = f_lat * h_lat * w_lat;
     let sigmas = ltx2_sampler::schedule(args.steps, n_tokens);
     let pad_width = std::cmp::max(3, conds.len().to_string().len());
@@ -173,7 +225,9 @@ fn main() -> anyhow::Result<()> {
         let _rng = rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(idx as u64));
         let mut latent = Tensor::randn(
             Shape::from_dims(&[1, 128, f_lat, h_lat, w_lat]),
-            0.0, 1.0, device.clone(),
+            0.0,
+            1.0,
+            device.clone(),
         )?
         .to_dtype(DType::BF16)?;
 
@@ -190,8 +244,14 @@ fn main() -> anyhow::Result<()> {
             latent = ltx2_sampler::euler_step(&latent, &pred, sigma, sigma_next)?;
 
             if step % 5 == 0 || step == args.steps - 1 {
-                log::info!("    prompt {}/{} step {}/{} sigma={:.4}",
-                    idx + 1, conds.len(), step + 1, args.steps, sigma);
+                log::info!(
+                    "    prompt {}/{} step {}/{} sigma={:.4}",
+                    idx + 1,
+                    conds.len(),
+                    step + 1,
+                    args.steps,
+                    sigma
+                );
             }
         }
         latents.push(latent);
@@ -203,9 +263,11 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("vae load: {e}"))?;
 
     for (idx, latent) in latents.iter().enumerate() {
-        let denormed = vae.denormalize(latent)
+        let denormed = vae
+            .denormalize(latent)
             .map_err(|e| anyhow::anyhow!("denormalize prompt {}: {e}", idx + 1))?;
-        let pixel_video = vae.decode_video(&denormed)
+        let pixel_video = vae
+            .decode_video(&denormed)
             .map_err(|e| anyhow::anyhow!("decode_video prompt {}: {e}", idx + 1))?;
 
         // 5. Save first frame as PNG. TODO: full video MP4 encode for F > 1.
@@ -234,7 +296,11 @@ fn main() -> anyhow::Result<()> {
         }
         let out_path = if multi_mode {
             let dir = args.output_dir.as_ref().unwrap();
-            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+            dir.join(format!(
+                "sample_{:0>width$}.png",
+                idx + 1,
+                width = pad_width
+            ))
         } else {
             args.output.clone()
         };

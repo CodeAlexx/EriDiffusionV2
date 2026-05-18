@@ -68,7 +68,10 @@ impl Gemma3Encoder {
             "Gemma3Encoder::load — STUB. Real Gemma-3 forward not yet ported. \
              encode() will return zeros. Train against pre-cached embeddings instead."
         );
-        Ok(Self { device, weights_loaded: false })
+        Ok(Self {
+            device,
+            weights_loaded: false,
+        })
     }
 
     /// Encode a single (already-tokenized, already-left-padded) input id sequence.

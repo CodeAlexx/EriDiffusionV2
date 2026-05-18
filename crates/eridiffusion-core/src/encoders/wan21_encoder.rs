@@ -43,13 +43,13 @@ type Weights = HashMap<String, Tensor>;
 // ---------------------------------------------------------------------------
 
 const MEAN: [f32; 16] = [
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-    0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517,
+    -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
 ];
 
 const STD: [f32; 16] = [
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-    3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
+    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579,
+    1.6382, 1.1253, 2.8251, 1.9160,
 ];
 
 // ---------------------------------------------------------------------------
@@ -103,14 +103,19 @@ impl CausalConv3d {
         )?;
         conv.weight = get(weights, &format!("{prefix}.weight"))?.to_dtype(DType::F32)?;
         conv.bias_tensor = Some(get(weights, &format!("{prefix}.bias"))?.to_dtype(DType::F32)?);
-        Ok(Self { conv, time_pad, zero_pad: false })
+        Ok(Self {
+            conv,
+            time_pad,
+            zero_pad: false,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x_padded = if self.time_pad > 0 {
             if self.zero_pad {
                 let dims = x.shape().dims().to_vec();
-                let pad_shape = Shape::from_dims(&[dims[0], dims[1], self.time_pad, dims[3], dims[4]]);
+                let pad_shape =
+                    Shape::from_dims(&[dims[0], dims[1], self.time_pad, dims[3], dims[4]]);
                 let zeros = Tensor::zeros_dtype(pad_shape, x.dtype(), x.device().clone())?;
                 Tensor::cat(&[&zeros, x], 2)?
             } else {
@@ -122,16 +127,32 @@ impl CausalConv3d {
             x.clone()
         };
         let is_bf16 = x_padded.dtype() == DType::BF16;
-        let input = if is_bf16 { x_padded.to_dtype(DType::F32)? } else { x_padded };
+        let input = if is_bf16 {
+            x_padded.to_dtype(DType::F32)?
+        } else {
+            x_padded
+        };
         let out = self.conv.forward(&input)?;
-        if is_bf16 { out.to_dtype(DType::BF16) } else { Ok(out) }
+        if is_bf16 {
+            out.to_dtype(DType::BF16)
+        } else {
+            Ok(out)
+        }
     }
 
     fn forward_raw(&self, x: &Tensor) -> Result<Tensor> {
         let is_bf16 = x.dtype() == DType::BF16;
-        let input = if is_bf16 { x.to_dtype(DType::F32)? } else { x.clone() };
+        let input = if is_bf16 {
+            x.to_dtype(DType::F32)?
+        } else {
+            x.clone()
+        };
         let out = self.conv.forward(&input)?;
-        if is_bf16 { out.to_dtype(DType::BF16) } else { Ok(out) }
+        if is_bf16 {
+            out.to_dtype(DType::BF16)
+        } else {
+            Ok(out)
+        }
     }
 }
 
@@ -140,12 +161,18 @@ impl CausalConv3d {
 // per-frame attention path.
 // ---------------------------------------------------------------------------
 
-struct RmsNorm5d { gamma: Tensor, scale: f32 }
+struct RmsNorm5d {
+    gamma: Tensor,
+    scale: f32,
+}
 
 impl RmsNorm5d {
     fn load(weights: &Weights, prefix: &str, dim: usize) -> Result<Self> {
         let gamma = get_bf16(weights, &format!("{prefix}.gamma"))?;
-        Ok(Self { gamma, scale: (dim as f32).sqrt() })
+        Ok(Self {
+            gamma,
+            scale: (dim as f32).sqrt(),
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -159,12 +186,18 @@ impl RmsNorm5d {
     }
 }
 
-struct RmsNorm4d { gamma: Tensor, scale: f32 }
+struct RmsNorm4d {
+    gamma: Tensor,
+    scale: f32,
+}
 
 impl RmsNorm4d {
     fn load(weights: &Weights, prefix: &str, dim: usize) -> Result<Self> {
         let gamma = get_bf16(weights, &format!("{prefix}.gamma"))?;
-        Ok(Self { gamma, scale: (dim as f32).sqrt() })
+        Ok(Self {
+            gamma,
+            scale: (dim as f32).sqrt(),
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -200,23 +233,47 @@ impl ResidualBlock {
     ) -> Result<Self> {
         let norm1 = RmsNorm5d::load(weights, &format!("{prefix}.residual.0"), in_dim)?;
         let conv1 = CausalConv3d::load(
-            weights, &format!("{prefix}.residual.2"), in_dim, out_dim,
-            (3, 3, 3), (1, 1, 1), (1, 1, 1), device,
+            weights,
+            &format!("{prefix}.residual.2"),
+            in_dim,
+            out_dim,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            device,
         )?;
         let norm2 = RmsNorm5d::load(weights, &format!("{prefix}.residual.3"), out_dim)?;
         let conv2 = CausalConv3d::load(
-            weights, &format!("{prefix}.residual.6"), out_dim, out_dim,
-            (3, 3, 3), (1, 1, 1), (1, 1, 1), device,
+            weights,
+            &format!("{prefix}.residual.6"),
+            out_dim,
+            out_dim,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            device,
         )?;
         let shortcut = if in_dim != out_dim {
             Some(CausalConv3d::load(
-                weights, &format!("{prefix}.shortcut"), in_dim, out_dim,
-                (1, 1, 1), (1, 1, 1), (0, 0, 0), device,
+                weights,
+                &format!("{prefix}.shortcut"),
+                in_dim,
+                out_dim,
+                (1, 1, 1),
+                (1, 1, 1),
+                (0, 0, 0),
+                device,
             )?)
         } else {
             None
         };
-        Ok(Self { norm1, conv1, norm2, conv2, shortcut })
+        Ok(Self {
+            norm1,
+            conv1,
+            norm2,
+            conv2,
+            shortcut,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -287,16 +344,15 @@ impl AttentionBlock {
         let attn_out = sdpa_forward(&q, &k, &v, None)
             .map_err(|e| Error::InvalidOperation(format!("Wan21 VAE encoder sdpa: {e}")))?;
 
-        let attn_out = attn_out
-            .squeeze(Some(1))?
-            .permute(&[0, 2, 1])?
-            .reshape(&[b * t, c, h, w])?;
+        let attn_out =
+            attn_out
+                .squeeze(Some(1))?
+                .permute(&[0, 2, 1])?
+                .reshape(&[b * t, c, h, w])?;
 
         let out = self.proj.forward(&attn_out)?;
 
-        let out = out
-            .reshape(&[b, t, c, h, w])?
-            .permute(&[0, 2, 1, 3, 4])?;
+        let out = out.reshape(&[b, t, c, h, w])?.permute(&[0, 2, 1, 3, 4])?;
 
         identity.add(&out)
     }
@@ -307,8 +363,13 @@ impl AttentionBlock {
 // ---------------------------------------------------------------------------
 
 enum DownResample {
-    Downsample2d { conv: Conv2d },
-    Downsample3d { conv: Conv2d, time_conv: CausalConv3d },
+    Downsample2d {
+        conv: Conv2d,
+    },
+    Downsample3d {
+        conv: Conv2d,
+        time_conv: CausalConv3d,
+    },
 }
 
 impl DownResample {
@@ -335,8 +396,14 @@ impl DownResample {
         conv.copy_bias_from(&get_bf16(weights, &format!("{prefix}.resample.1.bias"))?)?;
 
         let time_conv = CausalConv3d::load(
-            weights, &format!("{prefix}.time_conv"), dim, dim,
-            (3, 1, 1), (2, 1, 1), (0, 0, 0), device,
+            weights,
+            &format!("{prefix}.time_conv"),
+            dim,
+            dim,
+            (3, 1, 1),
+            (2, 1, 1),
+            (0, 0, 0),
+            device,
         )?;
 
         Ok(DownResample::Downsample3d { conv, time_conv })
@@ -445,10 +512,7 @@ pub struct Wan21VaeEncoder {
 impl Wan21VaeEncoder {
     /// Load a `qwen_image_vae.safetensors` (zero-pad CausalConv3d variant —
     /// QwenImage / Anima / Z-Image distribution convention).
-    pub fn from_safetensors(
-        path: &str,
-        device: &Arc<cudarc::driver::CudaDevice>,
-    ) -> Result<Self> {
+    pub fn from_safetensors(path: &str, device: &Arc<cudarc::driver::CudaDevice>) -> Result<Self> {
         let weights = load_file(Path::new(path), device)?;
         log::info!(
             "[Wan21VaeEncoder] Loaded {} weight tensors from {}",
@@ -460,10 +524,7 @@ impl Wan21VaeEncoder {
         Ok(enc)
     }
 
-    fn from_weights(
-        weights: &Weights,
-        device: &Arc<cudarc::driver::CudaDevice>,
-    ) -> Result<Self> {
+    fn from_weights(weights: &Weights, device: &Arc<cudarc::driver::CudaDevice>) -> Result<Self> {
         let z_dim: usize = 16;
 
         let mean_4d = Tensor::from_vec(
@@ -482,7 +543,14 @@ impl Wan21VaeEncoder {
         .to_dtype(DType::BF16)?;
 
         let encoder_conv1 = CausalConv3d::load(
-            weights, "encoder.conv1", 3, 96, (3, 3, 3), (1, 1, 1), (1, 1, 1), device,
+            weights,
+            "encoder.conv1",
+            3,
+            96,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            device,
         )?;
 
         // dim_mult=[1,2,4,4], num_res_blocks=2, temporal_downsample=[F,T,T].
@@ -495,7 +563,9 @@ impl Wan21VaeEncoder {
         let enc_dim: usize = 96;
         let dims: Vec<usize> = {
             let mut d = vec![enc_dim];
-            for &m in &dim_mult { d.push(enc_dim * m); }
+            for &m in &dim_mult {
+                d.push(enc_dim * m);
+            }
             d
         };
         let temporal_downsample = [false, true, true];
@@ -508,12 +578,20 @@ impl Wan21VaeEncoder {
             let out_dim = dims[i + 1];
 
             blocks.push(EncoderBlock::Res(ResidualBlock::load(
-                weights, &format!("encoder.downsamples.{idx}"), in_dim, out_dim, device,
+                weights,
+                &format!("encoder.downsamples.{idx}"),
+                in_dim,
+                out_dim,
+                device,
             )?));
             idx += 1;
 
             blocks.push(EncoderBlock::Res(ResidualBlock::load(
-                weights, &format!("encoder.downsamples.{idx}"), out_dim, out_dim, device,
+                weights,
+                &format!("encoder.downsamples.{idx}"),
+                out_dim,
+                out_dim,
+                device,
             )?));
             idx += 1;
 
@@ -521,11 +599,17 @@ impl Wan21VaeEncoder {
                 let t_down = temporal_downsample[i];
                 if t_down {
                     blocks.push(EncoderBlock::Downsample(DownResample::load_3d(
-                        weights, &format!("encoder.downsamples.{idx}"), out_dim, device,
+                        weights,
+                        &format!("encoder.downsamples.{idx}"),
+                        out_dim,
+                        device,
                     )?));
                 } else {
                     blocks.push(EncoderBlock::Downsample(DownResample::load_2d(
-                        weights, &format!("encoder.downsamples.{idx}"), out_dim, device,
+                        weights,
+                        &format!("encoder.downsamples.{idx}"),
+                        out_dim,
+                        device,
                     )?));
                 }
                 idx += 1;
@@ -539,11 +623,25 @@ impl Wan21VaeEncoder {
 
         let head_norm = RmsNorm5d::load(weights, "encoder.head.0", top_dim)?;
         let head_conv = CausalConv3d::load(
-            weights, "encoder.head.2", top_dim, z_dim * 2, (3, 3, 3), (1, 1, 1), (1, 1, 1), device,
+            weights,
+            "encoder.head.2",
+            top_dim,
+            z_dim * 2,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            device,
         )?;
 
         let conv1_top = CausalConv3d::load(
-            weights, "conv1", z_dim * 2, z_dim * 2, (1, 1, 1), (1, 1, 1), (0, 0, 0), device,
+            weights,
+            "conv1",
+            z_dim * 2,
+            z_dim * 2,
+            (1, 1, 1),
+            (1, 1, 1),
+            (0, 0, 0),
+            device,
         )?;
 
         Ok(Self {
@@ -568,7 +666,9 @@ impl Wan21VaeEncoder {
                 EncoderBlock::Res(r) => {
                     r.conv1.zero_pad = true;
                     r.conv2.zero_pad = true;
-                    if let Some(ref mut s) = r.shortcut { s.zero_pad = true; }
+                    if let Some(ref mut s) = r.shortcut {
+                        s.zero_pad = true;
+                    }
                 }
                 EncoderBlock::Downsample(d) => {
                     if let DownResample::Downsample3d { time_conv, .. } = d {
@@ -588,7 +688,9 @@ impl Wan21VaeEncoder {
     /// Internal 5D forward: `[B,3,T,H,W] -> [B,16,T',H/8,W/8]` raw mu (no norm).
     fn encode_video_raw(&self, video: &Tensor) -> Result<Tensor> {
         let mut x = self.encoder_conv1.forward(video)?;
-        for block in &self.downsamples { x = block.forward(&x)?; }
+        for block in &self.downsamples {
+            x = block.forward(&x)?;
+        }
         x = self.mid_res0.forward(&x)?;
         x = self.mid_attn.forward(&x)?;
         x = self.mid_res1.forward(&x)?;
@@ -634,6 +736,9 @@ impl Wan21VaeEncoder {
         let raw_f32 = raw.to_dtype(DType::F32)?;
         let mean_f32 = self.mean_4d.to_dtype(DType::F32)?;
         let inv_std_f32 = self.inv_std_4d.to_dtype(DType::F32)?;
-        raw_f32.sub(&mean_f32)?.mul(&inv_std_f32)?.to_dtype(DType::BF16)
+        raw_f32
+            .sub(&mean_f32)?
+            .mul(&inv_std_f32)?
+            .to_dtype(DType::BF16)
     }
 }

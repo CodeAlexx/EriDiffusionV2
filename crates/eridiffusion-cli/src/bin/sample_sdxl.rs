@@ -13,7 +13,6 @@
 //!   6. SDXL VAE decode → save PNG.
 
 use clap::Parser;
-use flame_core::{DType, Shape, Tensor};
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};
 use eridiffusion_core::encoders::{
     clip_g::ClipGEncoder,
@@ -25,6 +24,7 @@ use eridiffusion_core::sampler::sdxl_sampler::{
     build_time_ids, compute_alpha_bar, ddim_step, euler_a_step, sin_embed_256, timesteps,
     Prediction, SchedulerKind,
 };
+use flame_core::{DType, Shape, Tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -38,67 +38,95 @@ const CLIP_G_PAD_ID: i32 = 0;
 #[derive(Parser)]
 struct Args {
     /// Single prompt. Mutually exclusive with `--prompts-file`.
-    #[arg(long)] prompt: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
     /// Newline-separated prompts file for batch sampling. Blank lines and
     /// `#`-prefixed comments are skipped. Requires `--output-dir`. CLIPs
     /// load once for all prompts; UNet and VAE each load once total.
-    #[arg(long)] prompts_file: Option<PathBuf>,
+    #[arg(long)]
+    prompts_file: Option<PathBuf>,
     /// Negative prompt for CFG. Empty string disables CFG (uses cond pred only).
-    #[arg(long, default_value = "")] negative_prompt: String,
-    #[arg(long, default_value = "output.png")] output: PathBuf,
+    #[arg(long, default_value = "")]
+    negative_prompt: String,
+    #[arg(long, default_value = "output.png")]
+    output: PathBuf,
     /// Multi-prompt output directory. Required with `--prompts-file`.
     /// Files are written as `sample_001.png`, `sample_002.png`, ...
-    #[arg(long)] output_dir: Option<PathBuf>,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
     /// SDXL UNet checkpoint (single safetensors or shard dir).
-    #[arg(long)] unet: PathBuf,
+    #[arg(long)]
+    unet: PathBuf,
     /// SDXL VAE.
-    #[arg(long)] vae_ckpt: PathBuf,
+    #[arg(long)]
+    vae_ckpt: PathBuf,
     /// CLIP-L weights.
-    #[arg(long)] clip_l_ckpt: PathBuf,
+    #[arg(long)]
+    clip_l_ckpt: PathBuf,
     /// CLIP-G weights.
-    #[arg(long)] clip_g_ckpt: PathBuf,
-    #[arg(long)] clip_l_tokenizer: PathBuf,
-    #[arg(long)] clip_g_tokenizer: PathBuf,
+    #[arg(long)]
+    clip_g_ckpt: PathBuf,
+    #[arg(long)]
+    clip_l_tokenizer: PathBuf,
+    #[arg(long)]
+    clip_g_tokenizer: PathBuf,
 
-    #[arg(long, default_value = "1024")] size: usize,
+    #[arg(long, default_value = "1024")]
+    size: usize,
     /// Inference steps. SDXL audit H4: OT preset default is 30 (Euler-A).
-    #[arg(long, default_value = "30")] steps: usize,
-    #[arg(long, default_value = "7.5")] cfg_scale: f32,
+    #[arg(long, default_value = "30")]
+    steps: usize,
+    #[arg(long, default_value = "7.5")]
+    cfg_scale: f32,
     /// CFG-rescale (Lin et al. 2023). OT runtime default is 0.0 — the
     /// 0.7 path only fires when `force_last_timestep=True` (zero-terminal-SNR
     /// v-pred fine-tunes). Pair `--cfg-rescale 0.7` with `--zero-terminal-snr`
     /// at training time.
-    #[arg(long, default_value = "0.0")] cfg_rescale: f32,
-    #[arg(long, default_value = "42")] seed: u64,
+    #[arg(long, default_value = "0.0")]
+    cfg_rescale: f32,
+    #[arg(long, default_value = "42")]
+    seed: u64,
 
     /// Sampler scheduler. SDXL audit H4: OT preset default is `euler_a`.
     /// `ddim` retained as a legacy / determinism opt-in.
-    #[arg(long, default_value = "euler_a")] scheduler: String,
+    #[arg(long, default_value = "euler_a")]
+    scheduler: String,
 
     /// Optional safetensors of a trained LoRA (`train_sdxl` save format).
-    #[arg(long)] lora_path: Option<PathBuf>,
-    #[arg(long, default_value = "16")] lora_rank: usize,
-    #[arg(long, default_value = "1.0")] lora_alpha: f64,
+    #[arg(long)]
+    lora_path: Option<PathBuf>,
+    #[arg(long, default_value = "16")]
+    lora_rank: usize,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f64,
 
     /// Use v-prediction in the sampler (cosmos-style SDXL fine-tunes).
-    #[arg(long)] v_prediction: bool,
+    #[arg(long)]
+    v_prediction: bool,
 }
 
 fn collect_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
-    if path.is_file() { return Ok(vec![path.to_path_buf()]); }
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
     let mut shards: Vec<PathBuf> = std::fs::read_dir(path)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
         .collect();
     shards.sort();
-    if shards.is_empty() { anyhow::bail!("no safetensors at {:?}", path); }
+    if shards.is_empty() {
+        anyhow::bail!("no safetensors at {:?}", path);
+    }
     Ok(shards)
 }
 
 fn load_one_or_dir(
-    path: &std::path::Path, device: &std::sync::Arc<flame_core::CudaDevice>,
+    path: &std::path::Path,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
 ) -> flame_core::Result<HashMap<String, Tensor>> {
-    if path.is_file() { return flame_core::serialization::load_file(path, device); }
+    if path.is_file() {
+        return flame_core::serialization::load_file(path, device);
+    }
     let mut all = HashMap::new();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
         .map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
@@ -116,7 +144,9 @@ fn load_one_or_dir(
 const CLIP_EOS_ID: i32 = 49407;
 
 fn tokenize(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Result<Vec<i32>> {
-    let enc = tok.encode(text, true).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let enc = tok
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
     // SDXL audit CRIT-2: preserve EOS at slot 76 when truncating long
     // captions. See prepare_sdxl.rs::tokenize for the full writeup.
@@ -124,16 +154,21 @@ fn tokenize(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Res
         ids.truncate(CLIP_MAX_LEN - 1);
         ids.push(CLIP_EOS_ID);
     }
-    while ids.len() < CLIP_MAX_LEN { ids.push(pad_id); }
+    while ids.len() < CLIP_MAX_LEN {
+        ids.push(pad_id);
+    }
     Ok(ids)
 }
 
 /// Encode one prompt into (context [1,77,2048], y [1,2816]).
 fn encode_prompt(
     text: &str,
-    tok_l: &tokenizers::Tokenizer, tok_g: &tokenizers::Tokenizer,
-    clip_l: &ClipEncoder, clip_g: &ClipGEncoder,
-    size_emb: &[f32], device: &std::sync::Arc<flame_core::CudaDevice>,
+    tok_l: &tokenizers::Tokenizer,
+    tok_g: &tokenizers::Tokenizer,
+    clip_l: &ClipEncoder,
+    clip_g: &ClipGEncoder,
+    size_emb: &[f32],
+    device: &std::sync::Arc<flame_core::CudaDevice>,
 ) -> anyhow::Result<(Tensor, Tensor)> {
     // SDXL audit H1: per-encoder pad ids (CLIP-L uses EOS, CLIP-G uses 0).
     let ids_l = tokenize(tok_l, text, CLIP_L_PAD_ID)?;
@@ -141,14 +176,20 @@ fn encode_prompt(
     let (clip_l_h, _) = clip_l.encode_sd3(&ids_l)?;
     let (clip_g_h, clip_g_p) = clip_g.encode_sdxl(&ids_g)?;
     let context = Tensor::cat(&[&clip_l_h, &clip_g_h], 2)?.to_dtype(DType::BF16)?;
-    let size_t = Tensor::from_vec(size_emb.to_vec(), Shape::from_dims(&[1, 1536]), device.clone())?
-        .to_dtype(DType::BF16)?;
+    let size_t = Tensor::from_vec(
+        size_emb.to_vec(),
+        Shape::from_dims(&[1, 1536]),
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
     let y = Tensor::cat(&[&clip_g_p, &size_t], 1)?.to_dtype(DType::BF16)?;
     Ok((context, y))
 }
 
 fn save_png(rgb: &Tensor, path: &std::path::Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let rgb_f32 = rgb.to_dtype(DType::F32)?;
     let data = rgb_f32.to_vec()?;
     let dims = rgb_f32.shape().dims().to_vec();
@@ -185,9 +226,18 @@ fn main() -> anyhow::Result<()> {
         "ddim" => SchedulerKind::Ddim,
         other => anyhow::bail!("unknown scheduler '{}': use 'euler_a' or 'ddim'", other),
     };
-    log::info!("Sampling {}x{} → latent {}x{} (sched={:?}, cfg={}, rescale={}, steps={}, v_pred={})",
-        args.size, args.size, h_lat, w_lat, scheduler, args.cfg_scale, args.cfg_rescale,
-        args.steps, args.v_prediction);
+    log::info!(
+        "Sampling {}x{} → latent {}x{} (sched={:?}, cfg={}, rescale={}, steps={}, v_pred={})",
+        args.size,
+        args.size,
+        h_lat,
+        w_lat,
+        scheduler,
+        args.cfg_scale,
+        args.cfg_rescale,
+        args.steps,
+        args.v_prediction
+    );
 
     // 1. Load encoders
     log::info!("[1/4] Loading text encoders...");
@@ -215,7 +265,9 @@ fn main() -> anyhow::Result<()> {
     // 2. Pre-compute size embeddings
     let time_ids = build_time_ids(res, res, 0, 0, res, res);
     let mut size_emb = Vec::with_capacity(6 * 256);
-    for v in time_ids.iter() { size_emb.extend_from_slice(&sin_embed_256(*v)); }
+    for v in time_ids.iter() {
+        size_emb.extend_from_slice(&sin_embed_256(*v));
+    }
 
     // Resolve prompt list. Single-prompt mode keeps the legacy
     // `--prompt` / `--output` contract; multi-prompt mode reads
@@ -225,7 +277,8 @@ fn main() -> anyhow::Result<()> {
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
-            content.lines()
+            content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
@@ -249,19 +302,37 @@ fn main() -> anyhow::Result<()> {
     // 3. Encode cond × N / uncond — encoders all load once and stay
     //    resident until every prompt is encoded.
     log::info!("[2/4] Encoding {} prompt(s) + uncond...", prompts.len());
-    let conds: Vec<(Tensor, Tensor)> = prompts.iter().enumerate()
+    let conds: Vec<(Tensor, Tensor)> = prompts
+        .iter()
+        .enumerate()
         .map(|(i, p)| {
             let pair = encode_prompt(p, &tok_l, &tok_g, &clip_l, &clip_g, &size_emb, &device)?;
-            log::info!("  prompt {}/{}: ctx={:?} y={:?}",
-                i + 1, prompts.len(), pair.0.shape().dims(), pair.1.shape().dims());
+            log::info!(
+                "  prompt {}/{}: ctx={:?} y={:?}",
+                i + 1,
+                prompts.len(),
+                pair.0.shape().dims(),
+                pair.1.shape().dims()
+            );
             Ok(pair)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let do_cfg = args.cfg_scale > 1.0;
     let uncond_pair = if do_cfg {
-        Some(encode_prompt(&args.negative_prompt, &tok_l, &tok_g, &clip_l, &clip_g, &size_emb, &device)?)
-    } else { None };
-    drop(clip_l); drop(clip_g); // free TE VRAM before loading UNet
+        Some(encode_prompt(
+            &args.negative_prompt,
+            &tok_l,
+            &tok_g,
+            &clip_l,
+            &clip_g,
+            &size_emb,
+            &device,
+        )?)
+    } else {
+        None
+    };
+    drop(clip_l);
+    drop(clip_g); // free TE VRAM before loading UNet
 
     // 4. Load UNet (+ optional LoRA)
     log::info!("[3/4] Loading SDXL UNet...");
@@ -288,14 +359,22 @@ fn main() -> anyhow::Result<()> {
     let mut model = SDXLModel::load(&shards, &tc, device.clone())?;
     if let Some(lp) = &args.lora_path {
         model.load_weights(lp.to_str().unwrap())?;
-        log::info!("  Applied LoRA from {:?} (rank={}, alpha={})",
-            lp, args.lora_rank, args.lora_alpha);
+        log::info!(
+            "  Applied LoRA from {:?} (rank={}, alpha={})",
+            lp,
+            args.lora_rank,
+            args.lora_alpha
+        );
     }
 
     // 5. Denoise (Euler-A default per SDXL audit H4; DDIM is opt-in)
     let alpha_bar = compute_alpha_bar();
     let ts = timesteps(args.steps);
-    let pred_kind = if args.v_prediction { Prediction::V } else { Prediction::Epsilon };
+    let pred_kind = if args.v_prediction {
+        Prediction::V
+    } else {
+        Prediction::Epsilon
+    };
 
     use rand::Rng;
     // Single RNG drives both initial noise and Euler-A's per-step ancestral
@@ -310,14 +389,22 @@ fn main() -> anyhow::Result<()> {
             let mag = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f32::consts::PI * u2;
             data.push(mag * theta.cos());
-            if data.len() < n { data.push(mag * theta.sin()); }
+            if data.len() < n {
+                data.push(mag * theta.sin());
+            }
         }
         data.truncate(n);
         data
     }
 
-    log::info!("[4/4] Denoising {} prompt(s) × {} steps (sched={:?}, cfg={}, rescale={})...",
-        conds.len(), args.steps, scheduler, args.cfg_scale, args.cfg_rescale);
+    log::info!(
+        "[4/4] Denoising {} prompt(s) × {} steps (sched={:?}, cfg={}, rescale={})...",
+        conds.len(),
+        args.steps,
+        scheduler,
+        args.cfg_scale,
+        args.cfg_rescale
+    );
     let pad_width = std::cmp::max(3, conds.len().to_string().len());
     let mut latents: Vec<Tensor> = Vec::with_capacity(conds.len());
 
@@ -332,7 +419,8 @@ fn main() -> anyhow::Result<()> {
             sample_normal(&mut rng, n_lat),
             Shape::from_dims(&[1, 4, h_lat, w_lat]),
             device.clone(),
-        )?.to_dtype(DType::BF16)?;
+        )?
+        .to_dtype(DType::BF16)?;
 
         // Euler-A: scale x0 by σ_init = sqrt((1-ᾱ_max)/ᾱ_max). Matches diffusers
         // `EulerAncestralDiscreteScheduler.init_noise_sigma`.
@@ -344,7 +432,8 @@ fn main() -> anyhow::Result<()> {
         }
 
         for (i, &t) in ts.iter().enumerate() {
-            let t_tensor = Tensor::from_vec(vec![t as f32], Shape::from_dims(&[1]), device.clone())?;
+            let t_tensor =
+                Tensor::from_vec(vec![t as f32], Shape::from_dims(&[1]), device.clone())?;
 
             // For Euler-A we hand the model the σ-scaled latent rescaled to
             // unit-variance noisy form (model expects noisy = sqrt(ᾱ)·x0 + sqrt(1-ᾱ)·ε).
@@ -358,17 +447,23 @@ fn main() -> anyhow::Result<()> {
             };
 
             let pred_cond = <SDXLModel as TrainableModel>::forward(
-                &mut model, &model_input, &t_tensor,
-                std::slice::from_ref(ctx_cond), Some(y_cond),
+                &mut model,
+                &model_input,
+                &t_tensor,
+                std::slice::from_ref(ctx_cond),
+                Some(y_cond),
             )?;
             let pred = if let Some((ref ctx_u, ref y_u)) = uncond_pair {
                 let pred_uncond = <SDXLModel as TrainableModel>::forward(
-                    &mut model, &model_input, &t_tensor,
-                    std::slice::from_ref(ctx_u), Some(y_u),
+                    &mut model,
+                    &model_input,
+                    &t_tensor,
+                    std::slice::from_ref(ctx_u),
+                    Some(y_u),
                 )?;
                 // CFG: pred = uncond + cfg_scale * (cond - uncond)
-                let pred_cfg = pred_uncond.add(
-                    &pred_cond.sub(&pred_uncond)?.mul_scalar(args.cfg_scale)?)?;
+                let pred_cfg =
+                    pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(args.cfg_scale)?)?;
                 // CFG-rescale (Lin et al. 2023 §3.4) per OT
                 // `StableDiffusionXLSampler.py:163-169`:
                 //   std_pos  = noise_pred_positive.std(dim=[1..N], keepdim=True)
@@ -388,20 +483,22 @@ fn main() -> anyhow::Result<()> {
                     let non_batch_dims: Vec<usize> = (1..ndim).collect();
                     // std along non-batch dims, keepdim → [B,1,1,...,1].
                     let std_pos = cond_f32.std(Some(&non_batch_dims), true)?;
-                    let std_pred = cfg_f32.std(Some(&non_batch_dims), true)?
-                        .add_scalar(1e-8)?;
+                    let std_pred = cfg_f32.std(Some(&non_batch_dims), true)?.add_scalar(1e-8)?;
                     let ratio = std_pos.div(&std_pred)?;
                     // Broadcast `ratio` over [B,C,H,W] via mul.
                     let ratio_bc = ratio.broadcast_to(cfg_f32.shape())?;
                     let rescaled = cfg_f32.mul(&ratio_bc)?;
                     // Mix: cfg_rescale * rescaled + (1 - cfg_rescale) * pred_cfg.
-                    let mixed = rescaled.mul_scalar(args.cfg_rescale)?
+                    let mixed = rescaled
+                        .mul_scalar(args.cfg_rescale)?
                         .add(&cfg_f32.mul_scalar(1.0 - args.cfg_rescale)?)?;
                     mixed.to_dtype(pred_cfg.dtype())?
                 } else {
                     pred_cfg
                 }
-            } else { pred_cond };
+            } else {
+                pred_cond
+            };
 
             let next_t = ts.get(i + 1).copied();
             let ab_prev = match next_t {
@@ -410,23 +507,29 @@ fn main() -> anyhow::Result<()> {
             };
 
             latent = match scheduler {
-                SchedulerKind::Ddim => {
-                    ddim_step(&latent, &pred, ab_t, ab_prev, pred_kind)?
-                }
+                SchedulerKind::Ddim => ddim_step(&latent, &pred, ab_t, ab_prev, pred_kind)?,
                 SchedulerKind::EulerA => {
                     let n = 1 * 4 * h_lat * w_lat;
                     let noise = Tensor::from_vec(
                         sample_normal(&mut rng, n),
                         Shape::from_dims(&[1, 4, h_lat, w_lat]),
                         device.clone(),
-                    )?.to_dtype(DType::BF16)?;
+                    )?
+                    .to_dtype(DType::BF16)?;
                     euler_a_step(&latent, &pred, ab_t, ab_prev, &noise, pred_kind)?
                 }
             };
 
             if i % 5 == 0 || i == ts.len() - 1 {
-                log::info!("    prompt {}/{} step {}/{} t={} ᾱ={:.4}",
-                    idx + 1, conds.len(), i + 1, ts.len(), t, ab_t);
+                log::info!(
+                    "    prompt {}/{} step {}/{} t={} ᾱ={:.4}",
+                    idx + 1,
+                    conds.len(),
+                    i + 1,
+                    ts.len(),
+                    t,
+                    ab_t
+                );
             }
         }
         latents.push(latent);
@@ -443,7 +546,11 @@ fn main() -> anyhow::Result<()> {
         let rgb = vae.decode(latent)?;
         let out_path = if multi_mode {
             let dir = args.output_dir.as_ref().unwrap();
-            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+            dir.join(format!(
+                "sample_{:0>width$}.png",
+                idx + 1,
+                width = pad_width
+            ))
         } else {
             args.output.clone()
         };

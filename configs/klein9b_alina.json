@@ -8,7 +8,7 @@
   "batch_size": 2,
   "epochs": 1,
   "timestep_distribution": "LOGIT_NORMAL",
-  "timestep_shift": 1.0,
+  "timestep_shift": 1.8,
   "min_noising_strength": 0.0,
   "max_noising_strength": 1.0,
   "mse_strength": 1.0,

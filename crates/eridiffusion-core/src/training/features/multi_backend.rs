@@ -59,10 +59,7 @@ impl MultiBackend {
         let mut backends: Vec<Vec<PathBuf>> = Vec::with_capacity(dirs.len());
         for d in dirs {
             let entries = std::fs::read_dir(d).map_err(|e| {
-                crate::EriDiffusionError::Data(format!(
-                    "multi-backend dir {}: {e}",
-                    d.display()
-                ))
+                crate::EriDiffusionError::Data(format!("multi-backend dir {}: {e}", d.display()))
             })?;
             let mut files: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
@@ -122,11 +119,7 @@ impl MultiBackend {
     /// `repeats[i] == 0` (a zero-repeat backend would have zero effective
     /// weight and could never be sampled — surface as an error rather than
     /// silently dropping the backend).
-    pub fn new_with_repeats(
-        dirs: &[PathBuf],
-        weights: &[f32],
-        repeats: &[u32],
-    ) -> Result<Self> {
+    pub fn new_with_repeats(dirs: &[PathBuf], weights: &[f32], repeats: &[u32]) -> Result<Self> {
         if dirs.len() != weights.len() || weights.len() != repeats.len() {
             return Err(crate::EriDiffusionError::Data(format!(
                 "multi-backend with repeats: {} dirs vs {} weights vs {} repeats — must match",
@@ -282,8 +275,7 @@ mod tests {
         let d2 = make_dir_with_files(2);
         let dirs = vec![d1.path().to_path_buf(), d2.path().to_path_buf()];
         // Weights 1.0/1.0 with repeats 3/1 → effective 3.0/1.0 → 0.75/0.25.
-        let mb =
-            MultiBackend::new_with_repeats(&dirs, &[1.0, 1.0], &[3, 1]).unwrap();
+        let mb = MultiBackend::new_with_repeats(&dirs, &[1.0, 1.0], &[3, 1]).unwrap();
         assert!((mb.weights[0] - 0.75).abs() < 1e-6);
         assert!((mb.weights[1] - 0.25).abs() < 1e-6);
     }

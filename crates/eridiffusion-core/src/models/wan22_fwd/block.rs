@@ -25,8 +25,8 @@
 use flame_core::{CudaDevice, DType, Error, Result, Tensor};
 use std::{collections::HashMap, sync::Arc};
 
-use super::rope::WanRope;
 use super::super::wan22::{LoraTarget, Wan22LoraBundle};
+use super::rope::WanRope;
 
 /// Per-block weight lookup helper.
 fn w<'a>(
@@ -35,9 +35,9 @@ fn w<'a>(
     suffix: &str,
 ) -> Result<&'a Tensor> {
     let key = format!("blocks.{block_idx}.{suffix}");
-    weights.get(&key).ok_or_else(|| {
-        Error::InvalidInput(format!("block_forward: missing weight '{key}'"))
-    })
+    weights
+        .get(&key)
+        .ok_or_else(|| Error::InvalidInput(format!("block_forward: missing weight '{key}'")))
 }
 
 /// Layer norm without affine — F32 for parity with Python's
@@ -51,7 +51,8 @@ fn layer_norm_no_affine(x: &Tensor, eps: f32) -> Result<Tensor> {
     let x_flat = x_f32.reshape(&[batch, hidden])?;
     let mean = x_flat.sum_dim_keepdim(1)?.mul_scalar(1.0 / hidden as f32)?;
     let centered = x_flat.sub(&mean)?;
-    let var = centered.mul(&centered)?
+    let var = centered
+        .mul(&centered)?
         .sum_dim_keepdim(1)?
         .mul_scalar(1.0 / hidden as f32)?;
     let rstd = var.add_scalar(eps)?.sqrt()?.reciprocal()?;
@@ -71,7 +72,8 @@ fn layer_norm_affine(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Re
     let x_flat = x_f32.reshape(&[batch, hidden])?;
     let mean = x_flat.sum_dim_keepdim(1)?.mul_scalar(1.0 / hidden as f32)?;
     let centered = x_flat.sub(&mean)?;
-    let var = centered.mul(&centered)?
+    let var = centered
+        .mul(&centered)?
         .sum_dim_keepdim(1)?
         .mul_scalar(1.0 / hidden as f32)?;
     let rstd = var.add_scalar(eps)?.sqrt()?.reciprocal()?;
@@ -87,7 +89,8 @@ fn rms_norm(x: &Tensor, scale: &Tensor, eps: f32) -> Result<Tensor> {
     let hidden = *dims.last().unwrap();
     let batch: usize = dims[..dims.len() - 1].iter().product();
     let x_flat = x_f32.reshape(&[batch, hidden])?;
-    let rms_sq = x_flat.mul(&x_flat)?
+    let rms_sq = x_flat
+        .mul(&x_flat)?
         .sum_dim_keepdim(1)?
         .mul_scalar(1.0 / hidden as f32)?;
     let inv_rms = rms_sq.add_scalar(eps)?.sqrt()?.reciprocal()?;

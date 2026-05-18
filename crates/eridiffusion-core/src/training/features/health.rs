@@ -7,7 +7,7 @@
 //! Phase 7.5+. It records per-layer post-softmax max-abs attention magnitudes
 //! and flushes to SerenityBoard at step boundaries.
 
-use nvml_wrapper::{Nvml, error::NvmlError};
+use nvml_wrapper::{error::NvmlError, Nvml};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;

@@ -103,7 +103,8 @@ pub fn ddim_step(
     match prediction {
         Prediction::Epsilon => {
             // pred = ε
-            let pred_x0 = x.sub(&pred.mul_scalar((1.0 - ab_t).sqrt())?)?
+            let pred_x0 = x
+                .sub(&pred.mul_scalar((1.0 - ab_t).sqrt())?)?
                 .mul_scalar(1.0 / ab_t.sqrt())?;
             let dir = pred.mul_scalar((1.0 - ab_prev).sqrt())?;
             pred_x0.mul_scalar(ab_prev.sqrt())?.add(&dir)
@@ -111,9 +112,11 @@ pub fn ddim_step(
         Prediction::V => {
             // pred = v ⇒ ε = √ᾱ_t · v + √(1-ᾱ_t) · x_t
             //         pred_x0 = √ᾱ_t · x_t - √(1-ᾱ_t) · v
-            let pred_x0 = x.mul_scalar(ab_t.sqrt())?
+            let pred_x0 = x
+                .mul_scalar(ab_t.sqrt())?
                 .sub(&pred.mul_scalar((1.0 - ab_t).sqrt())?)?;
-            let eps = pred.mul_scalar(ab_t.sqrt())?
+            let eps = pred
+                .mul_scalar(ab_t.sqrt())?
                 .add(&x.mul_scalar((1.0 - ab_t).sqrt())?)?;
             let dir = eps.mul_scalar((1.0 - ab_prev).sqrt())?;
             pred_x0.mul_scalar(ab_prev.sqrt())?.add(&dir)
@@ -165,7 +168,7 @@ pub fn euler_a_step(
         }
         Prediction::V => {
             // unit_var = x · sqrt(ᾱ_t); pred_x0 = sqrt(ᾱ_t)·unit_var - sqrt(1-ᾱ_t)·v
-            x.mul_scalar(ab_t)?  // sqrt(ᾱ) · sqrt(ᾱ) · x
+            x.mul_scalar(ab_t)? // sqrt(ᾱ) · sqrt(ᾱ) · x
                 .sub(&pred.mul_scalar((1.0 - ab_t).sqrt())?)?
         }
     };
@@ -177,13 +180,19 @@ pub fn euler_a_step(
     let sigma_prev_sq = sigma_prev * sigma_prev;
     let sigma_up_sq = if sigma_t_sq > 0.0 {
         sigma_prev_sq * (sigma_t_sq - sigma_prev_sq) / sigma_t_sq
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let sigma_up = sigma_up_sq.max(0.0).sqrt();
     let sigma_down = (sigma_prev_sq - sigma_up_sq).max(0.0).sqrt();
 
     // d = (x - pred_x0) / σ_t
     let dx = x.sub(&pred_x0)?;
-    let d = if sigma_t > 1e-8 { dx.mul_scalar(1.0 / sigma_t)? } else { dx };
+    let d = if sigma_t > 1e-8 {
+        dx.mul_scalar(1.0 / sigma_t)?
+    } else {
+        dx
+    };
 
     // x_next = pred_x0 + σ_down · d + σ_up · noise
     let mut next = pred_x0.add(&d.mul_scalar(sigma_down)?)?;
@@ -197,8 +206,22 @@ pub fn euler_a_step(
 ///   `(orig_h, orig_w, crop_top, crop_left, target_h, target_w)`.
 /// Caller is responsible for embedding it into the 256·6=1536-dim time
 /// vector and concatenating with the CLIP-G pool to form `y` (2816-dim).
-pub fn build_time_ids(orig_h: u32, orig_w: u32, crop_top: u32, crop_left: u32, target_h: u32, target_w: u32) -> [f32; 6] {
-    [orig_h as f32, orig_w as f32, crop_top as f32, crop_left as f32, target_h as f32, target_w as f32]
+pub fn build_time_ids(
+    orig_h: u32,
+    orig_w: u32,
+    crop_top: u32,
+    crop_left: u32,
+    target_h: u32,
+    target_w: u32,
+) -> [f32; 6] {
+    [
+        orig_h as f32,
+        orig_w as f32,
+        crop_top as f32,
+        crop_left as f32,
+        target_h as f32,
+        target_w as f32,
+    ]
 }
 
 /// Sinusoidal embedding of one `add_time_id` value at dim=256, identical

@@ -26,20 +26,22 @@
 //! - Inline sampler at step 0 + every N + final, wrapped in if-let-Err. ✓
 
 use clap::Parser;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
+use eridiffusion_core::debug as dbg;
+use eridiffusion_core::encoders::ltx2_vae::Ltx2Vae;
+use eridiffusion_core::models::ltx2::{AUDIO_INNER_DIM, CAPTION_CHANNELS, INNER_DIM};
+use eridiffusion_core::models::{Ltx2Model, TrainableModel};
+use eridiffusion_core::sampler::ltx2_sampler;
+use eridiffusion_core::training::board::BoardWriter;
+use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::{
     ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
     validation::ValidationLoop,
 };
-use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::training_features::OptimizerKind;
-use eridiffusion_core::debug as dbg;
-use eridiffusion_core::encoders::ltx2_vae::Ltx2Vae;
-use eridiffusion_core::models::{Ltx2Model, TrainableModel};
-use eridiffusion_core::sampler::ltx2_sampler;
-use eridiffusion_core::training::board::BoardWriter;
 use flame_core::adam::AdamW;
 use flame_core::autograd::AutogradContext;
 use flame_core::{DType, Shape, Tensor};
@@ -47,114 +49,531 @@ use flame_core::{DType, Shape, Tensor};
 const SEED: u64 = 42;
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
 
+#[derive(Clone, Debug)]
+enum Ltx2CacheSample {
+    Legacy(PathBuf),
+    Paired {
+        latent: PathBuf,
+        text: PathBuf,
+        audio: Option<PathBuf>,
+    },
+}
+
+fn discover_ltx2_cache_samples(
+    cache_dir: &Path,
+    require_audio: bool,
+) -> anyhow::Result<Vec<Ltx2CacheSample>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(cache_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map_or(false, |e| e == "safetensors"))
+        .collect();
+    files.sort();
+
+    let mut text_by_base: HashMap<String, PathBuf> = HashMap::new();
+    let mut audio_by_base: HashMap<String, PathBuf> = HashMap::new();
+    for path in &files {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if let Some(base) = stem.strip_suffix("_ltx2_te") {
+                text_by_base.insert(base.to_string(), path.clone());
+            } else if let Some(base) = stem.strip_suffix("_ltx2_audio") {
+                audio_by_base.insert(base.to_string(), path.clone());
+            }
+        }
+    }
+
+    if text_by_base.is_empty() {
+        return Ok(files.into_iter().map(Ltx2CacheSample::Legacy).collect());
+    }
+
+    let mut paired = Vec::new();
+    for path in &files {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.ends_with("_ltx2_te") || stem.ends_with("_ltx2_audio") {
+            continue;
+        }
+        let Some(raw_base) = stem.strip_suffix("_ltx2") else {
+            continue;
+        };
+        let paired_text = text_by_base
+            .get(raw_base)
+            .or_else(|| text_by_base.get(strip_resolution_suffix(raw_base)));
+        if let Some(text) = paired_text {
+            let audio = audio_by_base
+                .get(raw_base)
+                .or_else(|| audio_by_base.get(strip_resolution_suffix(raw_base)))
+                .cloned();
+            if require_audio && audio.is_none() {
+                log::warn!(
+                    "[cache] skipping {}: --ltx2-mode av requires matching *_ltx2_audio.safetensors",
+                    path.display()
+                );
+                continue;
+            }
+            paired.push(Ltx2CacheSample::Paired {
+                latent: path.clone(),
+                text: text.clone(),
+                audio,
+            });
+        } else {
+            log::warn!(
+                "[cache] skipping {}: no matching *_ltx2_te.safetensors text cache",
+                path.display()
+            );
+        }
+    }
+
+    if paired.is_empty() {
+        log::warn!(
+            "[cache] found *_ltx2_te.safetensors files but no paired *_ltx2.safetensors latents; falling back to legacy one-file cache mode"
+        );
+        Ok(files.into_iter().map(Ltx2CacheSample::Legacy).collect())
+    } else {
+        Ok(paired)
+    }
+}
+
+fn strip_resolution_suffix(base: &str) -> &str {
+    let Some((prefix, last)) = base.rsplit_once('_') else {
+        return base;
+    };
+    let Some((w, h)) = last.split_once('x') else {
+        return base;
+    };
+    if !w.is_empty()
+        && !h.is_empty()
+        && w.chars().all(|c| c.is_ascii_digit())
+        && h.chars().all(|c| c.is_ascii_digit())
+    {
+        prefix
+    } else {
+        base
+    }
+}
+
+fn tensor_by_keys(
+    map: &HashMap<String, Tensor>,
+    keys: &[&str],
+    path: &Path,
+    what: &str,
+) -> anyhow::Result<Tensor> {
+    for key in keys {
+        if let Some(t) = map.get(*key) {
+            return Ok(t.clone());
+        }
+    }
+    anyhow::bail!(
+        "{} cache {} missing any of keys {:?}",
+        what,
+        path.display(),
+        keys
+    );
+}
+
+fn normalize_ltx2_latent(t: Tensor, path: &Path) -> anyhow::Result<Tensor> {
+    let t = t.to_dtype(DType::BF16)?;
+    let dims = t.shape().dims().to_vec();
+    match dims.as_slice() {
+        [128, _f, _h, _w] => Ok(t.unsqueeze(0)?),
+        [_b, 128, _f, _h, _w] => Ok(t),
+        _ => anyhow::bail!(
+            "latent cache {} has shape {:?}; expected [128,F,H,W] or [B,128,F,H,W]",
+            path.display(),
+            dims
+        ),
+    }
+}
+
+fn normalize_ltx2_text(t: Tensor, path: &Path) -> anyhow::Result<Tensor> {
+    let t = t.to_dtype(DType::BF16)?;
+    let dims = t.shape().dims().to_vec();
+    let text = match dims.as_slice() {
+        [_tokens, c] if *c == INNER_DIM || *c == CAPTION_CHANNELS => t.unsqueeze(0)?,
+        [_b, _tokens, c] if *c == INNER_DIM || *c == CAPTION_CHANNELS => t,
+        _ => anyhow::bail!(
+            "text cache {} has shape {:?}; expected [T,{}|{}] or [B,T,{}|{}]",
+            path.display(),
+            dims,
+            CAPTION_CHANNELS,
+            INNER_DIM,
+            CAPTION_CHANNELS,
+            INNER_DIM
+        ),
+    };
+    Ok(text)
+}
+
+fn normalize_ltx2_audio_text(t: Tensor, path: &Path) -> anyhow::Result<Tensor> {
+    let t = t.to_dtype(DType::BF16)?;
+    let dims = t.shape().dims().to_vec();
+    let text = match dims.as_slice() {
+        [_tokens, c] if *c == AUDIO_INNER_DIM || *c == CAPTION_CHANNELS => t.unsqueeze(0)?,
+        [_b, _tokens, c] if *c == AUDIO_INNER_DIM || *c == CAPTION_CHANNELS => t,
+        _ => anyhow::bail!(
+            "audio text cache {} has shape {:?}; expected [T,{}|{}] or [B,T,{}|{}]",
+            path.display(),
+            dims,
+            AUDIO_INNER_DIM,
+            CAPTION_CHANNELS,
+            AUDIO_INNER_DIM,
+            CAPTION_CHANNELS
+        ),
+    };
+    Ok(text)
+}
+
+fn normalize_ltx2_audio_latent(t: Tensor, path: &Path) -> anyhow::Result<Tensor> {
+    let t = t.to_dtype(DType::BF16)?;
+    let dims = t.shape().dims().to_vec();
+    match dims.as_slice() {
+        [8, _t, 16] => Ok(t.unsqueeze(0)?),
+        [_b, 8, _t, 16] => Ok(t),
+        [_t, 16, 8] => Ok(t.permute(&[2, 0, 1])?.unsqueeze(0)?),
+        [_b, _t, 16, 8] => Ok(t.permute(&[0, 3, 1, 2])?),
+        [_t, 128] => Ok(t.reshape(&[1, 1, dims[0], 128])?),
+        [_b, _t, 128] => Ok(t.reshape(&[dims[0], 1, dims[1], 128])?),
+        _ => anyhow::bail!(
+            "audio latent cache {} has shape {:?}; expected [8,T,16], [B,8,T,16], [T,16,8], [B,T,16,8], [T,128], or [B,T,128]",
+            path.display(),
+            dims
+        ),
+    }
+}
+
+#[derive(Clone)]
+struct Ltx2LoadedSample {
+    latent: Tensor,
+    text: Tensor,
+    audio_latent: Option<Tensor>,
+    audio_text: Option<Tensor>,
+}
+
+fn load_ltx2_cache_sample(
+    sample: &Ltx2CacheSample,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> anyhow::Result<Ltx2LoadedSample> {
+    match sample {
+        Ltx2CacheSample::Legacy(path) => {
+            let map = flame_core::serialization::load_file(path, device)?;
+            let latent = tensor_by_keys(&map, &["latent", "latents"], path, "latent")?;
+            let text = tensor_by_keys(
+                &map,
+                &[
+                    "text_embedding",
+                    "text_hidden",
+                    "text_bfloat16",
+                    "video_prompt_embeds_bfloat16",
+                    "video_prompt_embeds",
+                    "prompt_embeds",
+                ],
+                path,
+                "text",
+            )?;
+            let audio_latent = map
+                .iter()
+                .find(|(k, _)| k.starts_with("audio_latents_") || k.as_str() == "audio_latents")
+                .map(|(_, v)| normalize_ltx2_audio_latent(v.clone(), path))
+                .transpose()?;
+            let audio_text = tensor_by_keys(
+                &map,
+                &[
+                    "audio_prompt_embeds_bfloat16",
+                    "audio_prompt_embeds",
+                    "audio_text_bfloat16",
+                    "audio_text_embedding",
+                ],
+                path,
+                "audio text",
+            )
+            .ok()
+            .map(|t| normalize_ltx2_audio_text(t, path))
+            .transpose()?;
+            Ok(Ltx2LoadedSample {
+                latent: normalize_ltx2_latent(latent, path)?,
+                text: normalize_ltx2_text(text, path)?,
+                audio_latent,
+                audio_text,
+            })
+        }
+        Ltx2CacheSample::Paired {
+            latent,
+            text,
+            audio,
+        } => {
+            let lat_map = flame_core::serialization::load_file(latent, device)?;
+            let txt_map = flame_core::serialization::load_file(text, device)?;
+            let latent_tensor = tensor_by_keys(
+                &lat_map,
+                &["latent", "latents", "latents_1x8x8_bfloat16"],
+                latent,
+                "latent",
+            )
+            .or_else(|_| {
+                lat_map
+                    .iter()
+                    .find(|(k, _)| k.starts_with("latents_"))
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "latent cache {} missing latent tensor key",
+                            latent.display()
+                        )
+                    })
+            })?;
+            let text_tensor = tensor_by_keys(
+                &txt_map,
+                &[
+                    "text_embedding",
+                    "text_hidden",
+                    "text_bfloat16",
+                    "video_prompt_embeds_bfloat16",
+                    "video_prompt_embeds",
+                    "prompt_embeds",
+                ],
+                text,
+                "text",
+            )?;
+            let audio_text = tensor_by_keys(
+                &txt_map,
+                &[
+                    "audio_prompt_embeds_bfloat16",
+                    "audio_prompt_embeds",
+                    "audio_text_bfloat16",
+                    "audio_text_embedding",
+                ],
+                text,
+                "audio text",
+            )
+            .ok()
+            .map(|t| normalize_ltx2_audio_text(t, text))
+            .transpose()?;
+            let audio_latent = if let Some(audio_path) = audio {
+                let audio_map = flame_core::serialization::load_file(audio_path, device)?;
+                let audio_tensor = audio_map
+                    .iter()
+                    .find(|(k, _)| k.starts_with("audio_latents_") || k.as_str() == "audio_latents")
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "audio cache {} missing audio_latents_* tensor",
+                            audio_path.display()
+                        )
+                    })?;
+                Some(normalize_ltx2_audio_latent(audio_tensor, audio_path)?)
+            } else {
+                None
+            };
+            Ok(Ltx2LoadedSample {
+                latent: normalize_ltx2_latent(latent_tensor, latent)?,
+                text: normalize_ltx2_text(text_tensor, text)?,
+                audio_latent,
+                audio_text,
+            })
+        }
+    }
+}
+
+fn load_ltx2_text_cache(
+    path: &Path,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> anyhow::Result<Tensor> {
+    let map = flame_core::serialization::load_file(path, device)?;
+    let text = tensor_by_keys(
+        &map,
+        &[
+            "text_embedding",
+            "text_hidden",
+            "text_bfloat16",
+            "video_prompt_embeds_bfloat16",
+            "video_prompt_embeds",
+            "prompt_embeds",
+        ],
+        path,
+        "text",
+    )?;
+    normalize_ltx2_text(text, path)
+}
+
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] config: PathBuf,
-    #[arg(long)] cache_dir: PathBuf,
-    #[arg(long, default_value = "100")] steps: usize,
-    #[arg(long, default_value = "16")] rank: usize,
-    #[arg(long, default_value = "1.0")] lora_alpha: f64,
-    #[arg(long, default_value = "3e-4")] lr: f32,
-    #[arg(long, default_value = "1")] batch_size: usize,
-    #[arg(long, default_value = "output")] output_dir: PathBuf,
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    cache_dir: PathBuf,
+    #[arg(long, default_value = "100")]
+    steps: usize,
+    #[arg(long, default_value = "16")]
+    rank: usize,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f64,
+    #[arg(long, default_value = "3e-4")]
+    lr: f32,
+    #[arg(long, default_value = "1")]
+    batch_size: usize,
+    #[arg(long, default_value = "output")]
+    output_dir: PathBuf,
 
-    #[arg(long, default_value = "0")] sample_every: usize,
-    #[arg(long, default_value = "0")] save_every: usize,
-    #[arg(long, default_value = "")] sample_prompt: String,
+    #[arg(long, default_value = "0")]
+    sample_every: usize,
+    #[arg(long, default_value = "0")]
+    save_every: usize,
+    #[arg(long, default_value = "")]
+    sample_prompt: String,
     /// LTX-2 video VAE checkpoint (single safetensors).
-    #[arg(long)] sample_vae: Option<PathBuf>,
-    #[arg(long, default_value = "256")] sample_size: usize,
-    #[arg(long, default_value = "20")] sample_steps: usize,
-    #[arg(long, default_value = "5.0")] sample_cfg: f32,
-    #[arg(long, default_value = "42")] sample_seed: u64,
+    #[arg(long)]
+    sample_vae: Option<PathBuf>,
+    #[arg(long, default_value = "256")]
+    sample_size: usize,
+    #[arg(long, default_value = "20")]
+    sample_steps: usize,
+    #[arg(long, default_value = "5.0")]
+    sample_cfg: f32,
+    #[arg(long, default_value = "42")]
+    sample_seed: u64,
 
     /// Resume training from a previous LoRA checkpoint.
-    #[arg(long)] resume_lora: Option<PathBuf>,
+    #[arg(long)]
+    resume_lora: Option<PathBuf>,
 
     /// Frames per second (RoPE temporal axis scaling). Default 24.
-    #[arg(long, default_value = "24.0")] fps: f32,
+    #[arg(long, default_value = "24.0")]
+    fps: f32,
+    /// LTX-2 training mode: `video` or `av`. AV mode requires paired
+    /// `*_ltx2_audio.safetensors` caches and audio prompt embeddings.
+    #[arg(long, default_value = "video")]
+    ltx2_mode: String,
+    /// Audio loss multiplier in `--ltx2-mode av`.
+    #[arg(long, default_value_t = 1.0)]
+    audio_loss_weight: f32,
 
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
-    #[arg(long)] min_snr_gamma: Option<f32>,
-    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    #[arg(long)]
+    min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    caption_dropout_probability: f32,
     /// Path to a single cache file produced by `prepare_ltx2` from an empty-
     /// caption sample. When `--caption-dropout-probability > 0`, the trainer
     /// loads `text_embedding` from this file and swaps it in with probability
     /// `p` per sample. If unset and dropout > 0, the feature is disabled with
     /// a warning (preserves prior behaviour).
-    #[arg(long)] null_text_cache: Option<PathBuf>,
-    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
-    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
-    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
-    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
-    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
-    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    #[arg(long)]
+    null_text_cache: Option<PathBuf>,
+    #[arg(long, default_value_t = 1.0)]
+    noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)]
+    gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)]
+    huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lr_min_factor: f32,
+    #[arg(long)]
+    validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    validation_every_steps: u64,
+    #[arg(long, num_args = 0..)]
+    multi_backend_weights: Vec<f32>,
     /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
     /// trainers accept-and-warn until per-model wiring lands.
-    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    #[arg(long, num_args = 0..)]
+    multi_backend_cache_dirs: Vec<std::path::PathBuf>,
     /// Phase 2: validation prompt library JSON (Klein-only wiring; other
     /// trainers accept-and-warn).
-    #[arg(long)] validation_prompts_file: Option<std::path::PathBuf>,
-    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    #[arg(long)]
+    validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)]
+    masked_loss_weight: f32,
     /// Master EMA switch. Default-off → byte-identical to no-EMA.
-    #[arg(long, default_value_t = false)] ema: bool,
-    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
-    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
-    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
-    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
-    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
+    #[arg(long, default_value_t = false)]
+    ema: bool,
+    #[arg(long, default_value_t = 1.0)]
+    ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)]
+    ema_power: f32,
+    #[arg(long, default_value_t = 0)]
+    ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)]
+    ema_min_decay: f32,
+    #[arg(long, default_value_t = 0.9999)]
+    ema_max_decay: f32,
     /// Swap EMA shadow into live params at sample/checkpoint time, then
     /// restore. Default-off keeps live params untouched.
-    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+    #[arg(long, default_value_t = false)]
+    ema_validation_swap: bool,
 
     /// Multi-resolution noise iterations. NOTE: helper is 4D-only; LTX-2 uses
     /// 5D video latents [B, 128, F, H, W] so this flag emits a warn-and-skip.
     /// Kept for CLI uniformity with other trainers.
-    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
+    #[arg(long, default_value_t = 0)]
+    multires_noise_iterations: usize,
     /// Per-level discount factor for `--multires-noise-iterations`.
-    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+    #[arg(long, default_value_t = 0.3)]
+    multires_noise_discount: f32,
 
     /// Timestep biasing strategy: `none|earlier|later|range`. Default `none`
     /// is byte-identical to no biasing.
-    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
-    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    #[arg(long, default_value = "none")]
+    timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)]
+    timestep_bias_range_max: f32,
 
-    #[arg(long)] tread_route_pattern: Option<String>,
+    #[arg(long)]
+    tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
-    #[arg(long, default_value = "adamw")] optimizer: String,
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
 
     // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
-    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
-    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
-    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
-    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    #[arg(long, num_args = 0..)]
+    multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
     /// Phase 5: LR scheduler family. Default `constant` + `warmup_steps=0` is
     /// byte-equivalent to prior fixed-LR behaviour.
-    #[arg(long, default_value = "constant")] lr_scheduler: String,
+    #[arg(long, default_value = "constant")]
+    lr_scheduler: String,
     /// Phase 5: linear LR warmup steps. Default 0 keeps prior behaviour.
-    #[arg(long, default_value_t = 0)] warmup_steps: usize,
+    #[arg(long, default_value_t = 0)]
+    warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
-    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+    #[arg(long, default_value_t = 1.0)]
+    lr_cycles: f32,
 
     // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
     /// Route the backward pass through `AutogradContext::backward_v2`
     /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
-    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
 }
 
 fn debug_enabled() -> bool {
-    std::env::var("OT_DEBUG_STATS")
-        .map_or(false, |v| !matches!(v.as_str(), "0" | "" | "false" | "FALSE"))
+    std::env::var("OT_DEBUG_STATS").map_or(false, |v| {
+        !matches!(v.as_str(), "0" | "" | "false" | "FALSE")
+    })
 }
 
 fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
     env_logger::init();
     let args = Args::parse();
+    let ltx2_mode = args.ltx2_mode.to_ascii_lowercase();
+    let av_mode = match ltx2_mode.as_str() {
+        "video" | "t2v" => false,
+        "av" | "audio-video" | "video-audio" => true,
+        "audio" | "audio-only" => {
+            anyhow::bail!("--ltx2-mode audio is not wired in this Rust trainer yet; use --ltx2-mode av")
+        }
+        other => anyhow::bail!("unknown --ltx2-mode {other:?}; expected video or av"),
+    };
     // Phase 2: Klein-only wiring of multi-backend + validation prompts library.
     // Other trainers accept-and-warn so configs/launchers aren't broken; full
     // wiring is a follow-up after the per-model encoder + sample paths are
@@ -197,10 +616,14 @@ fn main() -> anyhow::Result<()> {
 
     // Load the LTX-2 transformer shards.
     let model_base = std::path::Path::new(&config.base_model_name);
-    let mut shard_paths: Vec<PathBuf> = std::fs::read_dir(model_base.join("transformer"))
-        .ok()
-        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
-        .unwrap_or_default();
+    let mut shard_paths: Vec<PathBuf> = if model_base.is_file() {
+        vec![model_base.to_path_buf()]
+    } else {
+        std::fs::read_dir(model_base.join("transformer"))
+            .ok()
+            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default()
+    };
     if shard_paths.is_empty() {
         // Fallback: maybe base_model_name itself points to a dir of shards.
         shard_paths = std::fs::read_dir(model_base)?
@@ -211,11 +634,18 @@ fn main() -> anyhow::Result<()> {
     shard_paths.retain(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"));
     shard_paths.sort();
     if shard_paths.is_empty() {
-        anyhow::bail!("No safetensors shards under {:?} (or its transformer/ subdir)", model_base);
+        anyhow::bail!(
+            "No safetensors shards under {:?} (or its transformer/ subdir)",
+            model_base
+        );
     }
 
-    log::info!("Loading LTX-2 transformer (rank={} alpha={})...", args.rank, args.lora_alpha);
-    let mut model = Ltx2Model::load(&shard_paths, &config, device.clone())?;
+    log::info!(
+        "Loading LTX-2 transformer (rank={} alpha={})...",
+        args.rank,
+        args.lora_alpha
+    );
+    let mut model = Ltx2Model::load_with_audio(&shard_paths, &config, device.clone(), av_mode)?;
     if let Some(resume) = &args.resume_lora {
         model.load_weights(resume.to_str().unwrap())?;
         log::info!("Resumed LoRA from {}", resume.display());
@@ -242,11 +672,8 @@ fn main() -> anyhow::Result<()> {
     let mut effective_caption_dropout_prob = args.caption_dropout_probability;
     let null_text: Option<Tensor> = if effective_caption_dropout_prob > 0.0 {
         match args.null_text_cache.as_ref() {
-            Some(p) => match flame_core::serialization::load_file(p, &device) {
-                Ok(s) => {
-                    let nt = s.get("text_embedding")
-                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
-                        .to_dtype(DType::BF16)?;
+            Some(p) => match load_ltx2_text_cache(p, &device) {
+                Ok(nt) => {
                     log::info!(
                         "[caption-dropout] WIRED — prob={:.3} (null_text_embedding={:?})",
                         effective_caption_dropout_prob,
@@ -335,21 +762,28 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
-    let mut cache_files: Vec<PathBuf> = std::fs::read_dir(&args.cache_dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map_or(false, |e| e == "safetensors"))
-        .collect();
-    cache_files.sort();
-    if cache_files.is_empty() {
+    let cache_samples = discover_ltx2_cache_samples(&args.cache_dir, av_mode)?;
+    if cache_samples.is_empty() {
         anyhow::bail!("No cached samples in {:?}", args.cache_dir);
     }
-    log::info!("Found {} cached samples (batch_size={})", cache_files.len(), args.batch_size);
+    log::info!(
+        "Found {} cached samples (batch_size={}, ltx2_mode={})",
+        cache_samples.len(),
+        args.batch_size,
+        if av_mode { "av" } else { "video" }
+    );
 
     // Phase 2: validation harness — held-out cache + cadence. None at default
     // (validation_every_steps == 0 OR no dir) → byte-identical off-path.
-    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
-        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
-    {
+    let validation_loop: Option<ValidationLoop> = if av_mode {
+        if args.validation_dataset_dir.is_some() && args.validation_every_steps > 0 {
+            log::warn!("[validation] LTX-2 AV validation is not wired yet; skipping validation loop");
+        }
+        None
+    } else if let (Some(dir), n) = (
+        args.validation_dataset_dir.as_ref(),
+        args.validation_every_steps,
+    ) {
         if n > 0 {
             let v = ValidationLoop::new(dir, n)?;
             log::info!(
@@ -367,11 +801,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
-    let board = BoardWriter::open(
-        &args.output_dir,
-        BoardWriter::new_session_id(),
-        None,
-    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+    let board = BoardWriter::open(&args.output_dir, BoardWriter::new_session_id(), None)
+        .map_err(|e| log::warn!("board.db open failed: {e}"))
+        .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
     }
@@ -384,23 +816,19 @@ fn main() -> anyhow::Result<()> {
         // ── Build a batch by stacking `batch_size` cached samples along dim 0 ──
         let mut batch_latents: Vec<Tensor> = Vec::with_capacity(args.batch_size);
         let mut batch_texts: Vec<Tensor> = Vec::with_capacity(args.batch_size);
+        let mut batch_audio_latents: Vec<Tensor> = Vec::with_capacity(args.batch_size);
+        let mut batch_audio_texts: Vec<Tensor> = Vec::with_capacity(args.batch_size);
         for bi in 0..args.batch_size {
-            let cache_idx = (step * args.batch_size + bi) % cache_files.len();
-            let sample = flame_core::serialization::load_file(&cache_files[cache_idx], &device)?;
-            let latent = sample
-                .get("latent")
-                .ok_or_else(|| anyhow::anyhow!("cached sample missing 'latent'"))?
-                .to_dtype(DType::BF16)?;
-            let txt_full = sample
-                .get("text_embedding")
-                .ok_or_else(|| anyhow::anyhow!("cached sample missing 'text_embedding'"))?
-                .to_dtype(DType::BF16)?;
+            let cache_idx = (step * args.batch_size + bi) % cache_samples.len();
+            let sample = load_ltx2_cache_sample(&cache_samples[cache_idx], &device)?;
             // Trim to real_len if available (Gemma3 uses fixed 1024 left-pad,
             // so the first `pad_n` positions are pad embeddings; we keep them).
             // (T2V cross-attn applies mask if needed; here we pass full 1024.)
             // Caption dropout: per-sample Bernoulli swaps text_embedding with
             // null cache. Default-off (prob == 0.0 OR null_text == None) draws
             // no rng.
+            let latent = sample.latent;
+            let txt_full = sample.text;
             let txt_full = if let Some(ref nt) = null_text {
                 use rand::Rng;
                 if rng.r#gen::<f32>() < effective_caption_dropout_prob {
@@ -413,6 +841,16 @@ fn main() -> anyhow::Result<()> {
             };
             batch_latents.push(latent);
             batch_texts.push(txt_full);
+            if av_mode {
+                let audio_latent = sample.audio_latent.ok_or_else(|| {
+                    anyhow::anyhow!("--ltx2-mode av sample is missing audio latent cache")
+                })?;
+                let audio_text = sample.audio_text.ok_or_else(|| {
+                    anyhow::anyhow!("--ltx2-mode av sample is missing audio prompt embeddings")
+                })?;
+                batch_audio_latents.push(audio_latent);
+                batch_audio_texts.push(audio_text);
+            }
         }
         let latent = if args.batch_size == 1 {
             batch_latents.pop().unwrap()
@@ -426,6 +864,26 @@ fn main() -> anyhow::Result<()> {
             let refs: Vec<&Tensor> = batch_texts.iter().collect();
             Tensor::cat(&refs, 0)?.contiguous()?
         };
+        let audio_latent = if av_mode {
+            Some(if args.batch_size == 1 {
+                batch_audio_latents.pop().unwrap()
+            } else {
+                let refs: Vec<&Tensor> = batch_audio_latents.iter().collect();
+                Tensor::cat(&refs, 0)?.contiguous()?
+            })
+        } else {
+            None
+        };
+        let audio_txt = if av_mode {
+            Some(if args.batch_size == 1 {
+                batch_audio_texts.pop().unwrap()
+            } else {
+                let refs: Vec<&Tensor> = batch_audio_texts.iter().collect();
+                Tensor::cat(&refs, 0)?.contiguous()?
+            })
+        } else {
+            None
+        };
 
         // ── Sample per-batch-element timesteps ──
         let dims = latent.shape().dims();
@@ -436,19 +894,19 @@ fn main() -> anyhow::Result<()> {
         for _ in 0..args.batch_size {
             let raw_t = ltx2_sampler::sample_timestep_logit_normal(&mut rng, mu);
             // Default-off: Strategy::None returns raw_t unchanged.
-            let t = timestep_bias::apply_bias(
-                raw_t,
-                NUM_TRAIN_TIMESTEPS as f32,
-                &timestep_bias_cfg,
-            );
+            let t =
+                timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
             t_continuous.push(t);
         }
         // Cap-and-floor to integer index for sigma lookup; LTX-2 uses 1000-step
         // discretization same as ERNIE/Z-Image.
-        let sigmas: Vec<f32> = t_continuous.iter().map(|&t| {
-            let idx = (t.floor() as usize).min(999);
-            (idx + 1) as f32 / 1000.0
-        }).collect();
+        let sigmas: Vec<f32> = t_continuous
+            .iter()
+            .map(|&t| {
+                let idx = (t.floor() as usize).min(999);
+                (idx + 1) as f32 / 1000.0
+            })
+            .collect();
 
         // ── Build noisy + target ──
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
@@ -471,7 +929,9 @@ fn main() -> anyhow::Result<()> {
         // a scalar; for >1 we expand a [B,1,1,1,1] tensor.
         let (noisy, target) = if args.batch_size == 1 {
             let s = sigmas[0];
-            let noisy = perturbed_noise.mul_scalar(s)?.add(&latent.mul_scalar(1.0 - s)?)?;
+            let noisy = perturbed_noise
+                .mul_scalar(s)?
+                .add(&latent.mul_scalar(1.0 - s)?)?;
             let target = clean_noise.sub(&latent)?;
             (noisy, target)
         } else {
@@ -480,11 +940,42 @@ fn main() -> anyhow::Result<()> {
                 sigmas.clone(),
                 Shape::from_dims(&[args.batch_size, 1, 1, 1, 1]),
                 device.clone(),
-            )?.to_dtype(DType::BF16)?;
+            )?
+            .to_dtype(DType::BF16)?;
             let one_minus_s = s_tensor.mul_scalar(-1.0)?.add_scalar(1.0)?;
-            let noisy = perturbed_noise.mul(&s_tensor)?.add(&latent.mul(&one_minus_s)?)?;
+            let noisy = perturbed_noise
+                .mul(&s_tensor)?
+                .add(&latent.mul(&one_minus_s)?)?;
             let target = clean_noise.sub(&latent)?;
             (noisy, target)
+        };
+        let audio_noisy_target: Option<(Tensor, Tensor)> = if let Some(audio_latent_ref) = audio_latent.as_ref() {
+            let audio_noise =
+                Tensor::randn(audio_latent_ref.shape().clone(), 0.0, 1.0, device.clone())?
+                    .to_dtype(DType::BF16)?;
+            if args.batch_size == 1 {
+                let s = sigmas[0];
+                let noisy_audio = audio_noise
+                    .mul_scalar(s)?
+                    .add(&audio_latent_ref.mul_scalar(1.0 - s)?)?;
+                let audio_target = audio_noise.sub(audio_latent_ref)?;
+                Some((noisy_audio, audio_target))
+            } else {
+                let s_tensor = Tensor::from_vec(
+                    sigmas.clone(),
+                    Shape::from_dims(&[args.batch_size, 1, 1, 1]),
+                    device.clone(),
+                )?
+                .to_dtype(DType::BF16)?;
+                let one_minus_s = s_tensor.mul_scalar(-1.0)?.add_scalar(1.0)?;
+                let noisy_audio = audio_noise
+                    .mul(&s_tensor)?
+                    .add(&audio_latent_ref.mul(&one_minus_s)?)?;
+                let audio_target = audio_noise.sub(audio_latent_ref)?;
+                Some((noisy_audio, audio_target))
+            }
+        } else {
+            None
         };
 
         // ── timestep tensor — F32 (audit: BF16 mantissa loses precision >256) ──
@@ -492,36 +983,82 @@ fn main() -> anyhow::Result<()> {
             t_continuous.clone(),
             Shape::from_dims(&[args.batch_size]),
             device.clone(),
-        )?;  // F32 by default from from_vec
+        )?; // F32 by default from from_vec
 
         if step == 0 {
             log::info!(
-                "step 0 | latent={:?} text={:?} sigma={:.4} mu={:.3} n_tokens={}",
-                dims, txt.shape().dims(), sigmas[0], mu, n_tokens
+                "step 0 | latent={:?} text={:?} audio_latent={:?} audio_text={:?} sigma={:.4} mu={:.3} n_tokens={}",
+                dims,
+                txt.shape().dims(),
+                audio_latent.as_ref().map(|t| t.shape().dims().to_vec()),
+                audio_txt.as_ref().map(|t| t.shape().dims().to_vec()),
+                sigmas[0],
+                mu,
+                n_tokens
             );
         }
 
         // ── Forward ──
         // Call the inherent Ltx2Model::forward to pass FPS explicitly.
-        let pred = Ltx2Model::forward(&mut model, &noisy, &txt, &timestep, args.fps)?;
+        let (pred, audio_pred_target) = if av_mode {
+            let audio_txt_ref = audio_txt
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--ltx2-mode av missing batched audio text"))?;
+            let (audio_noisy, audio_target) = audio_noisy_target
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--ltx2-mode av missing noisy audio target"))?;
+            let (v_pred, a_pred) = model.forward_audio_video(
+                &noisy,
+                audio_noisy,
+                &txt,
+                audio_txt_ref,
+                &timestep,
+                args.fps,
+            )?;
+            (v_pred, Some((a_pred, audio_target.clone())))
+        } else {
+            (Ltx2Model::forward(&mut model, &noisy, &txt, &timestep, args.fps)?, None)
+        };
         if pred.shape().dims() != target.shape().dims() {
             anyhow::bail!(
                 "predicted shape {:?} != target {:?}",
-                pred.shape().dims(), target.shape().dims()
+                pred.shape().dims(),
+                target.shape().dims()
             );
+        }
+        if let Some((audio_pred, audio_target)) = audio_pred_target.as_ref() {
+            if audio_pred.shape().dims() != audio_target.shape().dims() {
+                anyhow::bail!(
+                    "audio predicted shape {:?} != target {:?}",
+                    audio_pred.shape().dims(),
+                    audio_target.shape().dims()
+                );
+            }
         }
 
         // ── Loss = mean MSE in F32 ──
         // Phase 1: combined loss + per-step weighting. Default-off invariant.
         let pred_f32 = pred.to_dtype(DType::F32)?;
         let target_f32 = target.to_dtype(DType::F32)?;
-        let raw_loss = loss_weight::combined_loss(
+        let video_raw_loss = loss_weight::combined_loss(
             &pred_f32,
             &target_f32,
             config.mse_strength as f32,
             config.mae_strength as f32,
             args.huber_strength,
         )?;
+        let raw_loss = if let Some((audio_pred, audio_target)) = audio_pred_target.as_ref() {
+            let audio_raw_loss = loss_weight::combined_loss(
+                &audio_pred.to_dtype(DType::F32)?,
+                &audio_target.to_dtype(DType::F32)?,
+                config.mse_strength as f32,
+                config.mae_strength as f32,
+                args.huber_strength,
+            )?;
+            video_raw_loss.add(&audio_raw_loss.mul_scalar(args.audio_loss_weight)?)?
+        } else {
+            video_raw_loss
+        };
         let loss = loss_weight::apply_loss_weight(
             &raw_loss,
             sigmas[0],
@@ -564,16 +1101,21 @@ fn main() -> anyhow::Result<()> {
 
         const CLIP_GRAD_NORM: f32 = 1.0;
         // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.
-        let grad_refs: Vec<&flame_core::Tensor> = params
-            .iter()
-            .filter_map(|p| grads.get(p.id()))
-            .collect();
-        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
-            .item()? as f32;
-        let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
+        let grad_refs: Vec<&flame_core::Tensor> =
+            params.iter().filter_map(|p| grads.get(p.id())).collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
+        let scale = if total_norm > CLIP_GRAD_NORM {
+            CLIP_GRAD_NORM / total_norm
+        } else {
+            1.0
+        };
         for param in &params {
             if let Some(g) = grads.get(param.id()) {
-                let g_scaled = if scale < 1.0 { g.mul_scalar(scale)? } else { g.clone() };
+                let g_scaled = if scale < 1.0 {
+                    g.mul_scalar(scale)?
+                } else {
+                    g.clone()
+                };
                 param.set_grad(g_scaled)?;
             }
         }
@@ -596,7 +1138,9 @@ fn main() -> anyhow::Result<()> {
             opt.zero_grad(&params);
             if let Some(ref mut e) = ema {
                 e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
-                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
+                    .map_err(|err| {
+                        anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1)
+                    })?;
             }
         }
         AutogradContext::clear();
@@ -604,8 +1148,15 @@ fn main() -> anyhow::Result<()> {
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
             "LTX-2-lora",
-            step, args.steps, cache_files.len(), args.batch_size.max(1),
-            loss_val, total_norm, cur_lr, t_start, board.as_ref(),
+            step,
+            args.steps,
+            cache_samples.len(),
+            args.batch_size.max(1),
+            loss_val,
+            total_norm,
+            cur_lr,
+            t_start,
+            board.as_ref(),
         );
 
         // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
@@ -646,7 +1197,8 @@ fn main() -> anyhow::Result<()> {
                     if v_dims.len() != 5 {
                         log::warn!(
                             "[validation] {} latent rank {} != 5; skipping",
-                            vfile.display(), v_dims.len()
+                            vfile.display(),
+                            v_dims.len()
                         );
                         continue;
                     }
@@ -655,14 +1207,17 @@ fn main() -> anyhow::Result<()> {
                     // Validation uses its OWN run-side RNG so it does not
                     // perturb the training-side seeded sequence (byte invariance).
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let v_t_continuous = ltx2_sampler::sample_timestep_logit_normal(&mut vrng, v_mu);
-                    let v_sigma_idx = (v_t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+                    let v_t_continuous =
+                        ltx2_sampler::sample_timestep_logit_normal(&mut vrng, v_mu);
+                    let v_sigma_idx =
+                        (v_t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
                     let v_sigma = (v_sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
                     // Clean noise, no offset / no input perturbation — eval should
                     // measure model fit, not augmented-noise fit.
                     let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?
                         .to_dtype(DType::BF16)?;
-                    let v_noisy = v_noise.mul_scalar(v_sigma)?
+                    let v_noisy = v_noise
+                        .mul_scalar(v_sigma)?
                         .add(&v_lat.mul_scalar(1.0 - v_sigma)?)?;
                     let v_target = v_noise.sub(&v_lat)?;
                     // Mirror trainer's per-batch-element timestep tensor (B=1 here).
@@ -672,7 +1227,11 @@ fn main() -> anyhow::Result<()> {
                         device.clone(),
                     )?;
                     let v_pred = match Ltx2Model::forward(
-                        &mut model, &v_noisy, &v_txt, &v_timestep, args.fps,
+                        &mut model,
+                        &v_noisy,
+                        &v_txt,
+                        &v_timestep,
+                        args.fps,
                     ) {
                         Ok(p) => p,
                         Err(e) => {
@@ -680,7 +1239,8 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                     };
-                    let v_loss = v_pred.to_dtype(DType::F32)?
+                    let v_loss = v_pred
+                        .to_dtype(DType::F32)?
                         .sub(&v_target.to_dtype(DType::F32)?)?
                         .square()?
                         .mean()?;
@@ -712,13 +1272,17 @@ fn main() -> anyhow::Result<()> {
         // so the optimizer's accumulated moments stay consistent with the
         // tensors they were taken against.
         let step_num = step + 1;
-        let save_fires = args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps;
-        let sample_fires = args.sample_every > 0 && step_num % args.sample_every == 0 && step_num < args.steps;
+        let save_fires =
+            args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps;
+        let sample_fires =
+            args.sample_every > 0 && step_num % args.sample_every == 0 && step_num < args.steps;
         let ema_backup = if args.ema_validation_swap && (save_fires || sample_fires) {
             if let Some(ref e) = ema {
                 let _g = AutogradContext::no_grad();
-                Some(e.swap_with_live(&params)
-                    .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
+                Some(
+                    e.swap_with_live(&params)
+                        .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?,
+                )
             } else {
                 None
             }
@@ -727,7 +1291,9 @@ fn main() -> anyhow::Result<()> {
         };
 
         if save_fires {
-            let mid_ckpt = args.output_dir.join(format!("ltx2_lora_step{step_num}.safetensors"));
+            let mid_ckpt = args
+                .output_dir
+                .join(format!("ltx2_lora_step{step_num}.safetensors"));
             if let Err(e) = model.save_weights(&mid_ckpt.to_string_lossy()) {
                 log::warn!("[mid-save step {step_num}] save_weights failed: {e}");
             } else {
@@ -746,7 +1312,10 @@ fn main() -> anyhow::Result<()> {
                 &args.sample_prompt,
                 args.sample_vae.as_deref(),
                 &out,
-                args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_seed,
                 args.fps,
                 &device,
             ) {
@@ -762,8 +1331,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     let avg_loss = total_loss / args.steps as f32;
-    log::info!("Training complete: {} steps, avg loss={:.4}", args.steps, avg_loss);
-    if let Some(b) = &board { b.set_status("completed"); }
+    log::info!(
+        "Training complete: {} steps, avg loss={:.4}",
+        args.steps,
+        avg_loss
+    );
+    if let Some(b) = &board {
+        b.set_status("completed");
+    }
 
     // Final EMA swap (covers final save and final sample). No restore — the
     // process exits, no further training. Skipped when --ema-validation-swap
@@ -771,13 +1346,16 @@ fn main() -> anyhow::Result<()> {
     if args.ema_validation_swap {
         if let Some(ref e) = ema {
             let _g = AutogradContext::no_grad();
-            let _ = e.swap_with_live(&params)
+            let _ = e
+                .swap_with_live(&params)
                 .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
             log::info!("[ema] swapped EMA shadow into live params for final save + sample");
         }
     }
 
-    let ckpt = args.output_dir.join(format!("ltx2_lora_{}steps.safetensors", args.steps));
+    let ckpt = args
+        .output_dir
+        .join(format!("ltx2_lora_{}steps.safetensors", args.steps));
     if let Err(e) = model.save_weights(&ckpt.to_string_lossy()) {
         log::warn!("save_weights returned error: {e}");
     } else {
@@ -788,13 +1366,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.sample_every > 0 || !args.sample_prompt.is_empty() {
-        let out = args.output_dir.join(format!("sample_step{}_FINAL.png", args.steps));
+        let out = args
+            .output_dir
+            .join(format!("sample_step{}_FINAL.png", args.steps));
         if let Err(e) = inline_sample(
             &mut model,
             &args.sample_prompt,
             args.sample_vae.as_deref(),
             &out,
-            args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            args.sample_seed,
             args.fps,
             &device,
         ) {
@@ -814,20 +1397,40 @@ fn print_lora_b_nonzero(model: &Ltx2Model) {
     for adapter in &model.lora_adapters {
         let b = match adapter.lora_b().tensor() {
             Ok(t) => t,
-            Err(e) => { log::warn!("LoRA-B tensor read failed: {e}"); continue; }
+            Err(e) => {
+                log::warn!("LoRA-B tensor read failed: {e}");
+                continue;
+            }
         };
-        let v = match b.to_vec() { Ok(v) => v, Err(e) => { log::warn!("LoRA-B to_vec: {e}"); continue; } };
+        let v = match b.to_vec() {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("LoRA-B to_vec: {e}");
+                continue;
+            }
+        };
         let mut branch_has_nz = false;
         for x in &v {
             total += 1;
-            if x.abs() > 1e-12 { nz += 1; branch_has_nz = true; }
+            if x.abs() > 1e-12 {
+                nz += 1;
+                branch_has_nz = true;
+            }
         }
-        if branch_has_nz { nz_branches += 1; }
+        if branch_has_nz {
+            nz_branches += 1;
+        }
     }
-    let pct = if total > 0 { nz as f64 / total as f64 * 100.0 } else { 0.0 };
+    let pct = if total > 0 {
+        nz as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
     log::info!(
         "[lora-b-check] {}/{} branches have nonzero B ({:.1}% of B values nonzero)",
-        nz_branches, model.lora_adapters.len(), pct
+        nz_branches,
+        model.lora_adapters.len(),
+        pct
     );
     if nz_branches < model.lora_adapters.len() {
         log::warn!(
@@ -865,13 +1468,13 @@ fn inline_sample(
     let sigmas = ltx2_sampler::schedule(steps, n_tokens);
 
     let latent_shape = Shape::from_dims(&[1, 128, f_lat, h_lat, w_lat]);
-    let mut latent = Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
+    let mut latent =
+        Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?.to_dtype(DType::BF16)?;
 
     // For inline sample without a real Gemma3 encoder, use zeros as text emb.
     // Real previews require a cached embedding for the prompt.
     let txt = Tensor::zeros_dtype(
-        Shape::from_dims(&[1, 1024, eridiffusion_core::encoders::gemma3::GEMMA3_HIDDEN]),
+        Shape::from_dims(&[1, 1024, INNER_DIM]),
         DType::BF16,
         device.clone(),
     )?;
@@ -887,10 +1490,11 @@ fn inline_sample(
 
     // VAE decode if available; else save zeros.
     let pixel_video = if let Some(vp) = vae_path {
-        let vae = Ltx2Vae::load(vp, device.clone())
-            .map_err(|e| anyhow::anyhow!("vae load: {e}"))?;
+        let vae =
+            Ltx2Vae::load(vp, device.clone()).map_err(|e| anyhow::anyhow!("vae load: {e}"))?;
         // Denormalize before decode.
-        let denormed = vae.denormalize(&latent)
+        let denormed = vae
+            .denormalize(&latent)
             .map_err(|e| anyhow::anyhow!("denormalize: {e}"))?;
         vae.decode_video(&denormed)
             .map_err(|e| anyhow::anyhow!("decode_video: {e}"))?

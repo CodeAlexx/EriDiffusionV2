@@ -1,42 +1,58 @@
 //! sample_ernie — text → Ernie image generation. Tests the sampling pipeline.
 //! Supports `--lora-path` to overlay a trained LoRA on top of the base transformer.
 use clap::Parser;
-use std::path::PathBuf;
-use flame_core::{DType, Shape, Tensor};
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};
-use eridiffusion_core::encoders::{vae::KleinVaeDecoder, mistral3b::Mistral3bEncoder};
+use eridiffusion_core::encoders::{mistral3b::Mistral3bEncoder, vae::KleinVaeDecoder};
 use eridiffusion_core::models::{ErnieModel, TrainableModel};
 use eridiffusion_core::sampler::ernie_sampler;
+use flame_core::{DType, Shape, Tensor};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 struct Args {
     /// Single prompt. Mutually exclusive with `--prompts-file`.
-    #[arg(long)] prompt: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
     /// Newline-separated prompts file for batch sampling. Blank lines and
     /// `#`-prefixed comments are skipped. Requires `--output-dir`. Encoder
     /// loads once for all prompts; DiT and VAE each load once total.
-    #[arg(long)] prompts_file: Option<PathBuf>,
-    #[arg(long, default_value = "output.png")] output: PathBuf,
+    #[arg(long)]
+    prompts_file: Option<PathBuf>,
+    #[arg(long, default_value = "output.png")]
+    output: PathBuf,
     /// Multi-prompt output directory. Required with `--prompts-file`.
     /// Files are written as `sample_001.png`, `sample_002.png`, ...
-    #[arg(long)] output_dir: Option<PathBuf>,
-    #[arg(long)] transformer_dir: PathBuf,
-    #[arg(long)] vae_path: PathBuf,
-    #[arg(long)] text_ckpt: PathBuf,
-    #[arg(long)] tokenizer_path: PathBuf,
-    #[arg(long, default_value = "1024")] size: usize,
-    #[arg(long, default_value = "20")] steps: usize,
-    #[arg(long, default_value = "4.0")] guidance: f32,
-    #[arg(long, default_value = "42")] seed: u64,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+    #[arg(long)]
+    transformer_dir: PathBuf,
+    #[arg(long)]
+    vae_path: PathBuf,
+    #[arg(long)]
+    text_ckpt: PathBuf,
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    #[arg(long, default_value = "1024")]
+    size: usize,
+    #[arg(long, default_value = "20")]
+    steps: usize,
+    #[arg(long, default_value = "4.0")]
+    guidance: f32,
+    #[arg(long, default_value = "42")]
+    seed: u64,
     /// Optional safetensors of a trained LoRA (matches `train_ernie` save format).
-    #[arg(long)] lora_path: Option<PathBuf>,
+    #[arg(long)]
+    lora_path: Option<PathBuf>,
     /// Rank used when the LoRA was trained. Must match or load fails.
-    #[arg(long, default_value = "16")] lora_rank: usize,
+    #[arg(long, default_value = "16")]
+    lora_rank: usize,
     /// Alpha used when the LoRA was trained.
-    #[arg(long, default_value = "1.0")] lora_alpha: f64,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f64,
     /// Per-layer block offloading (LoRA-only): drop transformer layer weights from VRAM
     /// and stream them from disk per-layer. Frees ~10 GB; required for 1024² on 24 GB.
-    #[arg(long)] offload: bool,
+    #[arg(long)]
+    offload: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -63,7 +79,8 @@ fn main() -> anyhow::Result<()> {
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
-            content.lines()
+            content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
@@ -84,33 +101,51 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
     }
 
-    log::info!("[1/3] Text encoding {} prompt(s) (max_len={ERNIE_MAX_LEN}, pad_id={ERNIE_PAD_ID})...", prompts.len());
+    log::info!(
+        "[1/3] Text encoding {} prompt(s) (max_len={ERNIE_MAX_LEN}, pad_id={ERNIE_PAD_ID})...",
+        prompts.len()
+    );
     let tokenizer = tokenizers::Tokenizer::from_file(&args.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     let encode = |text: &str| -> anyhow::Result<(Vec<i32>, usize)> {
-        let e = tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let e = tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ids: Vec<i32> = e.get_ids().iter().map(|&x| x as i32).collect();
-        if ids.len() > ERNIE_MAX_LEN { ids.truncate(ERNIE_MAX_LEN); }
+        if ids.len() > ERNIE_MAX_LEN {
+            ids.truncate(ERNIE_MAX_LEN);
+        }
         let real_len = ids.len();
         Ok((ids, real_len))
     };
-    let prompt_ids: Vec<(Vec<i32>, usize)> = prompts.iter()
+    let prompt_ids: Vec<(Vec<i32>, usize)> = prompts
+        .iter()
         .map(|p| encode(p))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let (uncond_ids, uncond_len) = encode("")?;
     let te = Mistral3bEncoder::load(args.text_ckpt.to_str().unwrap(), &device)?;
     // Encode every prompt with the live TE before dropping.
-    let cond_pairs: Vec<(Tensor, usize)> = prompt_ids.iter().enumerate()
+    let cond_pairs: Vec<(Tensor, usize)> = prompt_ids
+        .iter()
+        .enumerate()
         .map(|(i, (ids, len))| {
             let emb = te.encode_with_pad(ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
-            log::info!("  prompt {}/{}: cond shape={:?} (real_len={})",
-                i + 1, prompts.len(), emb.shape().dims(), len);
+            log::info!(
+                "  prompt {}/{}: cond shape={:?} (real_len={})",
+                i + 1,
+                prompts.len(),
+                emb.shape().dims(),
+                len
+            );
             Ok((emb, *len))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let uncond = te.encode_with_pad(&uncond_ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
     drop(te);
-    log::info!("  uncond={:?} (real_len={uncond_len})", uncond.shape().dims());
+    log::info!(
+        "  uncond={:?} (real_len={uncond_len})",
+        uncond.shape().dims()
+    );
 
     // 2. Load model. Base-only takes the manual no-parameters path (avoids the F32
     // full-weight parameter copy that ErnieModel::load does for FineTune mode and that
@@ -132,11 +167,18 @@ fn main() -> anyhow::Result<()> {
         tc.lora_alpha = args.lora_alpha;
         let mut m = ErnieModel::load(&shard_paths, &tc, device.clone())?;
         m.load_weights(lp.to_str().unwrap())?;
-        log::info!("  Applied LoRA from {:?} (rank={}, alpha={})",
-            lp, args.lora_rank, args.lora_alpha);
+        log::info!(
+            "  Applied LoRA from {:?} (rank={}, alpha={})",
+            lp,
+            args.lora_rank,
+            args.lora_alpha
+        );
         if args.offload {
             m.enable_offload(shard_paths.clone())?;
-            log::info!("  Block offload enabled — per-layer streaming from {} shards", shard_paths.len());
+            log::info!(
+                "  Block offload enabled — per-layer streaming from {} shards",
+                shard_paths.len()
+            );
         }
         m
     } else {
@@ -152,8 +194,14 @@ fn main() -> anyhow::Result<()> {
         let all_weights = if args.offload {
             // Load only non-layer weights — layer weights will stream per-block.
             let shared_prefixes = [
-                "x_embedder.", "text_proj.", "time_embedding.", "time_proj.",
-                "adaLN_modulation.", "final_norm.", "final_linear.", "pos_embed.",
+                "x_embedder.",
+                "text_proj.",
+                "time_embedding.",
+                "time_proj.",
+                "adaLN_modulation.",
+                "final_norm.",
+                "final_linear.",
+                "pos_embed.",
             ];
             let mut wt = std::collections::HashMap::new();
             for p in &shard_paths {
@@ -186,24 +234,35 @@ fn main() -> anyhow::Result<()> {
         };
         if args.offload {
             m.enable_offload(shard_paths.clone())?;
-            log::info!("  Block offload enabled (base model) — per-layer streaming from {} shards", shard_paths.len());
+            log::info!(
+                "  Block offload enabled (base model) — per-layer streaming from {} shards",
+                shard_paths.len()
+            );
         }
         m
     };
     let mut config = model;
 
     // 3. Denoise — collect a final latent per prompt while DiT is resident.
-    log::info!("[3/4] Denoising {} prompt(s) × {} steps...", prompts.len(), args.steps);
+    log::info!(
+        "[3/4] Denoising {} prompt(s) × {} steps...",
+        prompts.len(),
+        args.steps
+    );
     let sigmas = ernie_sampler::schedule(args.steps);
     let pad_width = std::cmp::max(3, prompts.len().to_string().len());
 
     // Trim uncond once (same across all prompts).
-    let trim_uncond = uncond.narrow(1, 0, uncond_len.min(ERNIE_MAX_LEN).max(1))?.contiguous()?;
+    let trim_uncond = uncond
+        .narrow(1, 0, uncond_len.min(ERNIE_MAX_LEN).max(1))?
+        .contiguous()?;
 
     let mut latents: Vec<Tensor> = Vec::with_capacity(cond_pairs.len());
     for (idx, (embeds, len)) in cond_pairs.iter().enumerate() {
         log::info!("  [{}/{}] denoising prompt...", idx + 1, cond_pairs.len());
-        let trim_cond = embeds.narrow(1, 0, len.min(&ERNIE_MAX_LEN).max(&1).clone())?.contiguous()?;
+        let trim_cond = embeds
+            .narrow(1, 0, len.min(&ERNIE_MAX_LEN).max(&1).clone())?
+            .contiguous()?;
 
         // Same noise for every prompt (fixed seed). If varied noise is
         // wanted, advance seed by `idx`.
@@ -211,8 +270,13 @@ fn main() -> anyhow::Result<()> {
             use rand::SeedableRng;
             // Per-prompt seed offset for diverse compositions in batch sampling.
             let _rng = rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(idx as u64));
-            Tensor::randn(Shape::from_dims(&[1, 128, hp, wp]), 0.0, 1.0, device.clone())?
-                .to_dtype(DType::BF16)?
+            Tensor::randn(
+                Shape::from_dims(&[1, 128, hp, wp]),
+                0.0,
+                1.0,
+                device.clone(),
+            )?
+            .to_dtype(DType::BF16)?
         };
 
         for step in 0..args.steps {
@@ -229,8 +293,14 @@ fn main() -> anyhow::Result<()> {
             latent = ernie_sampler::euler_step(&latent, &pred, sigma, sigma_next)?;
 
             if step % 10 == 0 || step == args.steps - 1 {
-                log::info!("    prompt {}/{} step {}/{}, sigma={:.4}",
-                    idx + 1, cond_pairs.len(), step + 1, args.steps, sigma);
+                log::info!(
+                    "    prompt {}/{} step {}/{}, sigma={:.4}",
+                    idx + 1,
+                    cond_pairs.len(),
+                    step + 1,
+                    args.steps,
+                    sigma
+                );
             }
         }
         latents.push(latent);
@@ -247,12 +317,20 @@ fn main() -> anyhow::Result<()> {
         let img = decoder.decode(latent)?;
         let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
         let dims = img.shape().dims();
-        let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
+        let (c, h, w) = if dims.len() == 4 {
+            (dims[1], dims[2], dims[3])
+        } else {
+            (3, dims[0], dims[1])
+        };
         let mut buf = vec![0u8; c * h * w];
         for y in 0..h {
             for x in 0..w {
                 for ch in 0..c {
-                    let id = if dims.len() == 4 { ch * h * w + y * w + x } else { y * w * c + x * c + ch };
+                    let id = if dims.len() == 4 {
+                        ch * h * w + y * w + x
+                    } else {
+                        y * w * c + x * c + ch
+                    };
                     let v = pixels.get(id).copied().unwrap_or(0.0);
                     buf[y * w * c + x * c + ch] = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
                 }
@@ -260,7 +338,11 @@ fn main() -> anyhow::Result<()> {
         }
         let out_path = if multi_mode {
             let dir = args.output_dir.as_ref().unwrap();
-            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+            dir.join(format!(
+                "sample_{:0>width$}.png",
+                idx + 1,
+                width = pad_width
+            ))
         } else {
             args.output.clone()
         };

@@ -42,15 +42,26 @@ impl LoRALinear {
             .collect();
 
         let lora_a = Parameter::new(
-            Tensor::from_vec(a_data, Shape::from_dims(&[rank, in_features]), device.clone())?
-                .requires_grad_(true),
+            Tensor::from_vec(
+                a_data,
+                Shape::from_dims(&[rank, in_features]),
+                device.clone(),
+            )?
+            .requires_grad_(true),
         );
         let lora_b = Parameter::new(
             Tensor::zeros_dtype(Shape::from_dims(&[out_features, rank]), DType::F32, device)?
                 .requires_grad_(true),
         );
 
-        Ok(Self { lora_a, lora_b, rank, alpha, in_features, out_features })
+        Ok(Self {
+            lora_a,
+            lora_b,
+            rank,
+            alpha,
+            in_features,
+            out_features,
+        })
     }
 
     /// Compute LoRA delta: scale * (input @ A^T @ B^T).
@@ -142,22 +153,42 @@ impl LoRALinear {
         let b_new = format!("{prefix}.lora_B.weight");
         let a_legacy = format!("{prefix}.lora_A");
         let b_legacy = format!("{prefix}.lora_B");
-        let a = source.get(&a_new).or_else(|| source.get(&a_legacy))
-            .ok_or_else(|| crate::EriDiffusionError::Lora(format!("missing {a_new} (or legacy {a_legacy})")))?;
-        let b = source.get(&b_new).or_else(|| source.get(&b_legacy))
-            .ok_or_else(|| crate::EriDiffusionError::Lora(format!("missing {b_new} (or legacy {b_legacy})")))?;
-        self.lora_a.set_data(a.to_dtype(DType::F32)?.requires_grad_(true))?;
-        self.lora_b.set_data(b.to_dtype(DType::F32)?.requires_grad_(true))?;
+        let a = source
+            .get(&a_new)
+            .or_else(|| source.get(&a_legacy))
+            .ok_or_else(|| {
+                crate::EriDiffusionError::Lora(format!("missing {a_new} (or legacy {a_legacy})"))
+            })?;
+        let b = source
+            .get(&b_new)
+            .or_else(|| source.get(&b_legacy))
+            .ok_or_else(|| {
+                crate::EriDiffusionError::Lora(format!("missing {b_new} (or legacy {b_legacy})"))
+            })?;
+        self.lora_a
+            .set_data(a.to_dtype(DType::F32)?.requires_grad_(true))?;
+        self.lora_b
+            .set_data(b.to_dtype(DType::F32)?.requires_grad_(true))?;
         Ok(())
     }
 
-    pub fn in_features(&self) -> usize { self.in_features }
-    pub fn out_features(&self) -> usize { self.out_features }
-    pub fn rank_val(&self) -> usize { self.rank }
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+    pub fn rank_val(&self) -> usize {
+        self.rank
+    }
     /// Accessor for ports that expect a method-style API (e.g. zimage model from flame-diffusion).
-    pub fn lora_a(&self) -> &Parameter { &self.lora_a }
+    pub fn lora_a(&self) -> &Parameter {
+        &self.lora_a
+    }
     /// Accessor for ports that expect a method-style API.
-    pub fn lora_b(&self) -> &Parameter { &self.lora_b }
+    pub fn lora_b(&self) -> &Parameter {
+        &self.lora_b
+    }
 
     /// Clear any cached tensors — call after optimizer.step()
     pub fn refresh_cache(&self) {}

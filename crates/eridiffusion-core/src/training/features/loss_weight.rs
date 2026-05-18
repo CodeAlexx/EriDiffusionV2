@@ -69,7 +69,11 @@ pub fn debiased_weight(sigma: f32, is_v_prediction: bool) -> f32 {
 /// adjustment applied).
 pub fn debiased_weight_from_snr(snr: f32, is_v_prediction: bool) -> f32 {
     let snr_clamped = snr.min(1e3);
-    let snr_adjusted = if is_v_prediction { snr_clamped + 1.0 } else { snr_clamped };
+    let snr_adjusted = if is_v_prediction {
+        snr_clamped + 1.0
+    } else {
+        snr_clamped
+    };
     1.0 / snr_adjusted.sqrt().max(1e-8)
 }
 
@@ -193,7 +197,10 @@ pub fn combined_loss(
         let abs_clamped = abs.clamp(0.0, 1.0)?;
         let sq_part = abs_clamped.square()?.mul_scalar(0.5)?;
         let lin_excess = abs.sub_scalar(1.0)?.relu()?;
-        let huber = sq_part.add(&lin_excess)?.mean()?.mul_scalar(huber_strength)?;
+        let huber = sq_part
+            .add(&lin_excess)?
+            .mean()?
+            .mul_scalar(huber_strength)?;
         total = Some(match total {
             Some(t) => t.add(&huber)?,
             None => huber,
@@ -247,7 +254,12 @@ mod tests {
         let s: f32 = 0.01;
         let snr = ((1.0 - s) / s).powi(2);
         let expected = 5.0 / snr;
-        assert!((w - expected).abs() < 1e-5, "high-snr eps-pred: {} != {}", w, expected);
+        assert!(
+            (w - expected).abs() < 1e-5,
+            "high-snr eps-pred: {} != {}",
+            w,
+            expected
+        );
     }
 
     #[test]
@@ -282,7 +294,12 @@ mod tests {
         // Very small sigma → snr ≫ 1e3, must clip.
         let w = debiased_weight(1e-6, false);
         let expected = 1.0 / (1e3_f32).sqrt();
-        assert!((w - expected).abs() < 1e-4, "got {} expected {}", w, expected);
+        assert!(
+            (w - expected).abs() < 1e-4,
+            "got {} expected {}",
+            w,
+            expected
+        );
     }
 
     #[test]
@@ -293,11 +310,16 @@ mod tests {
         // → diff = x. Huber with δ=1: 0.5 x² for |x| ≤ 1, |x| - 0.5 otherwise.
         for x in [0.1f32, 0.3, 0.5, 1.0, 2.0] {
             let pred = Tensor::from_vec(vec![x], Shape::from_dims(&[1]), device.clone()).unwrap();
-            let target = Tensor::from_vec(vec![0.0], Shape::from_dims(&[1]), device.clone()).unwrap();
+            let target =
+                Tensor::from_vec(vec![0.0], Shape::from_dims(&[1]), device.clone()).unwrap();
             // mse=0, mae=0, huber=1 → forces the Huber branch.
             let loss = combined_loss(&pred, &target, 0.0, 0.0, 1.0).unwrap();
             let v = loss.to_vec().unwrap()[0];
-            let expected = if x.abs() <= 1.0 { 0.5 * x * x } else { x.abs() - 0.5 };
+            let expected = if x.abs() <= 1.0 {
+                0.5 * x * x
+            } else {
+                x.abs() - 0.5
+            };
             assert!(v >= 0.0, "Huber returned negative for x={x}: {v}");
             assert!(
                 (v - expected).abs() < 1e-5,
@@ -315,4 +337,3 @@ mod tests {
         assert!((w - 1.0).abs() < 1e-6);
     }
 }
-

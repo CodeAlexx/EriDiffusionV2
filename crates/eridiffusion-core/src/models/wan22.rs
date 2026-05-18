@@ -301,8 +301,7 @@ impl Wan22LoraBundle {
             return Self::new(cfg, lyc.rank, lyc.alpha, device, seed, expert_label);
         }
         let dim = cfg.dim;
-        let mut lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>> =
-            HashMap::new();
+        let mut lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>> = HashMap::new();
         for block_idx in 0..cfg.num_layers {
             for &target in LoraTarget::all() {
                 let wrapper = build_wan22_lycoris_linear(lyc, dim, dim, device.clone())?;
@@ -362,11 +361,19 @@ impl Wan22LoraBundle {
                 skipped += 1;
                 continue;
             };
-            let did = adapter.as_ref().init_perturbed_normal_lokr(base, scale)
-                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
-                    "init_perturbed_normal_lokr({key}): {e}"
-                )))?;
-            if did { applied += 1; } else { skipped += 1; }
+            let did = adapter
+                .as_ref()
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| {
+                    flame_core::FlameError::InvalidOperation(format!(
+                        "init_perturbed_normal_lokr({key}): {e}"
+                    ))
+                })?;
+            if did {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
         }
         log::info!(
             "[wan22:{}][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}",
@@ -379,11 +386,7 @@ impl Wan22LoraBundle {
     /// LyCORIS map when populated; falls back to the legacy plain-LoRA map.
     /// Returns `None` when neither has an entry. Mirrors
     /// `QwenImageLoraBundle::adapter_for`.
-    pub fn adapter_for(
-        &self,
-        block_idx: usize,
-        target: LoraTarget,
-    ) -> Option<&dyn AdapterModule> {
+    pub fn adapter_for(&self, block_idx: usize, target: LoraTarget) -> Option<&dyn AdapterModule> {
         if let Some(lyc) = self.lycoris_adapters.get(&(block_idx, target)) {
             return Some(lyc.as_ref());
         }
@@ -394,8 +397,7 @@ impl Wan22LoraBundle {
     }
 
     pub fn parameters(&self) -> Vec<Parameter> {
-        let mut out =
-            Vec::with_capacity(self.adapters.len() * 2 + self.lycoris_adapters.len() * 2);
+        let mut out = Vec::with_capacity(self.adapters.len() * 2 + self.lycoris_adapters.len() * 2);
         for lora in self.adapters.values() {
             out.extend(lora.parameters());
         }
@@ -470,10 +472,7 @@ impl Wan22LoraBundle {
     /// then falls back to the legacy `lora_wan_blocks_*` format. Used by
     /// `train_wan22 --resume-low-lora/--resume-high-lora` and by
     /// `sample_wan22 --low-lora/--high-lora`. Returns `(hits, total)`.
-    pub fn rehydrate(
-        &self,
-        tensors: &HashMap<String, Tensor>,
-    ) -> Result<(usize, usize)> {
+    pub fn rehydrate(&self, tensors: &HashMap<String, Tensor>) -> Result<(usize, usize)> {
         // LyCORIS-adapter rehydrate path: per-leaf `set_data` keyed by
         // `{prefix}.{leaf}` (modern PEFT convention), no legacy fallback.
         if !self.lycoris_adapters.is_empty() {
@@ -775,10 +774,15 @@ impl Wan22Model {
         let shard_path = ckpt_path.to_string_lossy().into_owned();
         let path_refs: Vec<&str> = vec![shard_path.as_str()];
 
-        let facilitator = Wan22Facilitator { num_blocks: cfg.num_layers };
+        let facilitator = Wan22Facilitator {
+            num_blocks: cfg.num_layers,
+        };
         let mut offloader = crate::training::block_offload::BlockOffloader::load(
-            &path_refs, &facilitator, device.clone(),
-        ).map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader load: {e}")))?;
+            &path_refs,
+            &facilitator,
+            device.clone(),
+        )
+        .map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader load: {e}")))?;
 
         // Phase 2 FlexTensor port: opt into Adaptive resident-set strategy
         // when `FLAME_OFFLOAD_ADAPTIVE=1`. Default behavior (no env var or
@@ -799,12 +803,17 @@ impl Wan22Model {
         }
 
         // Load shared (non-block) weights resident, casting to weight_dtype.
-        let shared_raw = flame_core::serialization::load_file_filtered(
-            ckpt_path, &device, |key| !key.starts_with("blocks."),
-        )?;
+        let shared_raw =
+            flame_core::serialization::load_file_filtered(ckpt_path, &device, |key| {
+                !key.starts_with("blocks.")
+            })?;
         let mut weights = HashMap::with_capacity(shared_raw.len());
         for (k, v) in shared_raw {
-            let cast = if v.dtype() == weight_dtype { v } else { v.to_dtype(weight_dtype)? };
+            let cast = if v.dtype() == weight_dtype {
+                v
+            } else {
+                v.to_dtype(weight_dtype)?
+            };
             weights.insert(k, cast);
         }
 

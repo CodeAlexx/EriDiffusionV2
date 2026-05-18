@@ -16,10 +16,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
-use flame_core::{parameter::Parameter, DType, Tensor};
+use flame_core::adam::AdamW;
 use flame_core::autograd::AutogradContext;
 use flame_core::gradient_clip::GradientClipper;
-use flame_core::adam::AdamW;
+use flame_core::{parameter::Parameter, DType, Tensor};
 
 use crate::config::TrainConfig;
 use crate::data::CachedDataset;
@@ -85,21 +85,40 @@ impl<T: TrainableModel, P: TrainingPipeline> GenericTrainer<T, P> {
             None
         };
 
-        log::info!("Trainer init: {} params, lr={}, wd={}, ema={:?}",
-            params.len(), lr, opt_cfg.weight_decay, config.ema);
+        log::info!(
+            "Trainer init: {} params, lr={}, wd={}, ema={:?}",
+            params.len(),
+            lr,
+            opt_cfg.weight_decay,
+            config.ema
+        );
 
-        Ok(Self { config, device, model, pipeline, dataset, optimizer, ema, output_dir, step: 0 })
+        Ok(Self {
+            config,
+            device,
+            model,
+            pipeline,
+            dataset,
+            optimizer,
+            ema,
+            output_dir,
+            step: 0,
+        })
     }
 
     /// Single training step
     pub fn train_step(&mut self) -> Result<f32> {
         let idx = self.step % self.dataset.len();
-        let sample = self.dataset.get(idx)
+        let sample = self
+            .dataset
+            .get(idx)
             .ok_or_else(|| crate::EriDiffusionError::Data("sample out of bounds".into()))?;
 
         // Load tensors from cached sample
         let latent = sample.latent_tensor(&self.device)?;
-        let embeddings: Vec<Tensor> = sample.embedding_keys.iter()
+        let embeddings: Vec<Tensor> = sample
+            .embedding_keys
+            .iter()
             .filter_map(|k| sample.embedding(k, &self.device).ok())
             .collect();
 
@@ -107,7 +126,12 @@ impl<T: TrainableModel, P: TrainingPipeline> GenericTrainer<T, P> {
         let (inputs, targets) = self.pipeline.prepare_inputs(&latent, &embeddings, None)?;
 
         // Model forward
-        let pred = self.model.forward(&inputs.noisy, &inputs.timestep, &inputs.context, inputs.pooled.as_ref())?;
+        let pred = self.model.forward(
+            &inputs.noisy,
+            &inputs.timestep,
+            &inputs.context,
+            inputs.pooled.as_ref(),
+        )?;
 
         // Loss
         let loss = self.pipeline.compute_loss(&pred, &targets.target, None)?;
@@ -116,9 +140,10 @@ impl<T: TrainableModel, P: TrainingPipeline> GenericTrainer<T, P> {
         let loss_f32 = loss.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         let loss_val = loss_f32.first().copied().unwrap_or(f32::NAN);
         if !loss_val.is_finite() {
-            return Err(crate::EriDiffusionError::Training(
-                format!("step {}: non-finite loss {}", self.step, loss_val)
-            ));
+            return Err(crate::EriDiffusionError::Training(format!(
+                "step {}: non-finite loss {}",
+                self.step, loss_val
+            )));
         }
 
         // Backward + optimize
@@ -144,7 +169,12 @@ impl<T: TrainableModel, P: TrainingPipeline> GenericTrainer<T, P> {
         self.step += 1;
 
         if self.step % 100 == 0 {
-            log::info!("step {} | loss {:.4} | grad_norm {:.4}", self.step, loss_val, grad_norm);
+            log::info!(
+                "step {} | loss {:.4} | grad_norm {:.4}",
+                self.step,
+                loss_val,
+                grad_norm
+            );
         }
 
         Ok(loss_val)
@@ -181,7 +211,11 @@ pub fn accumulate_parameter_grads(
 ) -> Result<()> {
     for param in params {
         if let Some(g) = grads.get(param.id()) {
-            let g = if g.dtype() == DType::F32 { g.clone() } else { g.to_dtype(DType::F32)? };
+            let g = if g.dtype() == DType::F32 {
+                g.clone()
+            } else {
+                g.to_dtype(DType::F32)?
+            };
             param.set_grad(g)?;
         }
     }

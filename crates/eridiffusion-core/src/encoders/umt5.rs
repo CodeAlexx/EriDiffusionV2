@@ -46,16 +46,16 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Umt5Config {
-    pub vocab_size: usize,          // 256384
-    pub d_model: usize,             // 4096
-    pub num_layers: usize,          // 24
-    pub d_ff: usize,                // 10240
-    pub num_heads: usize,           // 64
-    pub d_kv: usize,                // 64
-    pub num_buckets: usize,         // 32
-    pub max_distance: usize,        // 128
+    pub vocab_size: usize,   // 256384
+    pub d_model: usize,      // 4096
+    pub num_layers: usize,   // 24
+    pub d_ff: usize,         // 10240
+    pub num_heads: usize,    // 64
+    pub d_kv: usize,         // 64
+    pub num_buckets: usize,  // 32
+    pub max_distance: usize, // 128
     pub layer_norm_eps: f32,
-    pub text_len: usize,            // 512
+    pub text_len: usize, // 512
 }
 
 impl Default for Umt5Config {
@@ -155,11 +155,8 @@ fn load_t5_safetensors_as_bf16(
             _ => unreachable!(),
         }
 
-        let mut tensor = Tensor::zeros_dtype(
-            Shape::from_dims(&shape_vec),
-            DType::BF16,
-            device.clone(),
-        )?;
+        let mut tensor =
+            Tensor::zeros_dtype(Shape::from_dims(&shape_vec), DType::BF16, device.clone())?;
         tensor.copy_from_bf16_slice(&bf16_bits)?;
         out.insert(name.clone(), tensor);
     }
@@ -231,9 +228,9 @@ impl Umt5Encoder {
     }
 
     fn get(&self, key: &str) -> Result<&Tensor> {
-        self.weights.get(key).ok_or_else(|| {
-            flame_core::Error::InvalidInput(format!("Missing UMT5 weight: {key}"))
-        })
+        self.weights
+            .get(key)
+            .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing UMT5 weight: {key}")))
     }
 
     // -----------------------------------------------------------------
@@ -244,11 +241,7 @@ impl Umt5Encoder {
     // Wan reference at `wan/modules/t5.py` (bidirectional branch).
     // -----------------------------------------------------------------
 
-    fn relative_position_bucket(
-        rel_pos: i64,
-        num_buckets: usize,
-        max_dist: usize,
-    ) -> usize {
+    fn relative_position_bucket(rel_pos: i64, num_buckets: usize, max_dist: usize) -> usize {
         // bidirectional encoder branch
         let num_buckets = num_buckets / 2;
         let rel_buckets = if rel_pos > 0 { num_buckets } else { 0 };
@@ -303,13 +296,9 @@ impl Umt5Encoder {
         let prefix = format!("encoder.block.{layer_idx}");
 
         let w = |suf: &str| -> Result<&Tensor> {
-            self.weights
-                .get(&format!("{prefix}.{suf}"))
-                .ok_or_else(|| {
-                    flame_core::Error::InvalidInput(format!(
-                        "Missing UMT5 weight: {prefix}.{suf}"
-                    ))
-                })
+            self.weights.get(&format!("{prefix}.{suf}")).ok_or_else(|| {
+                flame_core::Error::InvalidInput(format!("Missing UMT5 weight: {prefix}.{suf}"))
+            })
         };
 
         let dims = hidden.shape().dims().to_vec();
@@ -325,22 +314,35 @@ impl Umt5Encoder {
             let ll = n * n;
             log::info!(
                 "[UMT5 dbg] L0 bias[0,0,0,0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                v[0], v[1], v[2], v[3], v[4]
+                v[0],
+                v[1],
+                v[2],
+                v[3],
+                v[4]
             );
             // head 1, q=0, first 5 keys:
             log::info!(
                 "[UMT5 dbg] L0 bias[0,1,0,0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                v[ll], v[ll + 1], v[ll + 2], v[ll + 3], v[ll + 4]
+                v[ll],
+                v[ll + 1],
+                v[ll + 2],
+                v[ll + 3],
+                v[ll + 4]
             );
         }
 
         // --- Self-attention (pre-norm) ---
-        let normed = Self::t5_layer_norm(hidden, w("layer.0.layer_norm.weight")?, cfg.layer_norm_eps)?;
+        let normed =
+            Self::t5_layer_norm(hidden, w("layer.0.layer_norm.weight")?, cfg.layer_norm_eps)?;
         if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
             let v = normed.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             log::info!(
                 "[UMT5 dbg] L0 normed    tok0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                v[0], v[1], v[2], v[3], v[4]
+                v[0],
+                v[1],
+                v[2],
+                v[3],
+                v[4]
             );
         }
 
@@ -353,15 +355,27 @@ impl Umt5Encoder {
             let vv = v.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             log::info!(
                 "[UMT5 dbg] L0 q tok0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                vq[0], vq[1], vq[2], vq[3], vq[4]
+                vq[0],
+                vq[1],
+                vq[2],
+                vq[3],
+                vq[4]
             );
             log::info!(
                 "[UMT5 dbg] L0 k tok0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                vk[0], vk[1], vk[2], vk[3], vk[4]
+                vk[0],
+                vk[1],
+                vk[2],
+                vk[3],
+                vk[4]
             );
             log::info!(
                 "[UMT5 dbg] L0 v tok0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                vv[0], vv[1], vv[2], vv[3], vv[4]
+                vv[0],
+                vv[1],
+                vv[2],
+                vv[3],
+                vv[4]
             );
         }
 
@@ -380,74 +394,83 @@ impl Umt5Encoder {
         // BF16 quantization step — without it, attention sharpness differs and
         // outputs drift catastrophically by layer 18. This was the Helios UMT5
         // bug.
-        let sdpa_raw = {
-            let bh = b * h;
-            let q3 = q.reshape(&[bh, n, d])?;          // BF16
-            let k3 = k.reshape(&[bh, n, d])?;
-            let v3 = v.reshape(&[bh, n, d])?;
-            let k3_t = k3.permute(&[0, 2, 1])?.contiguous()?;   // [bh, d, n] BF16
-            let scores3 = q3.bmm(&k3_t)?;              // BF16 (F32 accum internally per cuBLAS)
-            if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
-                let sv = scores3.to_vec1::<f32>()?;
-                // bh=b*h. head 0 = bh index 0. q_row=0, first 5 keys.
-                log::info!(
+        let sdpa_raw =
+            {
+                let bh = b * h;
+                let q3 = q.reshape(&[bh, n, d])?; // BF16
+                let k3 = k.reshape(&[bh, n, d])?;
+                let v3 = v.reshape(&[bh, n, d])?;
+                let k3_t = k3.permute(&[0, 2, 1])?.contiguous()?; // [bh, d, n] BF16
+                let scores3 = q3.bmm(&k3_t)?; // BF16 (F32 accum internally per cuBLAS)
+                if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
+                    let sv = scores3.to_vec1::<f32>()?;
+                    // bh=b*h. head 0 = bh index 0. q_row=0, first 5 keys.
+                    log::info!(
                     "[UMT5 dbg] L0 scores_pre_bias[bh=0,q=0,k=0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
                     sv[0], sv[1], sv[2], sv[3], sv[4]
                 );
-                // head 1 (bh=1), q=0
-                let h1q0 = 1 * n * n;
-                log::info!(
+                    // head 1 (bh=1), q=0
+                    let h1q0 = 1 * n * n;
+                    log::info!(
                     "[UMT5 dbg] L0 scores_pre_bias[bh=1,q=0,k=0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
                     sv[h1q0], sv[h1q0 + 1], sv[h1q0 + 2], sv[h1q0 + 3], sv[h1q0 + 4]
                 );
-            }
-            // scores BF16, bias BF16 — keep in BF16 to match torch's exact
-            // arithmetic before the F32 softmax cast.
-            let scores4 = scores3.reshape(&[b, h, n, n])?;
-            let scores4 = scores4.add(&bias)?;
-            // Now cast to F32 for the softmax (torch: softmax(scores.float(), dim=-1)).
-            let scores4 = scores4.to_dtype(DType::F32)?;
-            if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
-                let sv = scores4.to_vec1::<f32>()?;
-                log::info!(
-                    "[UMT5 dbg] L0 scores_post_bias[0,0,0,0..{}]: {:?}",
-                    n,
-                    &sv[..n]
-                );
-                let max_v = sv[..n].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let min_v = sv[..n].iter().cloned().fold(f32::INFINITY, f32::min);
-                log::info!("[UMT5 dbg] L0 scores_post_bias row max={max_v}  min={min_v}");
-            }
-            // Compute softmax manually in F32 to bypass any fast-path
-            // numerical mismatch. Python: F.softmax(x.float(), dim=-1).
-            let attn4 = {
-                let max4 = flame_core::cuda_ops::GpuOps::max_dim(&scores4, 3, true)?;
-                let shifted = scores4.sub(&max4)?;
-                let exp4 = shifted.exp()?;
-                let sum4 = flame_core::cuda_ops::GpuOps::sum_dim_keepdim(&exp4, 3)?;
-                exp4.div(&sum4)?
+                }
+                // scores BF16, bias BF16 — keep in BF16 to match torch's exact
+                // arithmetic before the F32 softmax cast.
+                let scores4 = scores3.reshape(&[b, h, n, n])?;
+                let scores4 = scores4.add(&bias)?;
+                // Now cast to F32 for the softmax (torch: softmax(scores.float(), dim=-1)).
+                let scores4 = scores4.to_dtype(DType::F32)?;
+                if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
+                    let sv = scores4.to_vec1::<f32>()?;
+                    log::info!(
+                        "[UMT5 dbg] L0 scores_post_bias[0,0,0,0..{}]: {:?}",
+                        n,
+                        &sv[..n]
+                    );
+                    let max_v = sv[..n].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let min_v = sv[..n].iter().cloned().fold(f32::INFINITY, f32::min);
+                    log::info!("[UMT5 dbg] L0 scores_post_bias row max={max_v}  min={min_v}");
+                }
+                // Compute softmax manually in F32 to bypass any fast-path
+                // numerical mismatch. Python: F.softmax(x.float(), dim=-1).
+                let attn4 = {
+                    let max4 = flame_core::cuda_ops::GpuOps::max_dim(&scores4, 3, true)?;
+                    let shifted = scores4.sub(&max4)?;
+                    let exp4 = shifted.exp()?;
+                    let sum4 = flame_core::cuda_ops::GpuOps::sum_dim_keepdim(&exp4, 3)?;
+                    exp4.div(&sum4)?
+                };
+                if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
+                    let sv = attn4.to_vec1::<f32>()?;
+                    log::info!(
+                        "[UMT5 dbg] L0 attn_weights[0,0,0,0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
+                        sv[0],
+                        sv[1],
+                        sv[2],
+                        sv[3],
+                        sv[4]
+                    );
+                    let row_sum: f32 = sv[..n].iter().sum();
+                    log::info!("[UMT5 dbg] L0 attn_weights row sum (head 0 q 0): {row_sum:.4}");
+                }
+                // attn weights BF16 (torch: .type_as(scores) → BF16). Multiply
+                // attn @ V in BF16 with F32 accumulator.
+                let attn3 = attn4.to_dtype(DType::BF16)?.reshape(&[bh, n, n])?;
+                let out3 = attn3.bmm(&v3)?; // BF16 (V is BF16)
+                out3.reshape(&[b, h, n, d])?
             };
-            if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
-                let sv = attn4.to_vec1::<f32>()?;
-                log::info!(
-                    "[UMT5 dbg] L0 attn_weights[0,0,0,0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                    sv[0], sv[1], sv[2], sv[3], sv[4]
-                );
-                let row_sum: f32 = sv[..n].iter().sum();
-                log::info!("[UMT5 dbg] L0 attn_weights row sum (head 0 q 0): {row_sum:.4}");
-            }
-            // attn weights BF16 (torch: .type_as(scores) → BF16). Multiply
-            // attn @ V in BF16 with F32 accumulator.
-            let attn3 = attn4.to_dtype(DType::BF16)?.reshape(&[bh, n, n])?;
-            let out3 = attn3.bmm(&v3)?;                // BF16 (V is BF16)
-            out3.reshape(&[b, h, n, d])?
-        };
         if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
             // sdpa_raw shape: [B, H, L, D]
             let v = sdpa_raw.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             log::info!(
                 "[UMT5 dbg] L0 sdpa[0,0,0,0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                v[0], v[1], v[2], v[3], v[4]
+                v[0],
+                v[1],
+                v[2],
+                v[3],
+                v[4]
             );
             // sdpa for (B=0, H=1, L=0)
             let l_len = n;
@@ -455,7 +478,11 @@ impl Umt5Encoder {
             let offs = 1 * l_len * d_dim;
             log::info!(
                 "[UMT5 dbg] L0 sdpa[0,1,0,0..5]: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                v[offs], v[offs + 1], v[offs + 2], v[offs + 3], v[offs + 4]
+                v[offs],
+                v[offs + 1],
+                v[offs + 2],
+                v[offs + 3],
+                v[offs + 4]
             );
         }
         let attn_pre = sdpa_raw.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?;
@@ -463,7 +490,11 @@ impl Umt5Encoder {
             let v = attn_pre.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             log::info!(
                 "[UMT5 dbg] L0 pre-o tok0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                v[0], v[1], v[2], v[3], v[4]
+                v[0],
+                v[1],
+                v[2],
+                v[3],
+                v[4]
             );
         }
         let attn = Self::linear_nobias(&attn_pre, w("layer.0.SelfAttention.o.weight")?)?;
@@ -472,11 +503,19 @@ impl Umt5Encoder {
             let va = attn.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             log::info!(
                 "[UMT5 dbg] L0 pre-attn  tok0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                vh[0], vh[1], vh[2], vh[3], vh[4]
+                vh[0],
+                vh[1],
+                vh[2],
+                vh[3],
+                vh[4]
             );
             log::info!(
                 "[UMT5 dbg] L0 attn_out  tok0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                va[0], va[1], va[2], va[3], va[4]
+                va[0],
+                va[1],
+                va[2],
+                va[3],
+                va[4]
             );
         }
         let hidden = hidden.add(&attn)?;
@@ -484,13 +523,19 @@ impl Umt5Encoder {
             let vh = hidden.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             log::info!(
                 "[UMT5 dbg] L0 post-attn tok0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                vh[0], vh[1], vh[2], vh[3], vh[4]
+                vh[0],
+                vh[1],
+                vh[2],
+                vh[3],
+                vh[4]
             );
         }
 
         // --- Gated-GELU FFN (pre-norm) ---
-        let normed2 = Self::t5_layer_norm(&hidden, w("layer.1.layer_norm.weight")?, cfg.layer_norm_eps)?;
-        let gate = Self::linear_nobias(&normed2, w("layer.1.DenseReluDense.wi_0.weight")?)?.gelu()?;
+        let normed2 =
+            Self::t5_layer_norm(&hidden, w("layer.1.layer_norm.weight")?, cfg.layer_norm_eps)?;
+        let gate =
+            Self::linear_nobias(&normed2, w("layer.1.DenseReluDense.wi_0.weight")?)?.gelu()?;
         let up = Self::linear_nobias(&normed2, w("layer.1.DenseReluDense.wi_1.weight")?)?;
         let ffn_hidden = up.mul(&gate)?;
         let ffn_out = Self::linear_nobias(&ffn_hidden, w("layer.1.DenseReluDense.wo.weight")?)?;
@@ -538,14 +583,19 @@ impl Umt5Encoder {
             let v = hidden.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             log::info!(
                 "[UMT5 dbg] embed token0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                v[0], v[1], v[2], v[3], v[4]
+                v[0],
+                v[1],
+                v[2],
+                v[3],
+                v[4]
             );
         }
 
         // Transformer blocks (each layer recomputes its own rel-pos bias).
         // When UMT5_DUMP_PER_LAYER is set, save each layer's output for
         // bisection vs diffusers reference.
-        let mut per_layer_dump: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        let mut per_layer_dump: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
         let dump_per_layer = std::env::var("UMT5_DUMP_PER_LAYER").is_ok();
         if dump_per_layer {
             per_layer_dump.insert("raw_embed".to_string(), hidden.clone());
@@ -559,7 +609,12 @@ impl Umt5Encoder {
                 let v = hidden.to_dtype(DType::F32)?.to_vec1::<f32>()?;
                 log::info!(
                     "[UMT5 dbg] after layer {}  token0 first5: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                    i, v[0], v[1], v[2], v[3], v[4]
+                    i,
+                    v[0],
+                    v[1],
+                    v[2],
+                    v[3],
+                    v[4]
                 );
             }
             if (i + 1) % 6 == 0 || i == cfg.num_layers - 1 {

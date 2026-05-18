@@ -25,43 +25,60 @@ const DROP_IDX: usize = 34;
 #[derive(Parser)]
 struct Args {
     /// Single prompt. Mutually exclusive with `--prompts-file`.
-    #[arg(long)] prompt: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
     /// Newline-separated prompts file for batch sampling. Blank lines and
     /// `#`-prefixed comments are skipped. Requires `--output-dir`. The
     /// text encoder is loaded once, every prompt is encoded, the TE is
     /// dropped, then the DiT loads once and serves all prompts — instead
     /// of paying TE+DiT load on every standalone invocation.
-    #[arg(long)] prompts_file: Option<PathBuf>,
-    #[arg(long, default_value = "")] negative_prompt: String,
+    #[arg(long)]
+    prompts_file: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    negative_prompt: String,
     /// Single-prompt output path. Used when `--prompt` is given.
-    #[arg(long, default_value = "output.png")] output: PathBuf,
+    #[arg(long, default_value = "output.png")]
+    output: PathBuf,
     /// Multi-prompt output directory. Required with `--prompts-file`.
     /// Files are written as `sample_001.png`, `sample_002.png`, ...
-    #[arg(long)] output_dir: Option<PathBuf>,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
     /// Qwen-Image-2512 transformer dir (the `transformer/` subdir of the HF
     /// release, with 9 sharded `diffusion_pytorch_model-...safetensors`).
-    #[arg(long)] model: PathBuf,
+    #[arg(long)]
+    model: PathBuf,
     /// `qwen_image_vae.safetensors` (wan21 internal-key format).
-    #[arg(long)] vae_path: PathBuf,
+    #[arg(long)]
+    vae_path: PathBuf,
     /// Directory of Qwen2.5-VL text encoder safetensors shards
     /// (`text_encoder/` subdir of `qwen-image-2512`), or a single combined file.
-    #[arg(long)] text_encoder: PathBuf,
+    #[arg(long)]
+    text_encoder: PathBuf,
     /// `tokenizer.json` for Qwen2.5-VL (Qwen-Image-2512's tokenizer subdir).
-    #[arg(long)] tokenizer_path: PathBuf,
-    #[arg(long, default_value = "512")] size: usize,
-    #[arg(long, default_value = "50")] steps: usize,
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    #[arg(long, default_value = "512")]
+    size: usize,
+    #[arg(long, default_value = "50")]
+    steps: usize,
     /// CFG scale. Set to 1.0 to disable classifier-free guidance.
-    #[arg(long, default_value = "4.0")] cfg: f32,
-    #[arg(long, default_value = "42")] seed: u64,
-    #[arg(long, default_value_t = TXT_PAD_LEN_DEFAULT)] max_text_len: usize,
+    #[arg(long, default_value = "4.0")]
+    cfg: f32,
+    #[arg(long, default_value = "42")]
+    seed: u64,
+    #[arg(long, default_value_t = TXT_PAD_LEN_DEFAULT)]
+    max_text_len: usize,
     /// Optional trained LoRA safetensors. Accepts `weights`-mode (bare
     /// LoRA tensors) and `full`-mode (LoRA + AdamW + step) checkpoints
     /// from `train_qwenimage` — the loader matches LoRA prefixes and
     /// ignores the `__opt__/` optimizer-state entries.
-    #[arg(long)] lora_path: Option<PathBuf>,
-    #[arg(long, default_value = "16")] lora_rank: usize,
+    #[arg(long)]
+    lora_path: Option<PathBuf>,
+    #[arg(long, default_value = "16")]
+    lora_rank: usize,
     /// Match the alpha used at training time. Mismatch = silent scale drift.
-    #[arg(long, default_value = "16.0")] lora_alpha: f32,
+    #[arg(long, default_value = "16.0")]
+    lora_alpha: f32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -82,8 +99,11 @@ fn main() -> anyhow::Result<()> {
     let te_cfg = Qwen25VLEncoder::config_from_weights(&te_weights)?;
     log::info!(
         "  config: hidden={} layers={} heads={} kv_heads={} head_dim={}",
-        te_cfg.hidden_size, te_cfg.num_layers, te_cfg.num_heads,
-        te_cfg.num_kv_heads, te_cfg.head_dim,
+        te_cfg.hidden_size,
+        te_cfg.num_layers,
+        te_cfg.num_heads,
+        te_cfg.num_kv_heads,
+        te_cfg.head_dim,
     );
     let te = Qwen25VLEncoder::new(te_weights, te_cfg, device.clone());
 
@@ -97,7 +117,8 @@ fn main() -> anyhow::Result<()> {
         // produces noise-only output. Trim back to the actual content
         // length (real tokens − DROP_IDX) before returning.
         let wrapped = format!("{PROMPT_PREFIX}{text}{PROMPT_SUFFIX}");
-        let enc = tokenizer.encode(wrapped, false)
+        let enc = tokenizer
+            .encode(wrapped, false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
         let raw_ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
         let work_len = args.max_text_len + DROP_IDX;
@@ -112,7 +133,8 @@ fn main() -> anyhow::Result<()> {
         }
         let kept_len = real_len - DROP_IDX;
         let full_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
-        full_hidden.narrow(1, DROP_IDX, kept_len)
+        full_hidden
+            .narrow(1, DROP_IDX, kept_len)
             .map_err(|e| anyhow::anyhow!("narrow: {e}"))
     };
 
@@ -124,7 +146,8 @@ fn main() -> anyhow::Result<()> {
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
-            content.lines()
+            content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
@@ -146,10 +169,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     log::info!("[2/4] Encoding {} prompt(s) + uncond...", prompts.len());
-    let conds: Vec<Tensor> = prompts.iter().enumerate()
+    let conds: Vec<Tensor> = prompts
+        .iter()
+        .enumerate()
         .map(|(i, p)| {
             let c = encode(p)?;
-            log::info!("  prompt {}/{}: cond shape={:?}", i + 1, prompts.len(), c.shape().dims());
+            log::info!(
+                "  prompt {}/{}: cond shape={:?}",
+                i + 1,
+                prompts.len(),
+                c.shape().dims()
+            );
             Ok(c)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -164,20 +194,29 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("[3/4] Loading Qwen-Image transformer...");
     let mut model = QwenImageTrainingModel::load(
-        &args.model, args.lora_rank, args.lora_alpha,
-        /*full_finetune*/ false, device.clone(), args.seed,
+        &args.model,
+        args.lora_rank,
+        args.lora_alpha,
+        /*full_finetune*/ false,
+        device.clone(),
+        args.seed,
     )?;
     if let Some(lp) = &args.lora_path {
         model.bundle.load(lp, &device)?;
         log::info!(
             "  applied LoRA from {} (rank={}, alpha={})",
-            lp.display(), args.lora_rank, args.lora_alpha,
+            lp.display(),
+            args.lora_rank,
+            args.lora_alpha,
         );
     }
 
     log::info!(
         "[4/4] Sampling {} prompt(s) at {}² ({} steps, cfg={})",
-        conds.len(), args.size, args.steps, args.cfg,
+        conds.len(),
+        args.size,
+        args.steps,
+        args.cfg,
     );
     // Width of the zero-padded sample index. Three digits is enough for
     // any practical batch; widen automatically if a future caller passes
@@ -195,7 +234,8 @@ fn main() -> anyhow::Result<()> {
             &mut model,
             cond,
             uncond.as_ref(),
-            args.size, args.size,
+            args.size,
+            args.size,
             args.steps,
             args.cfg,
             args.seed,

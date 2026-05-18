@@ -82,10 +82,10 @@ mod tests {
     #[test]
     fn weight_zero_is_noop() {
         let device = global_cuda_device();
-        let diff = Tensor::from_vec(vec![1.0, 2.0, -3.0], Shape::from_dims(&[3]), device.clone())
-            .unwrap();
-        let mask = Tensor::from_vec(vec![0.0, 1.0, 0.5], Shape::from_dims(&[3]), device.clone())
-            .unwrap();
+        let diff =
+            Tensor::from_vec(vec![1.0, 2.0, -3.0], Shape::from_dims(&[3]), device.clone()).unwrap();
+        let mask =
+            Tensor::from_vec(vec![0.0, 1.0, 0.5], Shape::from_dims(&[3]), device.clone()).unwrap();
         let out = apply_loss_mask(&diff, &mask, 0.0).unwrap();
         let v = out.to_vec().unwrap();
         assert!(approx_eq(v[0], 1.0, 1e-6));
@@ -96,10 +96,10 @@ mod tests {
     #[test]
     fn weight_one_full_mask() {
         let device = global_cuda_device();
-        let diff = Tensor::from_vec(vec![1.0, 2.0, -3.0], Shape::from_dims(&[3]), device.clone())
-            .unwrap();
-        let mask = Tensor::from_vec(vec![0.0, 1.0, 0.5], Shape::from_dims(&[3]), device.clone())
-            .unwrap();
+        let diff =
+            Tensor::from_vec(vec![1.0, 2.0, -3.0], Shape::from_dims(&[3]), device.clone()).unwrap();
+        let mask =
+            Tensor::from_vec(vec![0.0, 1.0, 0.5], Shape::from_dims(&[3]), device.clone()).unwrap();
         let out = apply_loss_mask(&diff, &mask, 1.0).unwrap();
         let v = out.to_vec().unwrap();
         assert!(approx_eq(v[0], 0.0, 1e-6));

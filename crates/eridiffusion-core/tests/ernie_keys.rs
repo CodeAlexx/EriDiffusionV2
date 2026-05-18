@@ -5,12 +5,18 @@ use std::path::Path;
 fn inspect_ernie_keys() {
     let device = flame_core::global_cuda_device();
     let dir = Path::new("/home/alex/models/ERNIE-Image/transformer");
-    for shard in &["diffusion_pytorch_model-00001-of-00002.safetensors", "diffusion_pytorch_model-00002-of-00002.safetensors"] {
+    for shard in &[
+        "diffusion_pytorch_model-00001-of-00002.safetensors",
+        "diffusion_pytorch_model-00002-of-00002.safetensors",
+    ] {
         let path = dir.join(shard);
         let weights = flame_core::serialization::load_file(&path, &device).unwrap();
         println!("=== {} ({} tensors) ===", shard, weights.len());
         // Show top-level keys only (not layers.*)
-        let tops: Vec<_> = weights.keys().filter(|k| !k.starts_with("layers.")).collect();
+        let tops: Vec<_> = weights
+            .keys()
+            .filter(|k| !k.starts_with("layers."))
+            .collect();
         for k in &tops {
             if let Some(t) = weights.get(*k) {
                 println!("  {} -> {:?}", k, t.shape().dims());

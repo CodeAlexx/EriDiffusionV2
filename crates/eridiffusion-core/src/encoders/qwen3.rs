@@ -129,7 +129,11 @@ impl Qwen3Encoder {
         let mut weights = weights;
         let keys: Vec<String> = weights.keys().cloned().collect();
         for key in &keys {
-            if key.ends_with(".weight") && !key.contains("layernorm") && !key.contains("norm") && !key.contains("embed") {
+            if key.ends_with(".weight")
+                && !key.contains("layernorm")
+                && !key.contains("norm")
+                && !key.contains("embed")
+            {
                 let w = &weights[key];
                 if w.shape().dims().len() == 2 {
                     if let Ok(wt) = flame_core::bf16_elementwise::transpose2d_bf16(w) {
@@ -163,7 +167,9 @@ impl Qwen3Encoder {
 
         // Count layers
         let mut num_layers = 0;
-        while weights.contains_key(&format!("model.layers.{num_layers}.self_attn.q_proj.weight")) {
+        while weights.contains_key(&format!(
+            "model.layers.{num_layers}.self_attn.q_proj.weight"
+        )) {
             num_layers += 1;
         }
 
@@ -203,9 +209,9 @@ impl Qwen3Encoder {
 
     /// Get a reference to a weight tensor, returning an error if missing.
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.weights.get(key).ok_or_else(|| {
-            flame_core::Error::InvalidInput(format!("Missing weight key: {key}"))
-        })
+        self.weights
+            .get(key)
+            .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing weight key: {key}")))
     }
 
     // -----------------------------------------------------------------------
@@ -254,8 +260,16 @@ impl Qwen3Encoder {
         let freq_row = log_freqs.reshape(&[1, half])?;
         let angles = pos_col.matmul(&freq_row)?;
 
-        let cos = angles.cos()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
-        let sin = angles.sin()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
+        let cos = angles
+            .cos()?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .to_dtype(DType::BF16)?;
+        let sin = angles
+            .sin()?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .to_dtype(DType::BF16)?;
         Ok((cos, sin))
     }
 
@@ -263,11 +277,7 @@ impl Qwen3Encoder {
     ///
     /// `x`: `[B, H, N, D]`, `pe_cos`/`pe_sin`: `[1, 1, N, D/2]`.
     /// Fused RoPE — single CUDA kernel, no intermediates.
-    fn apply_rope_single(
-        x: &Tensor,
-        pe_cos: &Tensor,
-        pe_sin: &Tensor,
-    ) -> Result<Tensor> {
+    fn apply_rope_single(x: &Tensor, pe_cos: &Tensor, pe_sin: &Tensor) -> Result<Tensor> {
         // Qwen3 uses half-split RoPE (HF rotate_half convention)
         flame_core::bf16_ops::rope_halfsplit_bf16(x, pe_cos, pe_sin)
     }
@@ -394,11 +404,19 @@ impl Qwen3Encoder {
             (self.weights.get(&q_norm_key), self.weights.get(&k_norm_key))
         {
             let q_flat = q.reshape(&[b * h * n, d])?;
-            let q_normed = flame_core::cuda_ops_bf16::rms_norm_bf16(&q_flat, Some(q_norm_w), cfg.rms_norm_eps)?;
+            let q_normed = flame_core::cuda_ops_bf16::rms_norm_bf16(
+                &q_flat,
+                Some(q_norm_w),
+                cfg.rms_norm_eps,
+            )?;
             q = q_normed.reshape(&[b, h, n, d])?;
 
             let k_flat = k.reshape(&[b * h_kv * n, d])?;
-            let k_normed = flame_core::cuda_ops_bf16::rms_norm_bf16(&k_flat, Some(k_norm_w), cfg.rms_norm_eps)?;
+            let k_normed = flame_core::cuda_ops_bf16::rms_norm_bf16(
+                &k_flat,
+                Some(k_norm_w),
+                cfg.rms_norm_eps,
+            )?;
             k = k_normed.reshape(&[b, h_kv, n, d])?;
         }
 
@@ -474,7 +492,10 @@ impl Qwen3Encoder {
 
         // Detect real (non-pad) token count. Pad token = 151643.
         let pad_id = 151643i32;
-        let real_len = token_ids.iter().position(|&id| id == pad_id).unwrap_or(seq_len);
+        let real_len = token_ids
+            .iter()
+            .position(|&id| id == pad_id)
+            .unwrap_or(seq_len);
 
         let mut hidden = self.embed_tokens(token_ids)?;
 
@@ -639,8 +660,8 @@ mod tests {
         let device = flame_core::CudaDevice::new(0).expect("cuda dev 0");
         let device: std::sync::Arc<flame_core::CudaDevice> = device;
 
-        let mut map = flame_core::serialization::load_file(&fixture_path, &device)
-            .expect("load fixture");
+        let mut map =
+            flame_core::serialization::load_file(&fixture_path, &device).expect("load fixture");
 
         // Pull off inputs, expected, and the final norm before we hand the
         // remaining model weights to the encoder.
@@ -660,9 +681,7 @@ mod tests {
         // The fixture script saved torch.int32; flame's load_file reads it as
         // DType::I32 (f32-bytes-relabeled per FLAME_CONVENTIONS). So
         // to_vec_f32 returns the int values as f32. Cast back to i32.
-        let token_ids_f32 = input_ids_tensor
-            .to_vec_f32()
-            .expect("input_ids to_vec_f32");
+        let token_ids_f32 = input_ids_tensor.to_vec_f32().expect("input_ids to_vec_f32");
         let token_ids: Vec<i32> = token_ids_f32.into_iter().map(|x| x as i32).collect();
 
         let cfg = Qwen3Config {
@@ -695,12 +714,9 @@ mod tests {
         let dims = last_layer_pre_norm.shape().dims().to_vec();
         let (b, s, h) = (dims[0], dims[1], dims[2]);
         let flat = last_layer_pre_norm.reshape(&[b * s, h]).expect("flatten");
-        let normed = flame_core::cuda_ops_bf16::rms_norm_bf16(
-            &flat,
-            Some(&final_norm_w),
-            cfg.rms_norm_eps,
-        )
-        .expect("final rms_norm");
+        let normed =
+            flame_core::cuda_ops_bf16::rms_norm_bf16(&flat, Some(&final_norm_w), cfg.rms_norm_eps)
+                .expect("final rms_norm");
         let normed = normed.reshape(&[b, s, h]).expect("reshape");
 
         let got = normed.to_vec_f32().expect("got vec");
@@ -717,9 +733,7 @@ mod tests {
             sum_abs += d as f64;
         }
         let mean_abs = (sum_abs / got.len() as f64) as f32;
-        eprintln!(
-            "qwen3_vl_text_small_parity: max_abs={max_abs:.4e} mean_abs={mean_abs:.4e}"
-        );
+        eprintln!("qwen3_vl_text_small_parity: max_abs={max_abs:.4e} mean_abs={mean_abs:.4e}");
         // BF16 scatter-add accumulation through 4 layers — mostly tight, max
         // can spike on near-zero outputs.
         assert!(mean_abs < 1e-3, "mean_abs {mean_abs} exceeds 1e-3");

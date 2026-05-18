@@ -8,7 +8,6 @@
 //!   5. SD3 16-channel VAE decode → save PNG.
 
 use clap::Parser;
-use flame_core::{DType, Shape, Tensor};
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};
 use eridiffusion_core::encoders::{
     clip_g::ClipGEncoder,
@@ -17,6 +16,7 @@ use eridiffusion_core::encoders::{
     t5_xxl::T5Encoder,
 };
 use eridiffusion_core::models::{sd35::SD35Model, TrainableModel};
+use flame_core::{DType, Shape, Tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -35,60 +35,89 @@ const VAE_SHIFT: f32 = 0.0609;
 #[derive(Parser)]
 struct Args {
     /// Single prompt. Mutually exclusive with `--prompts-file`.
-    #[arg(long)] prompt: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
     /// Newline-separated prompts file for batch sampling. Blank lines and
     /// `#`-prefixed comments are skipped. Requires `--output-dir`. CLIPs +
     /// T5 load once for all prompts; DiT and VAE each load once total.
-    #[arg(long)] prompts_file: Option<PathBuf>,
-    #[arg(long, default_value = "")] negative_prompt: String,
-    #[arg(long, default_value = "output.png")] output: PathBuf,
+    #[arg(long)]
+    prompts_file: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    negative_prompt: String,
+    #[arg(long, default_value = "output.png")]
+    output: PathBuf,
     /// Multi-prompt output directory. Required with `--prompts-file`.
     /// Files are written as `sample_001.png`, `sample_002.png`, ...
-    #[arg(long)] output_dir: Option<PathBuf>,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
 
     /// SD 3.5 transformer (combined ckpt or DiT-only). Same file works for VAE.
-    #[arg(long)] transformer: PathBuf,
+    #[arg(long)]
+    transformer: PathBuf,
     /// Optional separate VAE ckpt; defaults to --transformer (combined).
-    #[arg(long)] vae_ckpt: Option<PathBuf>,
-    #[arg(long)] clip_l_ckpt: PathBuf,
-    #[arg(long)] clip_g_ckpt: PathBuf,
-    #[arg(long)] t5_ckpt: PathBuf,
-    #[arg(long)] clip_l_tokenizer: PathBuf,
-    #[arg(long)] clip_g_tokenizer: PathBuf,
-    #[arg(long)] t5_tokenizer: PathBuf,
+    #[arg(long)]
+    vae_ckpt: Option<PathBuf>,
+    #[arg(long)]
+    clip_l_ckpt: PathBuf,
+    #[arg(long)]
+    clip_g_ckpt: PathBuf,
+    #[arg(long)]
+    t5_ckpt: PathBuf,
+    #[arg(long)]
+    clip_l_tokenizer: PathBuf,
+    #[arg(long)]
+    clip_g_tokenizer: PathBuf,
+    #[arg(long)]
+    t5_tokenizer: PathBuf,
 
     /// HARD-locked to 1024 — the only supported sample resolution.
-    #[arg(long, default_value_t = SAMPLE_RES)] size: usize,
-    #[arg(long, default_value = "28")] steps: usize,
+    #[arg(long, default_value_t = SAMPLE_RES)]
+    size: usize,
+    #[arg(long, default_value = "28")]
+    steps: usize,
     /// CFG scale. Set to 1.0 to disable CFG (single forward).
-    #[arg(long, default_value = "4.5")] cfg_scale: f32,
+    #[arg(long, default_value = "4.5")]
+    cfg_scale: f32,
     /// Discrete-flow schedule shift. SD3 reference default 3.0.
-    #[arg(long, default_value = "3.0")] shift: f32,
+    #[arg(long, default_value = "3.0")]
+    shift: f32,
     /// HARD-locked to 77 — combined CLIP+T5 context is `[B, 154, 4096]`.
-    #[arg(long, default_value_t = TXT_PAD_LEN)] t5_max_len: usize,
-    #[arg(long, default_value = "42")] seed: u64,
+    #[arg(long, default_value_t = TXT_PAD_LEN)]
+    t5_max_len: usize,
+    #[arg(long, default_value = "42")]
+    seed: u64,
 
     /// Optional trained LoRA safetensors (PEFT-format keys produced by train_sd35).
-    #[arg(long)] lora_path: Option<PathBuf>,
-    #[arg(long, default_value = "16")] lora_rank: usize,
-    #[arg(long, default_value = "1.0")] lora_alpha: f64,
+    #[arg(long)]
+    lora_path: Option<PathBuf>,
+    #[arg(long, default_value = "16")]
+    lora_rank: usize,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f64,
 }
 
 fn collect_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
-    if path.is_file() { return Ok(vec![path.to_path_buf()]); }
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
     let mut shards: Vec<PathBuf> = std::fs::read_dir(path)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
         .collect();
     shards.sort();
-    if shards.is_empty() { anyhow::bail!("no safetensors at {:?}", path); }
+    if shards.is_empty() {
+        anyhow::bail!("no safetensors at {:?}", path);
+    }
     Ok(shards)
 }
 
 fn load_one_or_dir(
-    path: &std::path::Path, device: &std::sync::Arc<flame_core::CudaDevice>,
+    path: &std::path::Path,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
 ) -> flame_core::Result<HashMap<String, Tensor>> {
-    if path.is_file() { return flame_core::serialization::load_file(path, device); }
+    if path.is_file() {
+        return flame_core::serialization::load_file(path, device);
+    }
     let mut all = HashMap::new();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
         .map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
@@ -103,25 +132,45 @@ fn load_one_or_dir(
 }
 
 fn tokenize_clip(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Result<Vec<i32>> {
-    let enc = tok.encode(text, true).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let enc = tok
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
-    if ids.len() > CLIP_MAX_LEN { ids.truncate(CLIP_MAX_LEN); }
-    while ids.len() < CLIP_MAX_LEN { ids.push(pad_id); }
+    if ids.len() > CLIP_MAX_LEN {
+        ids.truncate(CLIP_MAX_LEN);
+    }
+    while ids.len() < CLIP_MAX_LEN {
+        ids.push(pad_id);
+    }
     Ok(ids)
 }
 
-fn tokenize_t5(tok: &tokenizers::Tokenizer, text: &str, max_len: usize) -> anyhow::Result<Vec<i32>> {
-    let enc = tok.encode(text, true).map_err(|e| anyhow::anyhow!("t5 tokenize: {e}"))?;
+fn tokenize_t5(
+    tok: &tokenizers::Tokenizer,
+    text: &str,
+    max_len: usize,
+) -> anyhow::Result<Vec<i32>> {
+    let enc = tok
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("t5 tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
-    if ids.len() > max_len { ids.truncate(max_len); }
-    while ids.len() < max_len { ids.push(0); }
+    if ids.len() > max_len {
+        ids.truncate(max_len);
+    }
+    while ids.len() < max_len {
+        ids.push(0);
+    }
     Ok(ids)
 }
 
 fn encode_sd3_prompt(
     text: &str,
-    clip_l: &ClipEncoder, clip_g: &ClipGEncoder, t5: &mut T5Encoder,
-    tok_l: &tokenizers::Tokenizer, tok_g: &tokenizers::Tokenizer, tok_t5: &tokenizers::Tokenizer,
+    clip_l: &ClipEncoder,
+    clip_g: &ClipGEncoder,
+    t5: &mut T5Encoder,
+    tok_l: &tokenizers::Tokenizer,
+    tok_g: &tokenizers::Tokenizer,
+    tok_t5: &tokenizers::Tokenizer,
     t5_max_len: usize,
     device: &std::sync::Arc<flame_core::CudaDevice>,
 ) -> anyhow::Result<(Tensor, Tensor)> {
@@ -135,11 +184,12 @@ fn encode_sd3_prompt(
     let clip_lg = Tensor::cat(&[&clip_l_h, &clip_g_h], 2)?;
     let pad_zeros = Tensor::zeros_dtype(
         Shape::from_dims(&[clip_lg.dims()[0], clip_lg.dims()[1], 4096 - 2048]),
-        DType::BF16, device.clone(),
+        DType::BF16,
+        device.clone(),
     )?;
     let clip_lg_padded = Tensor::cat(&[&clip_lg.to_dtype(DType::BF16)?, &pad_zeros], 2)?;
-    let context = Tensor::cat(&[&clip_lg_padded, &t5_h.to_dtype(DType::BF16)?], 1)?
-        .to_dtype(DType::BF16)?;
+    let context =
+        Tensor::cat(&[&clip_lg_padded, &t5_h.to_dtype(DType::BF16)?], 1)?.to_dtype(DType::BF16)?;
     let pooled = Tensor::cat(&[&clip_l_pool, &clip_g_pool], 1)?.to_dtype(DType::BF16)?;
     Ok((context, pooled))
 }
@@ -159,7 +209,9 @@ fn build_schedule(num_steps: usize, shift: f32) -> Vec<f32> {
 }
 
 fn save_png(rgb: &Tensor, path: &std::path::Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let rgb_f32 = rgb.to_dtype(DType::F32)?;
     let data = rgb_f32.to_vec()?;
     let dims = rgb_f32.dims().to_vec();
@@ -205,8 +257,16 @@ fn main() -> anyhow::Result<()> {
 
     let h_lat = args.size / 8;
     let w_lat = args.size / 8;
-    log::info!("Sampling SD 3.5: {}x{} → latent {}x{} (cfg={}, steps={}, shift={})",
-        args.size, args.size, h_lat, w_lat, args.cfg_scale, args.steps, args.shift);
+    log::info!(
+        "Sampling SD 3.5: {}x{} → latent {}x{} (cfg={}, steps={}, shift={})",
+        args.size,
+        args.size,
+        h_lat,
+        w_lat,
+        args.cfg_scale,
+        args.steps,
+        args.shift
+    );
 
     // 1. Load text encoders + tokenizers
     log::info!("[1/5] Loading text encoders...");
@@ -225,7 +285,9 @@ fn main() -> anyhow::Result<()> {
         .collect::<anyhow::Result<_>>()?;
     let clip_g = ClipGEncoder::new(clip_g_w, device.clone());
     let mut t5 = T5Encoder::load(
-        args.t5_ckpt.to_str().ok_or_else(|| anyhow::anyhow!("t5 path utf8"))?,
+        args.t5_ckpt
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("t5 path utf8"))?,
         &device,
     )?;
     let tok_l = tokenizers::Tokenizer::from_file(&args.clip_l_tokenizer)
@@ -243,7 +305,8 @@ fn main() -> anyhow::Result<()> {
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
-            content.lines()
+            content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
@@ -273,11 +336,23 @@ fn main() -> anyhow::Result<()> {
     let mut conds: Vec<(Tensor, Tensor)> = Vec::with_capacity(prompts.len());
     for (i, p) in prompts.iter().enumerate() {
         let pair = encode_sd3_prompt(
-            p, &clip_l, &clip_g, &mut t5,
-            &tok_l, &tok_g, &tok_t5, args.t5_max_len, &device,
+            p,
+            &clip_l,
+            &clip_g,
+            &mut t5,
+            &tok_l,
+            &tok_g,
+            &tok_t5,
+            args.t5_max_len,
+            &device,
         )?;
-        log::info!("  prompt {}/{}: ctx={:?} pool={:?}",
-            i + 1, prompts.len(), pair.0.shape().dims(), pair.1.shape().dims());
+        log::info!(
+            "  prompt {}/{}: ctx={:?} pool={:?}",
+            i + 1,
+            prompts.len(),
+            pair.0.shape().dims(),
+            pair.1.shape().dims()
+        );
         conds.push(pair);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
@@ -285,11 +360,22 @@ fn main() -> anyhow::Result<()> {
     let do_cfg = args.cfg_scale > 1.0;
     let uncond = if do_cfg {
         Some(encode_sd3_prompt(
-            &args.negative_prompt, &clip_l, &clip_g, &mut t5,
-            &tok_l, &tok_g, &tok_t5, args.t5_max_len, &device,
+            &args.negative_prompt,
+            &clip_l,
+            &clip_g,
+            &mut t5,
+            &tok_l,
+            &tok_g,
+            &tok_t5,
+            args.t5_max_len,
+            &device,
         )?)
-    } else { None };
-    drop(clip_l); drop(clip_g); drop(t5);
+    } else {
+        None
+    };
+    drop(clip_l);
+    drop(clip_g);
+    drop(t5);
     flame_core::cuda_alloc_pool::clear_pool_cache();
     flame_core::trim_cuda_mempool(0);
 
@@ -313,16 +399,25 @@ fn main() -> anyhow::Result<()> {
     }
     let mut model = SD35Model::load(&shards, &tc, device.clone())?;
     if let Some(lp) = &args.lora_path {
-        model.load_weights(lp.to_str().unwrap())
+        model
+            .load_weights(lp.to_str().unwrap())
             .map_err(|e| anyhow::anyhow!("load_weights {}: {e}", lp.display()))?;
-        log::info!("  Applied LoRA from {:?} (rank={}, alpha={})",
-            lp, args.lora_rank, args.lora_alpha);
+        log::info!(
+            "  Applied LoRA from {:?} (rank={}, alpha={})",
+            lp,
+            args.lora_rank,
+            args.lora_alpha
+        );
     }
 
     // 4. Init noise + denoise — once per prompt, all latents collected
     //    while the DiT is resident.
     let timesteps = build_schedule(args.steps, args.shift);
-    log::info!("[4/5] Denoising {} prompt(s) × {} steps...", conds.len(), args.steps);
+    log::info!(
+        "[4/5] Denoising {} prompt(s) × {} steps...",
+        conds.len(),
+        args.steps
+    );
     let pad_width = std::cmp::max(3, conds.len().to_string().len());
     let mut latents: Vec<Tensor> = Vec::with_capacity(conds.len());
 
@@ -338,11 +433,16 @@ fn main() -> anyhow::Result<()> {
             let mag = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f32::consts::PI * u2;
             data.push(mag * theta.cos());
-            if data.len() < numel { data.push(mag * theta.sin()); }
+            if data.len() < numel {
+                data.push(mag * theta.sin());
+            }
         }
         let mut latent = Tensor::from_vec(
-            data, Shape::from_dims(&[1, VAE_LATENT_CHANNELS, h_lat, w_lat]), device.clone(),
-        )?.to_dtype(DType::BF16)?;
+            data,
+            Shape::from_dims(&[1, VAE_LATENT_CHANNELS, h_lat, w_lat]),
+            device.clone(),
+        )?
+        .to_dtype(DType::BF16)?;
 
         for i in 0..args.steps {
             let t_curr = timesteps[i];
@@ -353,25 +453,42 @@ fn main() -> anyhow::Result<()> {
             // breaks otherwise. The MMDiT timestep_embed promotes to F32
             // internally (sd35.rs:398), so passing F32 here is zero cost.
             let t_vec = Tensor::from_vec(
-                vec![t_curr * 1000.0], Shape::from_dims(&[1]), device.clone(),
-            )?.to_dtype(DType::F32)?;
+                vec![t_curr * 1000.0],
+                Shape::from_dims(&[1]),
+                device.clone(),
+            )?
+            .to_dtype(DType::F32)?;
             let pred_cond = <SD35Model as TrainableModel>::forward(
-                &mut model, &latent, &t_vec,
-                std::slice::from_ref(ctx_cond), Some(pool_cond),
+                &mut model,
+                &latent,
+                &t_vec,
+                std::slice::from_ref(ctx_cond),
+                Some(pool_cond),
             )?;
             let pred = if let Some((ref ctx_u, ref pool_u)) = uncond {
                 let pred_uncond = <SD35Model as TrainableModel>::forward(
-                    &mut model, &latent, &t_vec,
-                    std::slice::from_ref(ctx_u), Some(pool_u),
+                    &mut model,
+                    &latent,
+                    &t_vec,
+                    std::slice::from_ref(ctx_u),
+                    Some(pool_u),
                 )?;
                 let diff = pred_cond.sub(&pred_uncond)?;
                 pred_uncond.add(&diff.mul_scalar(args.cfg_scale)?)?
-            } else { pred_cond };
+            } else {
+                pred_cond
+            };
             let dt = t_next - t_curr;
             latent = latent.add(&pred.mul_scalar(dt)?)?;
             if i % 5 == 0 || i == args.steps - 1 {
-                log::info!("    prompt {}/{} step {}/{} t={:.4}",
-                    idx + 1, conds.len(), i + 1, args.steps, t_curr);
+                log::info!(
+                    "    prompt {}/{} step {}/{} t={:.4}",
+                    idx + 1,
+                    conds.len(),
+                    i + 1,
+                    args.steps,
+                    t_curr
+                );
             }
         }
         latents.push(latent);
@@ -382,14 +499,23 @@ fn main() -> anyhow::Result<()> {
     drop(model);
     let vae_path = args.vae_ckpt.as_ref().unwrap_or(&args.transformer);
     let vae = LdmVAEDecoder::from_safetensors(
-        vae_path.to_str().ok_or_else(|| anyhow::anyhow!("vae path utf8"))?,
-        VAE_LATENT_CHANNELS, VAE_SCALE, VAE_SHIFT, &device,
+        vae_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("vae path utf8"))?,
+        VAE_LATENT_CHANNELS,
+        VAE_SCALE,
+        VAE_SHIFT,
+        &device,
     )?;
     for (idx, latent) in latents.iter().enumerate() {
         let rgb = vae.decode(latent)?;
         let out_path = if multi_mode {
             let dir = args.output_dir.as_ref().unwrap();
-            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+            dir.join(format!(
+                "sample_{:0>width$}.png",
+                idx + 1,
+                width = pad_width
+            ))
         } else {
             args.output.clone()
         };

@@ -2,19 +2,23 @@ pub mod adapter;
 pub mod config;
 pub mod data;
 pub mod debug;
+pub mod encoders;
 pub mod lora;
 pub mod lycoris;
 pub mod models;
 pub mod pipeline;
+pub mod sampler;
 pub mod training;
 pub mod utils;
-pub mod encoders;
-pub mod sampler;
 pub mod video;
 
 use thiserror::Error;
 
 pub use flame_core;
+
+pub use training::features::asymflow_loss::{
+    asymflow_loss, calc_shifted_signal_ratio, compute_asymflow_target, AsymFlowTargetParts,
+};
 
 #[derive(Error, Debug)]
 pub enum EriDiffusionError {
@@ -43,7 +47,9 @@ pub enum EriDiffusionError {
 }
 
 impl From<flame_core::FlameError> for EriDiffusionError {
-    fn from(e: flame_core::FlameError) -> Self { EriDiffusionError::Flame(e) }
+    fn from(e: flame_core::FlameError) -> Self {
+        EriDiffusionError::Flame(e)
+    }
 }
 
 /// Reverse direction — needed for ported model code that returns

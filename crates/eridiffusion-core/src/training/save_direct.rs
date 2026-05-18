@@ -101,8 +101,8 @@ fn write_direct(
     datas: &[Vec<f32>],
     total_tensor_bytes: usize,
 ) -> std::result::Result<(), String> {
-    let cpath = std::ffi::CString::new(path.to_str().unwrap_or(""))
-        .map_err(|e| format!("path: {e}"))?;
+    let cpath =
+        std::ffi::CString::new(path.to_str().unwrap_or("")).map_err(|e| format!("path: {e}"))?;
     let fd = unsafe {
         libc::open(
             cpath.as_ptr(),
@@ -111,7 +111,10 @@ fn write_direct(
         )
     };
     if fd < 0 {
-        return Err(format!("open O_DIRECT: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "open O_DIRECT: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     let alloc_size = (CHUNK + ALIGN - 1) & !(ALIGN - 1);
@@ -157,11 +160,7 @@ fn write_direct(
             while off < segment.len() {
                 let space = CHUNK - *buffered;
                 let take = (segment.len() - off).min(space);
-                std::ptr::copy_nonoverlapping(
-                    segment.as_ptr().add(off),
-                    buf.add(*buffered),
-                    take,
-                );
+                std::ptr::copy_nonoverlapping(segment.as_ptr().add(off), buf.add(*buffered), take);
                 *buffered += take;
                 off += take;
                 if *buffered == CHUNK {
@@ -229,6 +228,9 @@ fn write_buffered(
 fn bytemuck_slice_f32(v: &[f32]) -> &[u8] {
     // Safety: f32 is plain-old-data, alignment of f32 (4) is a multiple of u8 (1).
     unsafe {
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * std::mem::size_of::<f32>())
+        std::slice::from_raw_parts(
+            v.as_ptr() as *const u8,
+            v.len() * std::mem::size_of::<f32>(),
+        )
     }
 }

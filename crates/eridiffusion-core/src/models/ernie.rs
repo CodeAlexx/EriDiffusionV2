@@ -1,10 +1,6 @@
 //! Ernie model — matching inference-flame's verified forward.
 //! Single-stream DiT, 36 layers × 4096 dim, 32 heads, SwiGLU, shared AdaLN.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use cudarc::driver::CudaDevice;
-use flame_core::{parameter::Parameter, DType, Shape, Tensor};
 use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
@@ -12,6 +8,10 @@ use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::models::chroma::build_lycoris_linear;
 use crate::models::TrainableModel;
 use crate::Result;
+use cudarc::driver::CudaDevice;
+use flame_core::{parameter::Parameter, DType, Shape, Tensor};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const HIDDEN: usize = 4096;
 pub const HEADS: usize = 32;
@@ -47,11 +47,16 @@ pub struct ErnieModel {
     /// When Some, per-layer transformer weights are streamed from pinned host RAM
     /// into reusable GPU slots per layer, per step via BlockOffloader.
     /// Block index space: `0..LAYERS` → `layers.{i}.*`.
-    pub offloader: Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
+    pub offloader:
+        Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
 }
 
 impl ErnieModel {
-    pub fn load(paths: &[std::path::PathBuf], config: &TrainConfig, device: Arc<CudaDevice>) -> Result<Self> {
+    pub fn load(
+        paths: &[std::path::PathBuf],
+        config: &TrainConfig,
+        device: Arc<CudaDevice>,
+    ) -> Result<Self> {
         let mut weights = HashMap::new();
         for p in paths {
             let part = flame_core::serialization::load_file(p, &device)?;
@@ -69,18 +74,69 @@ impl ErnieModel {
             for i in 0..LAYERS {
                 let s = 42u64 + i as u64;
                 // Q, K, V, out: 4096 → 4096
-                lora_adapters.push(LoRALinear::new(HIDDEN, HIDDEN, rank, alpha, device.clone(), s)?);
-                lora_adapters.push(LoRALinear::new(HIDDEN, HIDDEN, rank, alpha, device.clone(), s+1)?);
-                lora_adapters.push(LoRALinear::new(HIDDEN, HIDDEN, rank, alpha, device.clone(), s+2)?);
-                lora_adapters.push(LoRALinear::new(HIDDEN, HIDDEN, rank, alpha, device.clone(), s+3)?);
+                lora_adapters.push(LoRALinear::new(
+                    HIDDEN,
+                    HIDDEN,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s,
+                )?);
+                lora_adapters.push(LoRALinear::new(
+                    HIDDEN,
+                    HIDDEN,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 1,
+                )?);
+                lora_adapters.push(LoRALinear::new(
+                    HIDDEN,
+                    HIDDEN,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 2,
+                )?);
+                lora_adapters.push(LoRALinear::new(
+                    HIDDEN,
+                    HIDDEN,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 3,
+                )?);
                 // gate_proj: 4096 → 12288
-                lora_adapters.push(LoRALinear::new(HIDDEN, FFN, rank, alpha, device.clone(), s+4)?);
+                lora_adapters.push(LoRALinear::new(
+                    HIDDEN,
+                    FFN,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 4,
+                )?);
                 // up_proj: 4096 → 12288
-                lora_adapters.push(LoRALinear::new(HIDDEN, FFN, rank, alpha, device.clone(), s+5)?);
+                lora_adapters.push(LoRALinear::new(
+                    HIDDEN,
+                    FFN,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 5,
+                )?);
                 // linear_fc2 (down): 12288 → 4096
-                lora_adapters.push(LoRALinear::new(FFN, HIDDEN, rank, alpha, device.clone(), s+6)?);
+                lora_adapters.push(LoRALinear::new(
+                    FFN,
+                    HIDDEN,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 6,
+                )?);
             }
-            for l in &lora_adapters { parameters.extend(l.parameters()); }
+            for l in &lora_adapters {
+                parameters.extend(l.parameters());
+            }
         } else {
             for (_, t) in &weights {
                 parameters.push(Parameter::new(t.to_dtype(DType::F32)?.requires_grad_(true)));
@@ -138,9 +194,11 @@ impl ErnieModel {
         for layer in 0..LAYERS {
             for &(in_dim, out_dim) in SLOT_DIMS.iter() {
                 let wrapper = build_lycoris_linear(config, in_dim, out_dim, self.device.clone())
-                    .map_err(|e| crate::EriDiffusionError::Model(format!(
-                        "swap_lycoris_bundle: build_lycoris_linear({in_dim}, {out_dim}): {e}"
-                    )))?;
+                    .map_err(|e| {
+                        crate::EriDiffusionError::Model(format!(
+                            "swap_lycoris_bundle: build_lycoris_linear({in_dim}, {out_dim}): {e}"
+                        ))
+                    })?;
                 let arc = Arc::new(wrapper);
                 params.extend(arc.to_parameters());
                 lycoris_adapters.push(Some(arc));
@@ -201,14 +259,18 @@ impl ErnieModel {
             let did = adapter
                 .as_ref()
                 .init_perturbed_normal_lokr(base, scale)
-                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
-                    "init_perturbed_normal_lokr({key}): {e}"
-                )))?;
-            if did { applied += 1; } else { skipped += 1; }
+                .map_err(|e| {
+                    flame_core::FlameError::InvalidOperation(format!(
+                        "init_perturbed_normal_lokr({key}): {e}"
+                    ))
+                })?;
+            if did {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
         }
-        log::info!(
-            "[ernie][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
-        );
+        log::info!("[ernie][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}");
         Ok(skipped)
     }
 
@@ -231,26 +293,33 @@ impl ErnieModel {
     /// into reusable GPU slots per layer, per step. Works for both base and LoRA
     /// inference.
     pub fn enable_offload(&mut self, shards: Vec<std::path::PathBuf>) -> Result<()> {
-        let to_drop: Vec<String> = self.weights.keys()
+        let to_drop: Vec<String> = self
+            .weights
+            .keys()
             .filter(|k| k.starts_with("layers."))
             .cloned()
             .collect();
         let n = to_drop.len();
-        for k in to_drop { self.weights.remove(&k); }
+        for k in to_drop {
+            self.weights.remove(&k);
+        }
         log::info!("Ernie offload: dropped {} per-layer weight tensors", n);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
 
         struct ErnieFacilitator;
         impl crate::training::block_offload::BlockFacilitator for ErnieFacilitator {
-            fn block_count(&self) -> usize { LAYERS }
+            fn block_count(&self) -> usize {
+                LAYERS
+            }
             fn classify_key(&self, key: &str) -> Option<usize> {
                 let rest = key.strip_prefix("layers.")?;
                 rest.split('.').next()?.parse().ok()
             }
         }
 
-        let shard_strs: Vec<String> = shards.iter()
+        let shard_strs: Vec<String> = shards
+            .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let path_refs: Vec<&str> = shard_strs.iter().map(|s| s.as_str()).collect();
@@ -263,12 +332,16 @@ impl ErnieModel {
         let mut offloader = if use_streaming {
             log::info!("Ernie BlockOffloader: streaming mode");
             crate::training::block_offload::BlockOffloader::load_streaming(
-                &path_refs, &ErnieFacilitator, self.device.clone(),
+                &path_refs,
+                &ErnieFacilitator,
+                self.device.clone(),
             )
         } else {
             log::info!("Ernie BlockOffloader: pinned-RAM mode");
             crate::training::block_offload::BlockOffloader::load(
-                &path_refs, &ErnieFacilitator, self.device.clone(),
+                &path_refs,
+                &ErnieFacilitator,
+                self.device.clone(),
             )
         }
         // native_layout=true: leave 2D .weight tensors in on-disk [Cout, Cin] layout.
@@ -300,18 +373,28 @@ impl ErnieModel {
     }
 
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.weights.get(key).ok_or_else(|| crate::EriDiffusionError::Model(format!("missing: {}", key)))
+        self.weights
+            .get(key)
+            .ok_or_else(|| crate::EriDiffusionError::Model(format!("missing: {}", key)))
     }
 
     fn linear(&self, x: &Tensor, w_key: &str, bias_key: Option<&str>) -> Result<Tensor> {
         let w = self.w(w_key)?;
         let mut out = x.matmul(&w.transpose()?)?;
-        if let Some(bk) = bias_key { out = out.add(self.w(bk)?)?; }
+        if let Some(bk) = bias_key {
+            out = out.add(self.w(bk)?)?;
+        }
         Ok(out)
     }
 
     /// Linear with LoRA delta injected. adapter_idx: which LoRALinear in self.lora_adapters.
-    fn linear_lora(&self, x: &Tensor, w_key: &str, bias_key: Option<&str>, adapter_idx: usize) -> Result<Tensor> {
+    fn linear_lora(
+        &self,
+        x: &Tensor,
+        w_key: &str,
+        bias_key: Option<&str>,
+        adapter_idx: usize,
+    ) -> Result<Tensor> {
         let base = self.linear(x, w_key, bias_key)?;
         if self.is_lora {
             if let Some(adapter) = self.lora_adapters.get(adapter_idx) {
@@ -336,7 +419,9 @@ impl ErnieModel {
         let x_f = x_nhwc.reshape(&[b_sz * n_img, IN_C * PATCH_SIZE * PATCH_SIZE])?;
         let w_proj = self.w("x_embedder.proj.weight")?; // [HIDDEN, IN_C, 1, 1]
         let w_f = w_proj.reshape(&[HIDDEN, IN_C])?;
-        let out = x_f.matmul(&w_f.transpose()?)?.add(self.w("x_embedder.proj.bias")?)?;
+        let out = x_f
+            .matmul(&w_f.transpose()?)?
+            .add(self.w("x_embedder.proj.bias")?)?;
         out.reshape(&[b_sz, n_img, HIDDEN]).map_err(Into::into)
     }
 
@@ -347,7 +432,7 @@ impl ErnieModel {
 
     fn qk_rms_norm(&self, x: &Tensor, scale_key: &str) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
-        let batch: usize = dims[..dims.len()-1].iter().product();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
         let scale = self.w(scale_key)?;
         let x_h = x.reshape(&[batch * HEADS, HEAD_DIM])?;
         let n = flame_core::norm::rms_norm(&x_h, &[HEAD_DIM], Some(scale), NORM_EPS)?;
@@ -364,16 +449,18 @@ impl ErnieModel {
     ///   axis-2 (axes_dim=48, 24 freqs) occupies positions [80..128] same pattern
     /// Note: this is NOT classic half-split (cos[d] != cos[d+half]); the rotation in `rope()`
     /// applies cos/sin element-wise to the full head, with rotate-half inside.
-    fn build_rope(&self, n_img: usize, n_txt: usize, hp: usize, wp: usize) -> Result<(Tensor, Tensor)> {
+    fn build_rope(
+        &self,
+        n_img: usize,
+        n_txt: usize,
+        hp: usize,
+        wp: usize,
+    ) -> Result<(Tensor, Tensor)> {
         let _ = hp;
         let total = n_img + n_txt;
         let mut cos = vec![0f32; total * HEAD_DIM];
         let mut sin = vec![0f32; total * HEAD_DIM];
-        let axis_offsets = [
-            0usize,
-            ROPE_AXES[0],
-            ROPE_AXES[0] + ROPE_AXES[1],
-        ];
+        let axis_offsets = [0usize, ROPE_AXES[0], ROPE_AXES[0] + ROPE_AXES[1]];
         for s in 0..total {
             let pos = if s < n_img {
                 [n_txt as f32, (s / wp) as f32, (s % wp) as f32]
@@ -398,10 +485,18 @@ impl ErnieModel {
             }
         }
         Ok((
-            Tensor::from_vec(cos, Shape::from_dims(&[1, 1, total, HEAD_DIM]), self.device.clone())?
-                .to_dtype(DType::BF16)?,
-            Tensor::from_vec(sin, Shape::from_dims(&[1, 1, total, HEAD_DIM]), self.device.clone())?
-                .to_dtype(DType::BF16)?,
+            Tensor::from_vec(
+                cos,
+                Shape::from_dims(&[1, 1, total, HEAD_DIM]),
+                self.device.clone(),
+            )?
+            .to_dtype(DType::BF16)?,
+            Tensor::from_vec(
+                sin,
+                Shape::from_dims(&[1, 1, total, HEAD_DIM]),
+                self.device.clone(),
+            )?
+            .to_dtype(DType::BF16)?,
         ))
     }
 
@@ -413,15 +508,25 @@ impl ErnieModel {
         let mut d = vec![0f32; b * dim];
         for (bi, &tv) in t_v.iter().enumerate() {
             for j in 0..h {
-                let f = (-(10000.0f64.ln())*(j as f64)/(h as f64)).exp() as f32;
-                let a = tv * f;  // NO 1000x scaling
-                d[bi*dim+j] = a.sin(); d[bi*dim+h+j] = a.cos();
+                let f = (-(10000.0f64.ln()) * (j as f64) / (h as f64)).exp() as f32;
+                let a = tv * f; // NO 1000x scaling
+                d[bi * dim + j] = a.sin();
+                d[bi * dim + h + j] = a.cos();
             }
         }
-        let emb = Tensor::from_vec(d, Shape::from_dims(&[b, dim]), self.device.clone())?.to_dtype(DType::BF16)?;
-        let h1 = self.linear(&emb, "time_embedding.linear_1.weight", Some("time_embedding.linear_1.bias"))?;
+        let emb = Tensor::from_vec(d, Shape::from_dims(&[b, dim]), self.device.clone())?
+            .to_dtype(DType::BF16)?;
+        let h1 = self.linear(
+            &emb,
+            "time_embedding.linear_1.weight",
+            Some("time_embedding.linear_1.bias"),
+        )?;
         let h1 = h1.silu()?;
-        self.linear(&h1, "time_embedding.linear_2.weight", Some("time_embedding.linear_2.bias"))
+        self.linear(
+            &h1,
+            "time_embedding.linear_2.weight",
+            Some("time_embedding.linear_2.bias"),
+        )
     }
 
     pub fn forward(&mut self, img: &Tensor, txt: &Tensor, timestep: &Tensor) -> Result<Tensor> {
@@ -437,7 +542,10 @@ impl ErnieModel {
 
         // Timestep + shared AdaLN (SiLU!)
         let t_emb = self.timestep_embedding(timestep)?;
-        let mod_out = t_emb.silu()?.matmul(&self.w("adaLN_modulation.1.weight")?.transpose()?)?.add(self.w("adaLN_modulation.1.bias")?)?;
+        let mod_out = t_emb
+            .silu()?
+            .matmul(&self.w("adaLN_modulation.1.weight")?.transpose()?)?
+            .add(self.w("adaLN_modulation.1.bias")?)?;
         let chunks = mod_out.chunk(6, 1)?;
 
         // Unsqueeze to [B, 1, HIDDEN] for broadcasting with [B, N, HIDDEN]
@@ -457,14 +565,19 @@ impl ErnieModel {
         // Inference fast path: skip HashMap clone + checkpoint closure overhead.
         // Training path: unchanged (HashMap clone + grad-checkpoint for activation offload).
         let is_inference = !flame_core::autograd::AutogradContext::is_recording();
-        let use_checkpoint = std::env::var("ERNIE_GRAD_CHECKPOINT").map(|v| v != "0").unwrap_or(true);
+        let use_checkpoint = std::env::var("ERNIE_GRAD_CHECKPOINT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         for i in 0..LAYERS {
             // BlockOffloader: stream layer i from pinned host RAM into GPU slot.
             if let Some(ref off) = self.offloader {
-                let arc = off.lock()
+                let arc = off
+                    .lock()
                     .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
                     .ensure_block(i)
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({i}): {e}")))?;
+                    .map_err(|e| {
+                        crate::EriDiffusionError::Model(format!("offloader ensure_block({i}): {e}"))
+                    })?;
                 // Merge the block's weights into self.weights for the forward body.
                 for (k, v) in arc.iter() {
                     self.weights.insert(k.clone(), v.clone());
@@ -475,24 +588,31 @@ impl ErnieModel {
                 // Inference fast path — borrow weights directly, no clone, no closure.
                 let lora_base = i * 7;
                 let lora_slice: Option<&[LoRALinear]> = if self.is_lora {
-                    Some(&self.lora_adapters[lora_base..lora_base+7])
+                    Some(&self.lora_adapters[lora_base..lora_base + 7])
                 } else {
                     None
                 };
                 let lycoris_slice: Option<&[Option<Arc<LycorisLinear>>]> = if self.is_lora {
-                    Some(&self.lycoris_adapters[lora_base..lora_base+7])
+                    Some(&self.lycoris_adapters[lora_base..lora_base + 7])
                 } else {
                     None
                 };
                 x = block_forward_iflame(
                     &x,
-                    &sc_msa, &s_msa, &g_msa,
-                    &sc_mlp, &s_mlp, &g_mlp,
-                    &cos_b, &sin_b,
+                    &sc_msa,
+                    &s_msa,
+                    &g_msa,
+                    &sc_mlp,
+                    &s_mlp,
+                    &g_mlp,
+                    &cos_b,
+                    &sin_b,
                     &self.weights,
                     lora_slice,
                     lycoris_slice,
-                    i, b, n_total,
+                    i,
+                    b,
+                    n_total,
                 )?;
             } else {
                 // Training path — extract this layer's weights into a self-contained map so the
@@ -506,7 +626,7 @@ impl ErnieModel {
                 }
                 let lora_base = i * 7;
                 let lora_adapters: Option<Vec<LoRALinear>> = if self.is_lora {
-                    Some(self.lora_adapters[lora_base..lora_base+7].to_vec())
+                    Some(self.lora_adapters[lora_base..lora_base + 7].to_vec())
                 } else {
                     None
                 };
@@ -514,7 +634,7 @@ impl ErnieModel {
                 // Each closure capture must own a 'static-able view; the
                 // checkpoint closure path requires this.
                 let lycoris_adapters: Option<Vec<Option<Arc<LycorisLinear>>>> = if self.is_lora {
-                    Some(self.lycoris_adapters[lora_base..lora_base+7].to_vec())
+                    Some(self.lycoris_adapters[lora_base..lora_base + 7].to_vec())
                 } else {
                     None
                 };
@@ -530,29 +650,42 @@ impl ErnieModel {
                 let g_mlp_c = g_mlp.clone();
 
                 let result = if use_checkpoint {
-                    flame_core::autograd::AutogradContext::checkpoint(
-                        &[x_in.clone()],
-                        move || ernie_layer_forward_standalone(
+                    flame_core::autograd::AutogradContext::checkpoint(&[x_in.clone()], move || {
+                        ernie_layer_forward_standalone(
                             x_in.clone(),
-                            sc_msa_c.clone(), s_msa_c.clone(), g_msa_c.clone(),
-                            sc_mlp_c.clone(), s_mlp_c.clone(), g_mlp_c.clone(),
-                            cos_c.clone(), sin_c.clone(),
+                            sc_msa_c.clone(),
+                            s_msa_c.clone(),
+                            g_msa_c.clone(),
+                            sc_mlp_c.clone(),
+                            s_mlp_c.clone(),
+                            g_mlp_c.clone(),
+                            cos_c.clone(),
+                            sin_c.clone(),
                             layer_weights.clone(),
                             lora_adapters.clone(),
                             lycoris_adapters.clone(),
-                            i, b, n_total,
-                        ),
-                    )?
+                            i,
+                            b,
+                            n_total,
+                        )
+                    })?
                 } else {
                     ernie_layer_forward_standalone(
                         x_in,
-                        sc_msa_c, s_msa_c, g_msa_c,
-                        sc_mlp_c, s_mlp_c, g_mlp_c,
-                        cos_c, sin_c,
+                        sc_msa_c,
+                        s_msa_c,
+                        g_msa_c,
+                        sc_mlp_c,
+                        s_mlp_c,
+                        g_mlp_c,
+                        cos_c,
+                        sin_c,
                         layer_weights,
                         lora_adapters,
                         lycoris_adapters,
-                        i, b, n_total,
+                        i,
+                        b,
+                        n_total,
                     )?
                 };
                 x = result;
@@ -570,7 +703,11 @@ impl ErnieModel {
 
         // ErnieImageAdaLNContinuous: LayerNorm (no affine) + linear → chunk(scale, shift).
         let x_n = flame_core::layer_norm::layer_norm(&x, &[HIDDEN], None, None, NORM_EPS)?;
-        let final_mod = self.linear(&t_emb, "final_norm.linear.weight", Some("final_norm.linear.bias"))?;
+        let final_mod = self.linear(
+            &t_emb,
+            "final_norm.linear.weight",
+            Some("final_norm.linear.bias"),
+        )?;
         let f_chunks = final_mod.chunk(2, 1)?;
         let final_scale = f_chunks[0].unsqueeze(1)?;
         let final_shift = f_chunks[1].unsqueeze(1)?;
@@ -583,12 +720,18 @@ impl ErnieModel {
         let img_only = projected.narrow(1, 0, n_img)?.contiguous()?;
         let h = dims[2];
         let w = dims[3];
-        img_only.permute(&[0, 2, 1])?.contiguous()?.reshape(&[b, IN_C, h, w]).map_err(Into::into)
+        img_only
+            .permute(&[0, 2, 1])?
+            .contiguous()?
+            .reshape(&[b, IN_C, h, w])
+            .map_err(Into::into)
     }
 }
 
 fn rh(x: &Tensor, b: usize, n: usize) -> Result<Tensor> {
-    x.reshape(&[b, n, HEADS, HEAD_DIM])?.permute(&[0,2,1,3]).map_err(Into::into)
+    x.reshape(&[b, n, HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])
+        .map_err(Into::into)
 }
 /// Diffusers ErnieImage rotate-half RoPE on full HEAD_DIM with interleaved-doubled freqs.
 /// Reference: transformer_ernie_image.py apply_rotary_emb (rotary_interleaved=False).
@@ -616,18 +759,32 @@ fn dbg_stats(name: &str, t: &Tensor) {
         let mut mx = f32::NEG_INFINITY;
         let mut sum = 0.0f64;
         for &x in &v {
-            if x.is_nan() { nan += 1; }
-            else if x.is_infinite() { inf += 1; }
-            else {
-                if x < mn { mn = x; }
-                if x > mx { mx = x; }
+            if x.is_nan() {
+                nan += 1;
+            } else if x.is_infinite() {
+                inf += 1;
+            } else {
+                if x < mn {
+                    mn = x;
+                }
+                if x > mx {
+                    mx = x;
+                }
                 sum += x as f64;
             }
         }
         let n = v.len() as f64;
         let mean = sum / n.max(1.0);
-        eprintln!("[stat] {name}: shape={:?} n={} nan={} inf={} min={:.4} max={:.4} mean={:.4}",
-            t.shape().dims(), v.len(), nan, inf, mn, mx, mean);
+        eprintln!(
+            "[stat] {name}: shape={:?} n={} nan={} inf={} min={:.4} max={:.4} mean={:.4}",
+            t.shape().dims(),
+            v.len(),
+            nan,
+            inf,
+            mn,
+            mx,
+            mean
+        );
     } else {
         eprintln!("[stat] {name}: <to_vec failed>");
     }
@@ -641,9 +798,14 @@ fn dbg_stats(name: &str, t: &Tensor) {
 #[allow(clippy::too_many_arguments)]
 fn ernie_layer_forward_standalone(
     x: Tensor,
-    sc_msa: Tensor, s_msa: Tensor, g_msa: Tensor,
-    sc_mlp: Tensor, s_mlp: Tensor, g_mlp: Tensor,
-    cos_b: Tensor, sin_b: Tensor,
+    sc_msa: Tensor,
+    s_msa: Tensor,
+    g_msa: Tensor,
+    sc_mlp: Tensor,
+    s_mlp: Tensor,
+    g_mlp: Tensor,
+    cos_b: Tensor,
+    sin_b: Tensor,
     layer_weights: HashMap<String, Tensor>,
     lora_adapters: Option<Vec<LoRALinear>>,
     lycoris_adapters: Option<Vec<Option<Arc<LycorisLinear>>>>,
@@ -654,8 +816,12 @@ fn ernie_layer_forward_standalone(
     let pre = format!("layers.{}.self_attention", layer_idx);
 
     let w = |key: &str| -> flame_core::Result<&Tensor> {
-        layer_weights.get(key).ok_or_else(||
-            flame_core::FlameError::InvalidInput(format!("ernie layer {}: missing weight {}", layer_idx, key)))
+        layer_weights.get(key).ok_or_else(|| {
+            flame_core::FlameError::InvalidInput(format!(
+                "ernie layer {}: missing weight {}",
+                layer_idx, key
+            ))
+        })
     };
     let linear_no_lora = |x: &Tensor, w_key: &str| -> flame_core::Result<Tensor> {
         x.matmul(&w(w_key)?.transpose()?)
@@ -668,13 +834,15 @@ fn ernie_layer_forward_standalone(
         let base = linear_no_lora(x, w_key)?;
         if let Some(ref lyc) = lycoris_adapters {
             if let Some(Some(adapter)) = lyc.get(adapter_idx) {
-                let delta = adapter.forward_delta(x)
-                    .map_err(|e| flame_core::FlameError::InvalidInput(format!("lycoris delta: {e}")))?;
+                let delta = adapter.forward_delta(x).map_err(|e| {
+                    flame_core::FlameError::InvalidInput(format!("lycoris delta: {e}"))
+                })?;
                 return base.add(&delta);
             }
         }
         if let Some(ref adapters) = lora_adapters {
-            let delta = adapters[adapter_idx].forward_delta(x)
+            let delta = adapters[adapter_idx]
+                .forward_delta(x)
                 .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
             base.add(&delta)
         } else {
@@ -686,13 +854,14 @@ fn ernie_layer_forward_standalone(
     };
     let qk_rms_norm_local = |x: &Tensor, scale_key: &str| -> flame_core::Result<Tensor> {
         let dims = x.shape().dims().to_vec();
-        let batch: usize = dims[..dims.len()-1].iter().product();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
         let x_h = x.reshape(&[batch * HEADS, HEAD_DIM])?;
         let n = flame_core::norm::rms_norm(&x_h, &[HEAD_DIM], Some(w(scale_key)?), NORM_EPS)?;
         n.reshape(&dims)
     };
     let rh_local = |x: &Tensor| -> flame_core::Result<Tensor> {
-        x.reshape(&[b, n_total, HEADS, HEAD_DIM])?.permute(&[0,2,1,3])
+        x.reshape(&[b, n_total, HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])
     };
     let rope_local = |q: &Tensor| -> flame_core::Result<Tensor> {
         let q_bf16 = q.to_dtype(DType::BF16)?.contiguous()?;
@@ -717,7 +886,8 @@ fn ernie_layer_forward_standalone(
     let (qh, kh, vh) = (rh_local(&q_n)?, rh_local(&k_n)?, rh_local(&v)?);
     let (qh, kh) = (rope_local(&qh)?, rope_local(&kh)?);
     let attn = flame_core::attention::sdpa(&qh, &kh, &vh, None)?
-        .permute(&[0,2,1,3])?.reshape(&[b, n_total, HIDDEN])?;
+        .permute(&[0, 2, 1, 3])?
+        .reshape(&[b, n_total, HIDDEN])?;
     let out = linear_lora(&attn, &format!("{}.to_out.0.weight", pre), 3)?;
     let x = r.add(&g_msa.mul(&out)?)?;
 
@@ -741,9 +911,14 @@ fn ernie_layer_forward_standalone(
 #[allow(clippy::too_many_arguments)]
 fn block_forward_iflame(
     x: &Tensor,
-    sc_msa: &Tensor, s_msa: &Tensor, g_msa: &Tensor,
-    sc_mlp: &Tensor, s_mlp: &Tensor, g_mlp: &Tensor,
-    cos_b: &Tensor, sin_b: &Tensor,
+    sc_msa: &Tensor,
+    s_msa: &Tensor,
+    g_msa: &Tensor,
+    sc_mlp: &Tensor,
+    s_mlp: &Tensor,
+    g_mlp: &Tensor,
+    cos_b: &Tensor,
+    sin_b: &Tensor,
     weights: &HashMap<String, Tensor>,
     lora_adapters: Option<&[LoRALinear]>,
     lycoris_adapters: Option<&[Option<Arc<LycorisLinear>>]>,
@@ -754,8 +929,12 @@ fn block_forward_iflame(
     let pre = format!("layers.{}.self_attention", layer_idx);
 
     let w = |key: &str| -> crate::Result<&Tensor> {
-        weights.get(key).ok_or_else(||
-            crate::EriDiffusionError::Model(format!("ernie block {}: missing weight {}", layer_idx, key)))
+        weights.get(key).ok_or_else(|| {
+            crate::EriDiffusionError::Model(format!(
+                "ernie block {}: missing weight {}",
+                layer_idx, key
+            ))
+        })
     };
     let linear_no_lora = |x: &Tensor, w_key: &str| -> crate::Result<Tensor> {
         Ok(x.matmul(&w(w_key)?.transpose()?)?)
@@ -778,17 +957,23 @@ fn block_forward_iflame(
         Ok(base)
     };
     let rms_norm_full = |x: &Tensor, scale_key: &str| -> crate::Result<Tensor> {
-        Ok(flame_core::norm::rms_norm(x, &[HIDDEN], Some(w(scale_key)?), NORM_EPS)?)
+        Ok(flame_core::norm::rms_norm(
+            x,
+            &[HIDDEN],
+            Some(w(scale_key)?),
+            NORM_EPS,
+        )?)
     };
     let qk_rms_norm_local = |x: &Tensor, scale_key: &str| -> crate::Result<Tensor> {
         let dims = x.shape().dims().to_vec();
-        let batch: usize = dims[..dims.len()-1].iter().product();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
         let x_h = x.reshape(&[batch * HEADS, HEAD_DIM])?;
         let n = flame_core::norm::rms_norm(&x_h, &[HEAD_DIM], Some(w(scale_key)?), NORM_EPS)?;
         Ok(n.reshape(&dims)?)
     };
     let rh_local = |x: &Tensor| -> crate::Result<Tensor> {
-        Ok(x.reshape(&[b, n_total, HEADS, HEAD_DIM])?.permute(&[0,2,1,3])?)
+        Ok(x.reshape(&[b, n_total, HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?)
     };
     // Rotate-half RoPE: x * cos + [-x[half:], x[:half]] * sin.
     // cos/sin shape: [1, 1, total, HEAD_DIM] — broadcasts over [B, H, total, HEAD_DIM].
@@ -816,7 +1001,8 @@ fn block_forward_iflame(
     let (qh, kh, vh) = (rh_local(&q_n)?, rh_local(&k_n)?, rh_local(&v)?);
     let (qh, kh) = (rope_local(&qh)?, rope_local(&kh)?);
     let attn = flame_core::attention::sdpa(&qh, &kh, &vh, None)?
-        .permute(&[0,2,1,3])?.reshape(&[b, n_total, HIDDEN])?;
+        .permute(&[0, 2, 1, 3])?
+        .reshape(&[b, n_total, HIDDEN])?;
     let out = linear_lora(&attn, &format!("{}.to_out.0.weight", pre), 3)?;
     let x = r.add(&g_msa.mul(&out)?)?;
 
@@ -845,11 +1031,22 @@ const LORA_SLOT_KEYS: [&str; 7] = [
 ];
 
 impl TrainableModel for ErnieModel {
-    fn forward(&mut self, noisy: &Tensor, timestep: &Tensor, context: &[Tensor], _p: Option<&Tensor>) -> Result<Tensor> {
-        let txt = context.first().ok_or_else(|| crate::EriDiffusionError::Model("Ernie needs text embeddings".into()))?.clone();
+    fn forward(
+        &mut self,
+        noisy: &Tensor,
+        timestep: &Tensor,
+        context: &[Tensor],
+        _p: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let txt = context
+            .first()
+            .ok_or_else(|| crate::EriDiffusionError::Model("Ernie needs text embeddings".into()))?
+            .clone();
         ErnieModel::forward(self, noisy, &txt, timestep)
     }
-    fn parameters(&self) -> Vec<Parameter> { self.parameters.clone() }
+    fn parameters(&self) -> Vec<Parameter> {
+        self.parameters.clone()
+    }
     fn post_optimizer_step(&mut self) {}
 
     fn save_weights(&self, path: &str) -> Result<()> {
@@ -889,10 +1086,8 @@ impl TrainableModel for ErnieModel {
                 "load_weights for non-LoRA Ernie not implemented yet".into(),
             ));
         }
-        let source = flame_core::serialization::load_file(
-            std::path::Path::new(path),
-            &self.device,
-        ).map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
+        let source = flame_core::serialization::load_file(std::path::Path::new(path), &self.device)
+            .map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
         if self.algo == LycorisAlgo::None {
             for (i, adapter) in self.lora_adapters.iter().enumerate() {
                 let layer_idx = i / 7;

@@ -24,7 +24,8 @@ use eridiffusion_core::config::{TrainConfig, TrainingMethod};
 use eridiffusion_core::models::KleinModel;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 
-const KLEIN_9B_PATH: &str = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors";
+const KLEIN_9B_PATH: &str =
+    "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors";
 
 /// Klein 9B inner_dim=4096, joint_dim=12288, in_channels=128 (per
 /// `KleinConfig::klein_9b()` and `from_weights` autodetect). Latents are
@@ -81,7 +82,10 @@ fn klein9b_real_forward_backward() {
     );
 
     // Sanity: this had better be the 9B variant.
-    assert_eq!(model.kconfig.inner_dim, 4096, "expected Klein 9B inner_dim=4096");
+    assert_eq!(
+        model.kconfig.inner_dim, 4096,
+        "expected Klein 9B inner_dim=4096"
+    );
     assert_eq!(model.kconfig.joint_attention_dim, JOINT_DIM_9B);
     // Adapter count: 12 per double + 2 per single.
     let expected_adapters = model.kconfig.num_double * 12 + model.kconfig.num_single * 2;
@@ -165,7 +169,10 @@ fn klein9b_real_forward_backward() {
         pred_mean,
         pred_f32.len(),
     );
-    assert!(pred_min.is_finite() && pred_max.is_finite(), "pred has NaN/Inf");
+    assert!(
+        pred_min.is_finite() && pred_max.is_finite(),
+        "pred has NaN/Inf"
+    );
 
     // ── Loss (rectified-flow target: noise - latent), F32 MSE ────────────
     let target = noise.sub(&latent).expect("noise-latent");
@@ -215,7 +222,7 @@ fn klein9b_real_forward_backward() {
     let n_adapters = model.lora_adapters.len();
     let mut b_nonzero = 0usize;
     let mut b_missing = 0usize;
-    let mut a_nonzero = 0usize;   // expected zero on step 1; counted for visibility
+    let mut a_nonzero = 0usize; // expected zero on step 1; counted for visibility
     let mut a_missing = 0usize;
     let mut nan_count = 0usize;
     let mut inf_count = 0usize;
@@ -223,39 +230,44 @@ fn klein9b_real_forward_backward() {
     let mut grad_abs_max = 0f32;
     let mut elem_count: u64 = 0;
 
-    let mut inspect = |p: &flame_core::parameter::Parameter,
-                       nonzero: &mut usize,
-                       missing: &mut usize| {
-        let g = match grads.get(p.id()) {
-            Some(g) => g,
-            None => {
-                *missing += 1;
-                return;
-            }
-        };
-        let g_f32 = g.to_dtype(DType::F32).unwrap().to_vec().unwrap();
-        let mut p_abs_sum = 0f64;
-        let mut p_has_nan = false;
-        let mut p_has_inf = false;
-        for &v in &g_f32 {
-            if v.is_nan() {
-                p_has_nan = true;
-            } else if v.is_infinite() {
-                p_has_inf = true;
-            } else {
-                let av = v.abs();
-                p_abs_sum += av as f64;
-                if av > grad_abs_max {
-                    grad_abs_max = av;
+    let mut inspect =
+        |p: &flame_core::parameter::Parameter, nonzero: &mut usize, missing: &mut usize| {
+            let g = match grads.get(p.id()) {
+                Some(g) => g,
+                None => {
+                    *missing += 1;
+                    return;
+                }
+            };
+            let g_f32 = g.to_dtype(DType::F32).unwrap().to_vec().unwrap();
+            let mut p_abs_sum = 0f64;
+            let mut p_has_nan = false;
+            let mut p_has_inf = false;
+            for &v in &g_f32 {
+                if v.is_nan() {
+                    p_has_nan = true;
+                } else if v.is_infinite() {
+                    p_has_inf = true;
+                } else {
+                    let av = v.abs();
+                    p_abs_sum += av as f64;
+                    if av > grad_abs_max {
+                        grad_abs_max = av;
+                    }
                 }
             }
-        }
-        if p_has_nan { nan_count += 1; }
-        if p_has_inf { inf_count += 1; }
-        if p_abs_sum > 0.0 { *nonzero += 1; }
-        grad_abs_sum += p_abs_sum;
-        elem_count += g_f32.len() as u64;
-    };
+            if p_has_nan {
+                nan_count += 1;
+            }
+            if p_has_inf {
+                inf_count += 1;
+            }
+            if p_abs_sum > 0.0 {
+                *nonzero += 1;
+            }
+            grad_abs_sum += p_abs_sum;
+            elem_count += g_f32.len() as u64;
+        };
 
     for adapter in &model.lora_adapters {
         inspect(adapter.lora_a(), &mut a_nonzero, &mut a_missing);
@@ -281,8 +293,16 @@ fn klein9b_real_forward_backward() {
         nan_count, inf_count, grad_mean_abs, grad_abs_max,
     );
 
-    assert_eq!(nan_count, 0, "Found NaN gradients on {} LoRA params", nan_count);
-    assert_eq!(inf_count, 0, "Found Inf gradients on {} LoRA params", inf_count);
+    assert_eq!(
+        nan_count, 0,
+        "Found NaN gradients on {} LoRA params",
+        nan_count
+    );
+    assert_eq!(
+        inf_count, 0,
+        "Found Inf gradients on {} LoRA params",
+        inf_count
+    );
     assert_eq!(
         b_missing, 0,
         "{} lora_b parameters had no gradient entry — autograd path broken",

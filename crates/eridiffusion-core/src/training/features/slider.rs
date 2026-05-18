@@ -87,11 +87,9 @@ mod tests {
         // If eps_pos_lora == eps_pos and eps_neg_lora == eps_neg, loss = 0.
         let device = global_cuda_device();
         let eps_pos =
-            Tensor::from_vec(vec![1.0, -2.0, 3.0], Shape::from_dims(&[3]), device.clone())
-                .unwrap();
+            Tensor::from_vec(vec![1.0, -2.0, 3.0], Shape::from_dims(&[3]), device.clone()).unwrap();
         let eps_neg =
-            Tensor::from_vec(vec![0.5, 0.5, -1.0], Shape::from_dims(&[3]), device.clone())
-                .unwrap();
+            Tensor::from_vec(vec![0.5, 0.5, -1.0], Shape::from_dims(&[3]), device.clone()).unwrap();
         let eps_pos_lora = eps_pos.clone();
         let eps_neg_lora = eps_neg.clone();
         let loss = slider_loss(&eps_pos_lora, &eps_neg_lora, &eps_pos, &eps_neg, 0.0).unwrap();
@@ -109,8 +107,7 @@ mod tests {
         // Total = 14/6 ≈ 2.3333.
         let device = global_cuda_device();
         let eps_pos =
-            Tensor::from_vec(vec![1.0, -2.0, 3.0], Shape::from_dims(&[3]), device.clone())
-                .unwrap();
+            Tensor::from_vec(vec![1.0, -2.0, 3.0], Shape::from_dims(&[3]), device.clone()).unwrap();
         let eps_neg = Tensor::zeros(Shape::from_dims(&[3]), device.clone()).unwrap();
         let loss = slider_loss(&eps_pos, &eps_neg, &eps_pos, &eps_neg, 0.5).unwrap();
         let v = loss.to_vec().unwrap();
@@ -131,8 +128,7 @@ mod tests {
         let eps_neg_lora = Tensor::randn(shape.clone(), 0.0, 1.0, device.clone()).unwrap();
         let eps_pos = Tensor::randn(shape.clone(), 0.0, 1.0, device.clone()).unwrap();
         let eps_neg = Tensor::randn(shape.clone(), 0.0, 1.0, device.clone()).unwrap();
-        let loss =
-            slider_loss(&eps_pos_lora, &eps_neg_lora, &eps_pos, &eps_neg, 2.0).unwrap();
+        let loss = slider_loss(&eps_pos_lora, &eps_neg_lora, &eps_pos, &eps_neg, 2.0).unwrap();
         let v = loss.to_vec().unwrap();
         assert!(v[0].is_finite(), "loss not finite: {}", v[0]);
         assert!(v[0] >= 0.0, "loss negative: {}", v[0]);

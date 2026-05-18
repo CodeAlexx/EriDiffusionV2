@@ -21,12 +21,7 @@ pub fn cosine_lr(base_lr: f32, step: usize, total_steps: usize) -> f32 {
 /// `min_factor * base_lr` at the bottom of cosine decay.
 ///
 /// `min_factor = 0.0` is byte-identical to [`cosine_lr`].
-pub fn cosine_lr_with_floor(
-    base_lr: f32,
-    step: usize,
-    total_steps: usize,
-    min_factor: f32,
-) -> f32 {
+pub fn cosine_lr_with_floor(base_lr: f32, step: usize, total_steps: usize, min_factor: f32) -> f32 {
     if min_factor <= 0.0 {
         return cosine_lr(base_lr, step, total_steps);
     }

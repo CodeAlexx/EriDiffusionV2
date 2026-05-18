@@ -42,24 +42,26 @@
 //! exactly as Z-Image does, so trained LoRAs route through the inference-flame
 //! `LoraStack` `AiToolkit` mapper without conversion.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use cudarc::driver::CudaDevice;
-use flame_core::{parameter::Parameter, DType, Shape, Tensor};
 use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
 use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::models::TrainableModel;
 use crate::Result;
+use cudarc::driver::CudaDevice;
+use flame_core::{parameter::Parameter, DType, Shape, Tensor};
 use lycoris_rs::{
-    algorithms::{full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule},
+    algorithms::{
+        full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule,
+    },
     dora::init_magnitude,
     LycorisAdapter,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
 
 // ── Anima preview config (matches anima_utils.load_anima_model) ──
-pub const HIDDEN: usize = 2048;             // model_channels
+pub const HIDDEN: usize = 2048; // model_channels
 pub const HEADS: usize = 16;
 pub const HEAD_DIM: usize = HIDDEN / HEADS; // 128
 pub const NUM_BLOCKS: usize = 28;
@@ -88,12 +90,12 @@ pub const ROPE_THETA: f32 = 10000.0;
 /// Encode (training-time) — `(z - mean) / std`.
 /// Decode (sample-time)   — `z * std + mean`.
 pub const QWEN_VAE_LATENT_MEAN: [f32; 16] = [
-    -0.7571, -0.7089, -0.9113,  0.1075, -0.1745,  0.9653, -0.1517,  1.5508,
-     0.4134, -0.0715,  0.5517, -0.3632, -0.1922, -0.9497,  0.2503, -0.2921,
+    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517,
+    -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
 ];
 pub const QWEN_VAE_LATENT_STD: [f32; 16] = [
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-    3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
+    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579,
+    1.6382, 1.1253, 2.8251, 1.9160,
 ];
 
 /// LoRA target slots per Anima Block.
@@ -148,22 +150,42 @@ const LORA_SHAPES: [(usize, usize); LORA_SLOTS_PER_BLOCK] = [
 /// `zimage.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AnimaLoraTarget {
-    SaQ, SaK, SaV, SaOut,
-    CaQ, CaK, CaV, CaOut,
-    MlpL1, MlpL2,
-    AdalnSa1, AdalnSa2,
-    AdalnCa1, AdalnCa2,
-    AdalnMlp1, AdalnMlp2,
+    SaQ,
+    SaK,
+    SaV,
+    SaOut,
+    CaQ,
+    CaK,
+    CaV,
+    CaOut,
+    MlpL1,
+    MlpL2,
+    AdalnSa1,
+    AdalnSa2,
+    AdalnCa1,
+    AdalnCa2,
+    AdalnMlp1,
+    AdalnMlp2,
 }
 impl AnimaLoraTarget {
     pub fn slot(self) -> usize {
         match self {
-            Self::SaQ => 0, Self::SaK => 1, Self::SaV => 2, Self::SaOut => 3,
-            Self::CaQ => 4, Self::CaK => 5, Self::CaV => 6, Self::CaOut => 7,
-            Self::MlpL1 => 8, Self::MlpL2 => 9,
-            Self::AdalnSa1 => 10, Self::AdalnSa2 => 11,
-            Self::AdalnCa1 => 12, Self::AdalnCa2 => 13,
-            Self::AdalnMlp1 => 14, Self::AdalnMlp2 => 15,
+            Self::SaQ => 0,
+            Self::SaK => 1,
+            Self::SaV => 2,
+            Self::SaOut => 3,
+            Self::CaQ => 4,
+            Self::CaK => 5,
+            Self::CaV => 6,
+            Self::CaOut => 7,
+            Self::MlpL1 => 8,
+            Self::MlpL2 => 9,
+            Self::AdalnSa1 => 10,
+            Self::AdalnSa2 => 11,
+            Self::AdalnCa1 => 12,
+            Self::AdalnCa2 => 13,
+            Self::AdalnMlp1 => 14,
+            Self::AdalnMlp2 => 15,
         }
     }
 }
@@ -199,7 +221,14 @@ impl AnimaLoraBundle {
         for block_idx in 0..NUM_BLOCKS {
             for (slot_idx, &(in_f, out_f)) in LORA_SHAPES.iter().enumerate() {
                 let s = seed + (block_idx * LORA_SLOTS_PER_BLOCK + slot_idx) as u64;
-                adapters.push(LoRALinear::new(in_f, out_f, rank, alpha, device.clone(), s)?);
+                adapters.push(LoRALinear::new(
+                    in_f,
+                    out_f,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s,
+                )?);
             }
         }
         Ok(Self {
@@ -249,26 +278,43 @@ impl AnimaLoraBundle {
 
     /// Total adapter count (works for both legacy and lycoris paths).
     fn slot_count(&self) -> usize {
-        if let Some(ref l) = self.lyc_adapters { l.len() } else { self.adapters.len() }
+        if let Some(ref l) = self.lyc_adapters {
+            l.len()
+        } else {
+            self.adapters.len()
+        }
     }
 
     /// Iterate `(slot_index, &dyn AdapterModule)` over whichever path is active.
     fn iter_adapters(&self) -> Box<dyn Iterator<Item = (usize, &dyn AdapterModule)> + '_> {
         if let Some(ref l) = self.lyc_adapters {
-            Box::new(l.iter().enumerate().map(|(i, a)| (i, a.as_ref() as &dyn AdapterModule)))
+            Box::new(
+                l.iter()
+                    .enumerate()
+                    .map(|(i, a)| (i, a.as_ref() as &dyn AdapterModule)),
+            )
         } else {
-            Box::new(self.adapters.iter().enumerate().map(|(i, a)| (i, a as &dyn AdapterModule)))
+            Box::new(
+                self.adapters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| (i, a as &dyn AdapterModule)),
+            )
         }
     }
 
     pub fn parameters(&self) -> Vec<Parameter> {
         if let Some(ref l) = self.lyc_adapters {
             let mut out = Vec::new();
-            for adapter in l { out.extend(adapter.to_parameters()); }
+            for adapter in l {
+                out.extend(adapter.to_parameters());
+            }
             out
         } else {
             let mut p = Vec::with_capacity(self.adapters.len() * 2);
-            for adapter in &self.adapters { p.extend(adapter.parameters()); }
+            for adapter in &self.adapters {
+                p.extend(adapter.parameters());
+            }
             p
         }
     }
@@ -279,7 +325,10 @@ impl AnimaLoraBundle {
         for (i, adapter) in self.iter_adapters() {
             let block_idx = i / LORA_SLOTS_PER_BLOCK;
             let slot = i % LORA_SLOTS_PER_BLOCK;
-            let prefix = format!("diffusion_model.blocks.{block_idx}.{}", LORA_SLOT_KEYS[slot]);
+            let prefix = format!(
+                "diffusion_model.blocks.{block_idx}.{}",
+                LORA_SLOT_KEYS[slot]
+            );
             let params = adapter.to_parameters();
             let names = adapter.named_tensors();
             for (param, (leaf, _)) in params.into_iter().zip(names.into_iter()) {
@@ -305,7 +354,10 @@ impl AnimaLoraBundle {
         for (i, adapter) in self.iter_adapters() {
             let block_idx = i / LORA_SLOTS_PER_BLOCK;
             let slot = i % LORA_SLOTS_PER_BLOCK;
-            let prefix = format!("diffusion_model.blocks.{block_idx}.{}", LORA_SLOT_KEYS[slot]);
+            let prefix = format!(
+                "diffusion_model.blocks.{block_idx}.{}",
+                LORA_SLOT_KEYS[slot]
+            );
             for (leaf, t) in adapter.named_tensors() {
                 tensors.insert(format!("{prefix}.{leaf}"), t);
             }
@@ -324,7 +376,10 @@ impl AnimaLoraBundle {
             for (i, adapter) in self.adapters.iter().enumerate() {
                 let block_idx = i / LORA_SLOTS_PER_BLOCK;
                 let slot = i % LORA_SLOTS_PER_BLOCK;
-                let prefix = format!("diffusion_model.blocks.{block_idx}.{}", LORA_SLOT_KEYS[slot]);
+                let prefix = format!(
+                    "diffusion_model.blocks.{block_idx}.{}",
+                    LORA_SLOT_KEYS[slot]
+                );
                 adapter.load_tensors(&prefix, &source)?;
             }
             return Ok(());
@@ -335,7 +390,10 @@ impl AnimaLoraBundle {
         for (i, adapter) in lyc.iter().enumerate() {
             let block_idx = i / LORA_SLOTS_PER_BLOCK;
             let slot = i % LORA_SLOTS_PER_BLOCK;
-            let prefix = format!("diffusion_model.blocks.{block_idx}.{}", LORA_SLOT_KEYS[slot]);
+            let prefix = format!(
+                "diffusion_model.blocks.{block_idx}.{}",
+                LORA_SLOT_KEYS[slot]
+            );
             for (leaf, _) in adapter.named_tensors() {
                 let key = format!("{prefix}.{leaf}");
                 let _ = source.get(&key).ok_or_else(|| {
@@ -352,7 +410,8 @@ impl AnimaLoraBundle {
             log::warn!(
                 "[AnimaLoraBundle::load] LyCORIS in-place leaf-load TODO for algo={} at slot {} \
                  (file present but bytes not copied — Phase 2c will wire this)",
-                self.algo.as_str(), i,
+                self.algo.as_str(),
+                i,
             );
         }
         Ok(())
@@ -403,9 +462,11 @@ impl AnimaLoraBundle {
             // downcast required — the trait method routes per-impl.
             let applied = adapter
                 .init_perturbed_normal_lokr(base, scale)
-                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
-                    "init_perturbed_normal_lokr slot {i}: {e}"
-                )))?;
+                .map_err(|e| {
+                    flame_core::FlameError::InvalidOperation(format!(
+                        "init_perturbed_normal_lokr slot {i}: {e}"
+                    ))
+                })?;
             if !applied {
                 log::warn!(
                     "[init_lokr_norm] slot {i} (block={block_idx}, key=`{weight_key}`): \
@@ -433,41 +494,67 @@ fn build_lycoris_linear(
         LycorisAlgo::None => {
             return Err(flame_core::Error::InvalidInput(
                 "build_lycoris_linear: LycorisAlgo::None should be handled by caller".into(),
-            ).into());
+            )
+            .into());
         }
         LycorisAlgo::LoCon => LycorisAdapter::LoCon(
             LoConModule::new_linear_for_training(
-                in_features, out_features, config.rank, alpha,
-                device.clone(), dtype,
+                in_features,
+                out_features,
+                config.rank,
+                alpha,
+                device.clone(),
+                dtype,
             )
-            .map_err(|e| flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}")))?,
+            .map_err(|e| {
+                flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}"))
+            })?,
         ),
         LycorisAlgo::LoHa => LycorisAdapter::LoHa(
             LoHaModule::new_linear_for_training(
-                in_features, out_features, config.rank, alpha,
-                device.clone(), dtype,
+                in_features,
+                out_features,
+                config.rank,
+                alpha,
+                device.clone(),
+                dtype,
             )
-            .map_err(|e| flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}")))?,
+            .map_err(|e| {
+                flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}"))
+            })?,
         ),
         LycorisAlgo::LoKr => LycorisAdapter::LoKr(
             LoKrModule::new_linear(
-                in_features, out_features, config.rank, config.alpha,
-                config.factor, config.decompose_both, config.use_scalar,
-                device.clone(), dtype,
+                in_features,
+                out_features,
+                config.rank,
+                config.alpha,
+                config.factor,
+                config.decompose_both,
+                config.use_scalar,
+                device.clone(),
+                dtype,
             )
             .map_err(|e| flame_core::Error::InvalidInput(format!("LoKr::new_linear: {e}")))?,
         ),
         LycorisAlgo::Full => LycorisAdapter::Full(
             FullAdapter::new_for_training(
                 flame_core::Shape::from_dims(&[out_features, in_features]),
-                None, device.clone(), dtype,
+                None,
+                device.clone(),
+                dtype,
             )
             .map_err(|e| flame_core::Error::InvalidInput(format!("Full::new_for_training: {e}")))?,
         ),
         LycorisAlgo::Oft => LycorisAdapter::OFT(
             OFTModule::new_linear(
-                in_features, out_features, config.block_size, config.alpha,
-                None, dtype, device.clone(),
+                in_features,
+                out_features,
+                config.block_size,
+                config.alpha,
+                None,
+                dtype,
+                device.clone(),
             )
             .map_err(|e| flame_core::Error::InvalidInput(format!("OFT::new_linear: {e}")))?
             .with_neumann_terms(config.neumann_terms),
@@ -478,17 +565,15 @@ fn build_lycoris_linear(
         if config.algo == LycorisAlgo::Oft {
             return Err(flame_core::Error::InvalidInput(
                 "DoRA + OFT is not supported (multiplicative + decomposition conflict)".into(),
-            ).into());
+            )
+            .into());
         }
         let shape = if config.dora_wd_on_out {
             flame_core::Shape::from_dims(&[out_features, 1])
         } else {
             flame_core::Shape::from_dims(&[1, in_features])
         };
-        let ones = Tensor::from_vec(
-            vec![1.0_f32; shape.elem_count()],
-            shape, device.clone(),
-        )?;
+        let ones = Tensor::from_vec(vec![1.0_f32; shape.elem_count()], shape, device.clone())?;
         let m = init_magnitude(&ones, config.dora_wd_on_out, 0.0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("init_magnitude: {e}")))?;
         Some(m.requires_grad_(true))
@@ -497,7 +582,11 @@ fn build_lycoris_linear(
     };
 
     Ok(LycorisLinear::new(
-        adapter, dora_magnitude, config.dora_wd_on_out, config.dora_eps, config.storage,
+        adapter,
+        dora_magnitude,
+        config.dora_wd_on_out,
+        config.dora_eps,
+        config.storage,
     ))
 }
 
@@ -524,7 +613,11 @@ impl AnimaModel {
         for (k, v) in raw {
             weights.insert(k, v.to_dtype(DType::BF16)?);
         }
-        log::info!("Anima: {} tensors loaded from {}", weights.len(), weight_path.display());
+        log::info!(
+            "Anima: {} tensors loaded from {}",
+            weights.len(),
+            weight_path.display()
+        );
 
         if !config.is_lora() {
             return Err(crate::EriDiffusionError::Model(
@@ -536,7 +629,10 @@ impl AnimaModel {
         let bundle = AnimaLoraBundle::new(rank, alpha, device.clone(), 42)?;
         log::info!(
             "Anima LoRA: {} adapters across {} blocks (rank={}, alpha={})",
-            bundle.adapters.len(), NUM_BLOCKS, rank, alpha,
+            bundle.adapters.len(),
+            NUM_BLOCKS,
+            rank,
+            alpha,
         );
         Ok(Self {
             config: config.clone(),
@@ -551,10 +647,14 @@ impl AnimaModel {
     fn w(&self, key: &str) -> Result<&Tensor> {
         // Try literal first, then `net.<key>` (preview checkpoints prefix
         // every key with `net.`).
-        if let Some(t) = self.weights.get(key) { return Ok(t); }
+        if let Some(t) = self.weights.get(key) {
+            return Ok(t);
+        }
         let alt = format!("net.{key}");
         self.weights.get(&alt).ok_or_else(|| {
-            crate::EriDiffusionError::Model(format!("Anima: missing weight `{key}` (also tried `{alt}`)"))
+            crate::EriDiffusionError::Model(format!(
+                "Anima: missing weight `{key}` (also tried `{alt}`)"
+            ))
         })
     }
 
@@ -600,7 +700,8 @@ impl AnimaModel {
         if let Some((block, target)) = slot_block {
             let lora = self.bundle.get(block, target);
             // Trait dispatch: covers both legacy LoRALinear and LyCORIS paths.
-            let delta = lora.forward_delta(x)
+            let delta = lora
+                .forward_delta(x)
                 .map_err(|e| crate::EriDiffusionError::Model(format!("forward_delta: {e}")))?;
             base.add(&delta).map_err(Into::into)
         } else {
@@ -656,11 +757,15 @@ impl AnimaModel {
             }
         }
         let emb = Tensor::from_vec_dtype(
-            emb_data, Shape::from_dims(&[batch, dim]),
-            self.device.clone(), DType::BF16,
+            emb_data,
+            Shape::from_dims(&[batch, dim]),
+            self.device.clone(),
+            DType::BF16,
         )?;
         // hidden = SiLU(Linear(emb))
-        let hidden = self.linear_no_bias(&emb, "t_embedder.1.linear_1.weight")?.silu()?;
+        let hidden = self
+            .linear_no_bias(&emb, "t_embedder.1.linear_1.weight")?
+            .silu()?;
         let base_adaln = self.linear_no_bias(&hidden, "t_embedder.1.linear_2.weight")?;
         let t_cond = self.rms_norm(&emb, "t_embedding_norm.weight", 1e-6)?;
         Ok((t_cond, base_adaln))
@@ -728,13 +833,31 @@ impl AnimaModel {
         let dims = x.shape().dims().to_vec();
         let (b, seq) = (dims[0], dims[1]);
 
-        let q = self.linear_lora(x, &format!("{prefix}.q_proj.weight"), Some((block, AnimaLoraTarget::SaQ)))?;
-        let k = self.linear_lora(x, &format!("{prefix}.k_proj.weight"), Some((block, AnimaLoraTarget::SaK)))?;
-        let v = self.linear_lora(x, &format!("{prefix}.v_proj.weight"), Some((block, AnimaLoraTarget::SaV)))?;
+        let q = self.linear_lora(
+            x,
+            &format!("{prefix}.q_proj.weight"),
+            Some((block, AnimaLoraTarget::SaQ)),
+        )?;
+        let k = self.linear_lora(
+            x,
+            &format!("{prefix}.k_proj.weight"),
+            Some((block, AnimaLoraTarget::SaK)),
+        )?;
+        let v = self.linear_lora(
+            x,
+            &format!("{prefix}.v_proj.weight"),
+            Some((block, AnimaLoraTarget::SaV)),
+        )?;
 
-        let q = q.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+        let q = q
+            .reshape(&[b, seq, HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let k = k
+            .reshape(&[b, seq, HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let v = v
+            .reshape(&[b, seq, HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
 
         let q = self.rms_norm_per_head_bhsd(&q, &format!("{prefix}.q_norm.weight"))?;
         let k = self.rms_norm_per_head_bhsd(&k, &format!("{prefix}.k_norm.weight"))?;
@@ -747,26 +870,39 @@ impl AnimaModel {
         let k = flame_core::bf16_ops::rope_halfsplit_bf16(&k, rope_cos, rope_sin)?;
 
         let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-        let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq, HEADS * HEAD_DIM])?;
-        self.linear_lora(&out, &format!("{prefix}.output_proj.weight"), Some((block, AnimaLoraTarget::SaOut)))
+        let out = out
+            .permute(&[0, 2, 1, 3])?
+            .reshape(&[b, seq, HEADS * HEAD_DIM])?;
+        self.linear_lora(
+            &out,
+            &format!("{prefix}.output_proj.weight"),
+            Some((block, AnimaLoraTarget::SaOut)),
+        )
     }
 
     // ─── Cross-attention (no RoPE) ──────────────────────────────────────────
 
-    fn cross_attention(
-        &self,
-        x: &Tensor,
-        context: &Tensor,
-        block: usize,
-    ) -> Result<Tensor> {
+    fn cross_attention(&self, x: &Tensor, context: &Tensor, block: usize) -> Result<Tensor> {
         let prefix = format!("blocks.{block}.cross_attn");
         let dims = x.shape().dims().to_vec();
         let (b, seq_img) = (dims[0], dims[1]);
         let seq_txt = context.shape().dims()[1];
 
-        let q = self.linear_lora(x, &format!("{prefix}.q_proj.weight"), Some((block, AnimaLoraTarget::CaQ)))?;
-        let k = self.linear_lora(context, &format!("{prefix}.k_proj.weight"), Some((block, AnimaLoraTarget::CaK)))?;
-        let v = self.linear_lora(context, &format!("{prefix}.v_proj.weight"), Some((block, AnimaLoraTarget::CaV)))?;
+        let q = self.linear_lora(
+            x,
+            &format!("{prefix}.q_proj.weight"),
+            Some((block, AnimaLoraTarget::CaQ)),
+        )?;
+        let k = self.linear_lora(
+            context,
+            &format!("{prefix}.k_proj.weight"),
+            Some((block, AnimaLoraTarget::CaK)),
+        )?;
+        let v = self.linear_lora(
+            context,
+            &format!("{prefix}.v_proj.weight"),
+            Some((block, AnimaLoraTarget::CaV)),
+        )?;
 
         let q = q.reshape(&[b, seq_img, HEADS, HEAD_DIM])?;
         let k = k.reshape(&[b, seq_txt, HEADS, HEAD_DIM])?;
@@ -780,17 +916,31 @@ impl AnimaModel {
         let v = v.permute(&[0, 2, 1, 3])?;
 
         let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-        let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq_img, HEADS * HEAD_DIM])?;
-        self.linear_lora(&out, &format!("{prefix}.output_proj.weight"), Some((block, AnimaLoraTarget::CaOut)))
+        let out = out
+            .permute(&[0, 2, 1, 3])?
+            .reshape(&[b, seq_img, HEADS * HEAD_DIM])?;
+        self.linear_lora(
+            &out,
+            &format!("{prefix}.output_proj.weight"),
+            Some((block, AnimaLoraTarget::CaOut)),
+        )
     }
 
     // ─── GELU MLP ───────────────────────────────────────────────────────────
 
     fn mlp(&self, x: &Tensor, block: usize) -> Result<Tensor> {
         let prefix = format!("blocks.{block}.mlp");
-        let h = self.linear_lora(x, &format!("{prefix}.layer1.weight"), Some((block, AnimaLoraTarget::MlpL1)))?;
+        let h = self.linear_lora(
+            x,
+            &format!("{prefix}.layer1.weight"),
+            Some((block, AnimaLoraTarget::MlpL1)),
+        )?;
         let h = h.gelu()?;
-        self.linear_lora(&h, &format!("{prefix}.layer2.weight"), Some((block, AnimaLoraTarget::MlpL2)))
+        self.linear_lora(
+            &h,
+            &format!("{prefix}.layer2.weight"),
+            Some((block, AnimaLoraTarget::MlpL2)),
+        )
     }
 
     // ─── Transformer block ──────────────────────────────────────────────────
@@ -816,7 +966,8 @@ impl AnimaModel {
 
         // Self-attention.
         let (shift_sa, scale_sa, gate_sa) = self.adaln_modulation(
-            t_cond, base_adaln,
+            t_cond,
+            base_adaln,
             &format!("blocks.{block}.adaln_modulation_self_attn"),
             Some((block, AnimaLoraTarget::AdalnSa1, AnimaLoraTarget::AdalnSa2)),
         )?;
@@ -827,7 +978,8 @@ impl AnimaModel {
 
         // Cross-attention.
         let (shift_ca, scale_ca, gate_ca) = self.adaln_modulation(
-            t_cond, base_adaln,
+            t_cond,
+            base_adaln,
             &format!("blocks.{block}.adaln_modulation_cross_attn"),
             Some((block, AnimaLoraTarget::AdalnCa1, AnimaLoraTarget::AdalnCa2)),
         )?;
@@ -838,9 +990,14 @@ impl AnimaModel {
 
         // MLP.
         let (shift_mlp, scale_mlp, gate_mlp) = self.adaln_modulation(
-            t_cond, base_adaln,
+            t_cond,
+            base_adaln,
             &format!("blocks.{block}.adaln_modulation_mlp"),
-            Some((block, AnimaLoraTarget::AdalnMlp1, AnimaLoraTarget::AdalnMlp2)),
+            Some((
+                block,
+                AnimaLoraTarget::AdalnMlp1,
+                AnimaLoraTarget::AdalnMlp2,
+            )),
         )?;
         let x_mod = self.apply_adaln(&x, &shift_mlp, &scale_mlp)?;
         let mlp_out = self.mlp(&x_mod, block)?;
@@ -870,7 +1027,9 @@ impl AnimaModel {
         let nw = w / ph;
         // Append zero padding-mask channel.
         let mask = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, t, h, w, 1]), DType::BF16, self.device.clone(),
+            Shape::from_dims(&[b, t, h, w, 1]),
+            DType::BF16,
+            self.device.clone(),
         )?;
         let x_padded = Tensor::cat(&[x, &mask], 4)?;
         let c_pad = c + 1; // 17
@@ -890,7 +1049,8 @@ impl AnimaModel {
         let c = IN_CHANNELS;
         let x_r = x.reshape(&[b, t, nh, nw, ph, ph, c])?;
         let x_p = x_r.permute(&[0, 1, 2, 4, 3, 5, 6])?.contiguous()?;
-        x_p.reshape(&[b, t, nh * ph, nw * ph, c]).map_err(Into::into)
+        x_p.reshape(&[b, t, nh * ph, nw * ph, c])
+            .map_err(Into::into)
     }
 
     fn patch_embed(&self, patches: &Tensor) -> Result<Tensor> {
@@ -940,7 +1100,9 @@ impl AnimaModel {
             let v = v.permute(&[0, 2, 1, 3])?;
 
             let attn = flame_core::attention::sdpa(&q, &k, &v, None)?;
-            let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, seq_len, num_heads * head_dim])?;
+            let attn = attn
+                .permute(&[0, 2, 1, 3])?
+                .reshape(&[b, seq_len, num_heads * head_dim])?;
             let attn = self.linear_no_bias(&attn, &format!("{bp}.self_attn.o_proj.weight"))?;
             x = x.add(&attn)?;
 
@@ -967,7 +1129,10 @@ impl AnimaModel {
             let k = k.permute(&[0, 2, 1, 3])?;
             let v = v.permute(&[0, 2, 1, 3])?;
             let cross = flame_core::attention::sdpa(&q, &k, &v, None)?;
-            let cross = cross.permute(&[0, 2, 1, 3])?.reshape(&[b, seq_len, num_heads * head_dim])?;
+            let cross =
+                cross
+                    .permute(&[0, 2, 1, 3])?
+                    .reshape(&[b, seq_len, num_heads * head_dim])?;
             let cross = self.linear_no_bias(&cross, &format!("{bp}.cross_attn.o_proj.weight"))?;
             x = x.add(&cross)?;
 
@@ -1021,7 +1186,8 @@ impl AnimaModel {
         let in_dims = noisy.shape().dims().to_vec();
         if in_dims.len() != 4 {
             return Err(crate::EriDiffusionError::Model(format!(
-                "AnimaModel::forward expected [B,16,H,W], got {:?}", in_dims
+                "AnimaModel::forward expected [B,16,H,W], got {:?}",
+                in_dims
             )));
         }
         let (b, c, h, w) = (in_dims[0], in_dims[1], in_dims[2], in_dims[3]);
@@ -1032,8 +1198,8 @@ impl AnimaModel {
         }
         // 4D NCHW → 5D NTHWC (T=1, C-last).
         let x = noisy
-            .reshape(&[b, c, 1, h, w])?           // [B, C, 1, H, W]
-            .permute(&[0, 2, 3, 4, 1])?            // [B, 1, H, W, C]
+            .reshape(&[b, c, 1, h, w])? // [B, C, 1, H, W]
+            .permute(&[0, 2, 3, 4, 1])? // [B, 1, H, W, C]
             .contiguous()?;
 
         // 1. Timestep conditioning.
@@ -1121,17 +1287,28 @@ impl AnimaModel {
                     &[x_in.clone()],
                     move || {
                         anima_block_forward_standalone(
-                            &block_weights, &bundle_c, &x_in,
-                            &context_c, &t_cond_c, &base_adaln_c,
-                            &rope_cos_c, &rope_sin_c, block_idx,
+                            &block_weights,
+                            &bundle_c,
+                            &x_in,
+                            &context_c,
+                            &t_cond_c,
+                            &base_adaln_c,
+                            &rope_cos_c,
+                            &rope_sin_c,
+                            block_idx,
                         )
                         .map_err(|e| flame_core::FlameError::InvalidInput(format!("{e}")))
                     },
                 )?;
             } else {
                 x_hidden = self.transformer_block(
-                    &x_hidden, &context, &t_cond, &base_adaln,
-                    &rope_cos, &rope_sin, i,
+                    &x_hidden,
+                    &context,
+                    &t_cond,
+                    &base_adaln,
+                    &rope_cos,
+                    &rope_sin,
+                    i,
                 )?;
             }
         }
@@ -1141,8 +1318,7 @@ impl AnimaModel {
 
         // 7. Unpatchify → [B, 1, H, W, 16] → [B, 16, H, W].
         let out_5d = self.unpatchify(&x_out, t_frames, nh, nw)?;
-        let out_4d = out_5d.permute(&[0, 4, 1, 2, 3])?
-            .reshape(&[b, c, h, w])?;
+        let out_4d = out_5d.permute(&[0, 4, 1, 2, 3])?.reshape(&[b, c, h, w])?;
         Ok(out_4d)
     }
 
@@ -1159,15 +1335,23 @@ impl TrainableModel for AnimaModel {
         context: &[Tensor],
         _pooled: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let cap_feats = context.first().ok_or_else(|| {
-            crate::EriDiffusionError::Model("Anima needs cap_feats in context[0]".into())
-        })?.clone();
+        let cap_feats = context
+            .first()
+            .ok_or_else(|| {
+                crate::EriDiffusionError::Model("Anima needs cap_feats in context[0]".into())
+            })?
+            .clone();
         let cap_mask = context.get(1).cloned();
         let t5_ids = context.get(2).cloned();
         let t5_mask = context.get(3).cloned();
         AnimaModel::forward(
-            self, noisy, timestep, &cap_feats,
-            cap_mask.as_ref(), t5_ids.as_ref(), t5_mask.as_ref(),
+            self,
+            noisy,
+            timestep,
+            &cap_feats,
+            cap_mask.as_ref(),
+            t5_ids.as_ref(),
+            t5_mask.as_ref(),
         )
     }
 
@@ -1212,15 +1396,21 @@ impl TrainableModel for AnimaModel {
 // per the `#[derive(Clone)]` rationale on `AnimaLoraBundle`).
 
 fn anima_w<'a>(weights: &'a HashMap<String, Tensor>, key: &str) -> Result<&'a Tensor> {
-    if let Some(t) = weights.get(key) { return Ok(t); }
+    if let Some(t) = weights.get(key) {
+        return Ok(t);
+    }
     let alt = format!("net.{key}");
     weights.get(&alt).ok_or_else(|| {
-        crate::EriDiffusionError::Model(format!("Anima: missing weight `{key}` (also tried `{alt}`)"))
+        crate::EriDiffusionError::Model(format!(
+            "Anima: missing weight `{key}` (also tried `{alt}`)"
+        ))
     })
 }
 
 fn anima_linear_no_bias(
-    weights: &HashMap<String, Tensor>, x: &Tensor, weight_key: &str,
+    weights: &HashMap<String, Tensor>,
+    x: &Tensor,
+    weight_key: &str,
 ) -> Result<Tensor> {
     let weight = anima_w(weights, weight_key)?;
     let dims = x.shape().dims().to_vec();
@@ -1245,7 +1435,8 @@ fn anima_linear_lora(
     let base = anima_linear_no_bias(weights, x, weight_key)?;
     if let Some((block, target)) = slot_block {
         let lora = bundle.get(block, target);
-        let delta = lora.forward_delta(x)
+        let delta = lora
+            .forward_delta(x)
             .map_err(|e| crate::EriDiffusionError::Model(format!("forward_delta: {e}")))?;
         base.add(&delta).map_err(Into::into)
     } else {
@@ -1254,7 +1445,9 @@ fn anima_linear_lora(
 }
 
 fn anima_rms_norm_per_head(
-    weights: &HashMap<String, Tensor>, x: &Tensor, weight_key: &str,
+    weights: &HashMap<String, Tensor>,
+    x: &Tensor,
+    weight_key: &str,
 ) -> Result<Tensor> {
     let w = anima_w(weights, weight_key)?;
     let dims = x.shape().dims().to_vec();
@@ -1265,7 +1458,9 @@ fn anima_rms_norm_per_head(
 }
 
 fn anima_rms_norm_per_head_bhsd(
-    weights: &HashMap<String, Tensor>, x: &Tensor, weight_key: &str,
+    weights: &HashMap<String, Tensor>,
+    x: &Tensor,
+    weight_key: &str,
 ) -> Result<Tensor> {
     let w = anima_w(weights, weight_key)?;
     let dims = x.shape().dims().to_vec();
@@ -1288,7 +1483,13 @@ fn anima_adaln_modulation(
         Some((b, s1, s2)) => (Some((b, s1)), Some((b, s2))),
         None => (None, None),
     };
-    let h = anima_linear_lora(weights, bundle, &t_silu, &format!("{prefix}.1.weight"), slot1)?;
+    let h = anima_linear_lora(
+        weights,
+        bundle,
+        &t_silu,
+        &format!("{prefix}.1.weight"),
+        slot1,
+    )?;
     let mod_out = anima_linear_lora(weights, bundle, &h, &format!("{prefix}.2.weight"), slot2)?;
     let mod_out = mod_out.add(base_adaln)?;
     let dim = HIDDEN;
@@ -1317,13 +1518,37 @@ fn anima_self_attention(
     let dims = x.shape().dims().to_vec();
     let (b, seq) = (dims[0], dims[1]);
 
-    let q = anima_linear_lora(weights, bundle, x, &format!("{prefix}.q_proj.weight"), Some((block, AnimaLoraTarget::SaQ)))?;
-    let k = anima_linear_lora(weights, bundle, x, &format!("{prefix}.k_proj.weight"), Some((block, AnimaLoraTarget::SaK)))?;
-    let v = anima_linear_lora(weights, bundle, x, &format!("{prefix}.v_proj.weight"), Some((block, AnimaLoraTarget::SaV)))?;
+    let q = anima_linear_lora(
+        weights,
+        bundle,
+        x,
+        &format!("{prefix}.q_proj.weight"),
+        Some((block, AnimaLoraTarget::SaQ)),
+    )?;
+    let k = anima_linear_lora(
+        weights,
+        bundle,
+        x,
+        &format!("{prefix}.k_proj.weight"),
+        Some((block, AnimaLoraTarget::SaK)),
+    )?;
+    let v = anima_linear_lora(
+        weights,
+        bundle,
+        x,
+        &format!("{prefix}.v_proj.weight"),
+        Some((block, AnimaLoraTarget::SaV)),
+    )?;
 
-    let q = q.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let k = k.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let v = v.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+    let q = q
+        .reshape(&[b, seq, HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let k = k
+        .reshape(&[b, seq, HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let v = v
+        .reshape(&[b, seq, HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
 
     let q = anima_rms_norm_per_head_bhsd(weights, &q, &format!("{prefix}.q_norm.weight"))?;
     let k = anima_rms_norm_per_head_bhsd(weights, &k, &format!("{prefix}.k_norm.weight"))?;
@@ -1334,8 +1559,16 @@ fn anima_self_attention(
     let k = flame_core::bf16_ops::rope_halfsplit_bf16(&k, rope_cos, rope_sin)?;
 
     let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-    let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq, HEADS * HEAD_DIM])?;
-    anima_linear_lora(weights, bundle, &out, &format!("{prefix}.output_proj.weight"), Some((block, AnimaLoraTarget::SaOut)))
+    let out = out
+        .permute(&[0, 2, 1, 3])?
+        .reshape(&[b, seq, HEADS * HEAD_DIM])?;
+    anima_linear_lora(
+        weights,
+        bundle,
+        &out,
+        &format!("{prefix}.output_proj.weight"),
+        Some((block, AnimaLoraTarget::SaOut)),
+    )
 }
 
 fn anima_cross_attention(
@@ -1350,9 +1583,27 @@ fn anima_cross_attention(
     let (b, seq_img) = (dims[0], dims[1]);
     let seq_txt = context.shape().dims()[1];
 
-    let q = anima_linear_lora(weights, bundle, x, &format!("{prefix}.q_proj.weight"), Some((block, AnimaLoraTarget::CaQ)))?;
-    let k = anima_linear_lora(weights, bundle, context, &format!("{prefix}.k_proj.weight"), Some((block, AnimaLoraTarget::CaK)))?;
-    let v = anima_linear_lora(weights, bundle, context, &format!("{prefix}.v_proj.weight"), Some((block, AnimaLoraTarget::CaV)))?;
+    let q = anima_linear_lora(
+        weights,
+        bundle,
+        x,
+        &format!("{prefix}.q_proj.weight"),
+        Some((block, AnimaLoraTarget::CaQ)),
+    )?;
+    let k = anima_linear_lora(
+        weights,
+        bundle,
+        context,
+        &format!("{prefix}.k_proj.weight"),
+        Some((block, AnimaLoraTarget::CaK)),
+    )?;
+    let v = anima_linear_lora(
+        weights,
+        bundle,
+        context,
+        &format!("{prefix}.v_proj.weight"),
+        Some((block, AnimaLoraTarget::CaV)),
+    )?;
 
     let q = q.reshape(&[b, seq_img, HEADS, HEAD_DIM])?;
     let k = k.reshape(&[b, seq_txt, HEADS, HEAD_DIM])?;
@@ -1366,8 +1617,16 @@ fn anima_cross_attention(
     let v = v.permute(&[0, 2, 1, 3])?;
 
     let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-    let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq_img, HEADS * HEAD_DIM])?;
-    anima_linear_lora(weights, bundle, &out, &format!("{prefix}.output_proj.weight"), Some((block, AnimaLoraTarget::CaOut)))
+    let out = out
+        .permute(&[0, 2, 1, 3])?
+        .reshape(&[b, seq_img, HEADS * HEAD_DIM])?;
+    anima_linear_lora(
+        weights,
+        bundle,
+        &out,
+        &format!("{prefix}.output_proj.weight"),
+        Some((block, AnimaLoraTarget::CaOut)),
+    )
 }
 
 fn anima_mlp(
@@ -1377,9 +1636,21 @@ fn anima_mlp(
     block: usize,
 ) -> Result<Tensor> {
     let prefix = format!("blocks.{block}.mlp");
-    let h = anima_linear_lora(weights, bundle, x, &format!("{prefix}.layer1.weight"), Some((block, AnimaLoraTarget::MlpL1)))?;
+    let h = anima_linear_lora(
+        weights,
+        bundle,
+        x,
+        &format!("{prefix}.layer1.weight"),
+        Some((block, AnimaLoraTarget::MlpL1)),
+    )?;
     let h = h.gelu()?;
-    anima_linear_lora(weights, bundle, &h, &format!("{prefix}.layer2.weight"), Some((block, AnimaLoraTarget::MlpL2)))
+    anima_linear_lora(
+        weights,
+        bundle,
+        &h,
+        &format!("{prefix}.layer2.weight"),
+        Some((block, AnimaLoraTarget::MlpL2)),
+    )
 }
 
 /// Standalone Anima transformer block. Byte-equivalent to the
@@ -1401,7 +1672,10 @@ pub fn anima_block_forward_standalone(
 
     // Self-attention.
     let (shift_sa, scale_sa, gate_sa) = anima_adaln_modulation(
-        block_weights, bundle, t_cond, base_adaln,
+        block_weights,
+        bundle,
+        t_cond,
+        base_adaln,
         &format!("blocks.{block}.adaln_modulation_self_attn"),
         Some((block, AnimaLoraTarget::AdalnSa1, AnimaLoraTarget::AdalnSa2)),
     )?;
@@ -1412,7 +1686,10 @@ pub fn anima_block_forward_standalone(
 
     // Cross-attention.
     let (shift_ca, scale_ca, gate_ca) = anima_adaln_modulation(
-        block_weights, bundle, t_cond, base_adaln,
+        block_weights,
+        bundle,
+        t_cond,
+        base_adaln,
         &format!("blocks.{block}.adaln_modulation_cross_attn"),
         Some((block, AnimaLoraTarget::AdalnCa1, AnimaLoraTarget::AdalnCa2)),
     )?;
@@ -1423,9 +1700,16 @@ pub fn anima_block_forward_standalone(
 
     // MLP.
     let (shift_mlp, scale_mlp, gate_mlp) = anima_adaln_modulation(
-        block_weights, bundle, t_cond, base_adaln,
+        block_weights,
+        bundle,
+        t_cond,
+        base_adaln,
         &format!("blocks.{block}.adaln_modulation_mlp"),
-        Some((block, AnimaLoraTarget::AdalnMlp1, AnimaLoraTarget::AdalnMlp2)),
+        Some((
+            block,
+            AnimaLoraTarget::AdalnMlp1,
+            AnimaLoraTarget::AdalnMlp2,
+        )),
     )?;
     let x_mod = anima_apply_adaln(&x, &shift_mlp, &scale_mlp)?;
     let mlp_out = anima_mlp(block_weights, bundle, &x_mod, block)?;
@@ -1441,7 +1725,11 @@ pub fn anima_block_forward_standalone(
 /// throughout zimage.rs to bypass the inference-only `cuda_ops_bf16::rms_norm_bf16`.
 fn primitive_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> flame_core::Result<Tensor> {
     let out_dtype = x.dtype();
-    let x_f32 = if out_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
+    let x_f32 = if out_dtype == DType::F32 {
+        x.clone()
+    } else {
+        x.to_dtype(DType::F32)?
+    };
     let weight_f32 = if weight.dtype() == DType::F32 {
         weight.clone()
     } else {
@@ -1455,13 +1743,21 @@ fn primitive_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> flame_core::Resu
     let inv_rms = mean_sq.add_scalar(eps)?.rsqrt()?;
     let normed = x_f32.mul(&inv_rms)?;
     let scaled = normed.mul(&weight_f32)?;
-    if out_dtype == DType::F32 { Ok(scaled) } else { scaled.to_dtype(out_dtype) }
+    if out_dtype == DType::F32 {
+        Ok(scaled)
+    } else {
+        scaled.to_dtype(out_dtype)
+    }
 }
 
 /// F32-internal LayerNorm (no scale/bias). Pair with adaLN's `(1+scale)*y+shift`.
 fn primitive_layer_norm(x: &Tensor, eps: f32) -> flame_core::Result<Tensor> {
     let out_dtype = x.dtype();
-    let x_f32 = if out_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
+    let x_f32 = if out_dtype == DType::F32 {
+        x.clone()
+    } else {
+        x.to_dtype(DType::F32)?
+    };
     let dims = x_f32.shape().dims().to_vec();
     let last = dims.len() - 1;
     let n = dims[last] as f32;
@@ -1471,7 +1767,11 @@ fn primitive_layer_norm(x: &Tensor, eps: f32) -> flame_core::Result<Tensor> {
     let var = sq.sum_dim_keepdim(last)?.mul_scalar(1.0 / n)?;
     let inv_std = var.add_scalar(eps)?.rsqrt()?;
     let normed = centered.mul(&inv_std)?;
-    if out_dtype == DType::F32 { Ok(normed) } else { normed.to_dtype(out_dtype) }
+    if out_dtype == DType::F32 {
+        Ok(normed)
+    } else {
+        normed.to_dtype(out_dtype)
+    }
 }
 
 /// Embedding lookup. Indices are stored as F32 in safetensors I/O.
@@ -1501,8 +1801,10 @@ fn embedding_lookup(
         }
     }
     Tensor::from_vec_dtype(
-        out_data, Shape::from_dims(&[b, s, dim]),
-        device.clone(), DType::BF16,
+        out_data,
+        Shape::from_dims(&[b, s, dim]),
+        device.clone(),
+        DType::BF16,
     )
 }
 
@@ -1524,12 +1826,16 @@ fn build_1d_rope(
         }
     }
     let cos = Tensor::from_vec_dtype(
-        cos_data, Shape::from_dims(&[seq_len, half]),
-        device.clone(), DType::BF16,
+        cos_data,
+        Shape::from_dims(&[seq_len, half]),
+        device.clone(),
+        DType::BF16,
     )?;
     let sin = Tensor::from_vec_dtype(
-        sin_data, Shape::from_dims(&[seq_len, half]),
-        device.clone(), DType::BF16,
+        sin_data,
+        Shape::from_dims(&[seq_len, half]),
+        device.clone(),
+        DType::BF16,
     )?;
     Ok((cos, sin))
 }
@@ -1587,7 +1893,7 @@ fn build_3d_rope_cossin(
     let total_seq = t_frames * nh * nw;
     let full_d = half_d * 2;
     let dim_h: usize = full_d / 6 * 2; // 42
-    let dim_w: usize = dim_h;           // 42
+    let dim_w: usize = dim_h; // 42
     let dim_t: usize = full_d - 2 * dim_h; // 44
     let bins_t = dim_t / 2;
     let bins_h = dim_h / 2;
@@ -1642,12 +1948,16 @@ fn build_3d_rope_cossin(
         }
     }
     let cos = Tensor::from_vec_dtype(
-        cos_data, Shape::from_dims(&[1, 1, total_seq, half_d]),
-        device.clone(), DType::BF16,
+        cos_data,
+        Shape::from_dims(&[1, 1, total_seq, half_d]),
+        device.clone(),
+        DType::BF16,
     )?;
     let sin = Tensor::from_vec_dtype(
-        sin_data, Shape::from_dims(&[1, 1, total_seq, half_d]),
-        device.clone(), DType::BF16,
+        sin_data,
+        Shape::from_dims(&[1, 1, total_seq, half_d]),
+        device.clone(),
+        DType::BF16,
     )?;
     Ok((cos, sin))
 }

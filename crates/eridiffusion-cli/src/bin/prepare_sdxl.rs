@@ -21,13 +21,13 @@
 //!     bucketing in this minimal port). Original image size is recorded so
 //!     a future bucketing pass can use the true aspect.
 use clap::Parser;
-use flame_core::{serialization::save_file, DType, Shape, Tensor};
 use eridiffusion_core::encoders::{
     clip_g::ClipGEncoder,
     clip_l::{ClipConfig, ClipEncoder},
     sdxl_vae::SdxlVaeEncoder,
 };
 use eridiffusion_core::sampler::sdxl_sampler::build_time_ids;
+use flame_core::{serialization::save_file, DType, Shape, Tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -39,36 +39,53 @@ const CLIP_G_PAD_ID: i32 = 0;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] input_dir: PathBuf,
-    #[arg(long)] output_dir: PathBuf,
+    #[arg(long)]
+    input_dir: PathBuf,
+    #[arg(long)]
+    output_dir: PathBuf,
     /// SDXL VAE safetensors (e.g. `sdxl_vae.safetensors` or full SDXL ckpt).
-    #[arg(long)] vae_ckpt: PathBuf,
+    #[arg(long)]
+    vae_ckpt: PathBuf,
     /// CLIP-L weights (HF `text_encoder/`).
-    #[arg(long)] clip_l_ckpt: PathBuf,
+    #[arg(long)]
+    clip_l_ckpt: PathBuf,
     /// CLIP-G weights (HF `text_encoder_2/`).
-    #[arg(long)] clip_g_ckpt: PathBuf,
+    #[arg(long)]
+    clip_g_ckpt: PathBuf,
     /// CLIP-L tokenizer.json.
-    #[arg(long)] clip_l_tokenizer: PathBuf,
+    #[arg(long)]
+    clip_l_tokenizer: PathBuf,
     /// CLIP-G tokenizer.json (OpenCLIP bigG, same vocab as CLIP-L).
-    #[arg(long)] clip_g_tokenizer: PathBuf,
+    #[arg(long)]
+    clip_g_tokenizer: PathBuf,
     /// OT preset default 1024.
-    #[arg(long, default_value = "1024")] resolution: u32,
-    #[arg(long, default_value_t = true)] skip_existing: bool,
-    #[arg(long, default_value_t = 0)] max_samples: usize,
+    #[arg(long, default_value = "1024")]
+    resolution: u32,
+    #[arg(long, default_value_t = true)]
+    skip_existing: bool,
+    #[arg(long, default_value_t = 0)]
+    max_samples: usize,
     /// Image augmentations at prep time. All default-off → byte-identical
     /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
     /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
     /// seeds the per-sample RNG.
-    #[arg(long, default_value_t = false)] aug_flip: bool,
-    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
-    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
-    #[arg(long, default_value_t = 0)] aug_seed: u64,
+    #[arg(long, default_value_t = false)]
+    aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)]
+    aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)]
+    aug_contrast: f32,
+    #[arg(long, default_value_t = 0)]
+    aug_seed: u64,
 }
 
 fn load_one_or_dir(
-    path: &std::path::Path, device: &std::sync::Arc<flame_core::CudaDevice>,
+    path: &std::path::Path,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
 ) -> flame_core::Result<HashMap<String, Tensor>> {
-    if path.is_file() { return flame_core::serialization::load_file(path, device); }
+    if path.is_file() {
+        return flame_core::serialization::load_file(path, device);
+    }
     let mut all = HashMap::new();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
         .map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
@@ -87,7 +104,9 @@ fn load_one_or_dir(
 const CLIP_EOS_ID: i32 = 49407;
 
 fn tokenize(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Result<Vec<i32>> {
-    let enc = tok.encode(text, true).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let enc = tok
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
     // SDXL audit CRIT-2: HF CLIPTokenizer with `truncation=True, max_length=77`
     // guarantees `[BOS, ...75 content tokens..., EOS]`. The raw `tokenizers`
@@ -100,7 +119,9 @@ fn tokenize(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Res
         ids.truncate(CLIP_MAX_LEN - 1);
         ids.push(CLIP_EOS_ID);
     }
-    while ids.len() < CLIP_MAX_LEN { ids.push(pad_id); }
+    while ids.len() < CLIP_MAX_LEN {
+        ids.push(pad_id);
+    }
     Ok(ids)
 }
 
@@ -111,7 +132,9 @@ fn main() -> anyhow::Result<()> {
     // OOM-killing the box around sample 75 on 62 GB. Pool off → flat RSS.
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at this point.
-        unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
+        unsafe {
+            std::env::set_var("FLAME_ALLOC_POOL", "0");
+        }
     }
     env_logger::init();
     let args = Args::parse();
@@ -136,9 +159,11 @@ fn main() -> anyhow::Result<()> {
     //
     // TODO(flame-core): F32 conv path → drop the BF16 cast at line 200,
     // load VAE weights at F32, match OT bit-for-bit.
-    log::warn!("[VAE] running encode in BF16 (flame-core Conv2d limitation). \
+    log::warn!(
+        "[VAE] running encode in BF16 (flame-core Conv2d limitation). \
         Latents will diverge from OT F32 reference at ~0.5-1%. See \
-        prepare_sdxl.rs source for the TODO.");
+        prepare_sdxl.rs source for the TODO."
+    );
     let vae = SdxlVaeEncoder::from_safetensors(args.vae_ckpt.to_str().unwrap(), &device)?;
 
     log::info!("[2/4] Loading CLIP-L (768d, 12L, quick_gelu)...");
@@ -153,8 +178,11 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("clip_l tokenizer: {e}"))?;
     let tok_g = tokenizers::Tokenizer::from_file(&args.clip_g_tokenizer)
         .map_err(|e| anyhow::anyhow!("clip_g tokenizer: {e}"))?;
-    debug_assert_eq!(clip_g.pad_token_id(), CLIP_G_PAD_ID,
-        "CLIP-G pad id mismatch — expected 0 from HF tokenizer_2 config");
+    debug_assert_eq!(
+        clip_g.pad_token_id(),
+        CLIP_G_PAD_ID,
+        "CLIP-G pad id mismatch — expected 0 from HF tokenizer_2 config"
+    );
 
     log::info!("[4/4] Encoding samples at {}²...", args.resolution);
     let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -168,7 +196,9 @@ fn main() -> anyhow::Result<()> {
         }
     }
     pairs.sort();
-    if args.max_samples > 0 { pairs.truncate(args.max_samples); }
+    if args.max_samples > 0 {
+        pairs.truncate(args.max_samples);
+    }
     log::info!("Found {} image-caption pairs", pairs.len());
 
     let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
@@ -179,7 +209,10 @@ fn main() -> anyhow::Result<()> {
     if aug_cfg.is_active() {
         log::info!(
             "[image-aug] flip={} brightness={} contrast={} seed={}",
-            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+            aug_cfg.flip,
+            aug_cfg.brightness,
+            aug_cfg.contrast,
+            args.aug_seed
         );
     }
 
@@ -187,7 +220,9 @@ fn main() -> anyhow::Result<()> {
     for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
-        if args.skip_existing && out_path.exists() { continue; }
+        if args.skip_existing && out_path.exists() {
+            continue;
+        }
 
         // Image → VAE latent. Record the original (pre-resize) dimensions so
         // the trainer can pass true `add_time_ids`. The minimal port still
@@ -196,7 +231,11 @@ fn main() -> anyhow::Result<()> {
         let orig_img = image::open(img_path)?;
         let (orig_w, orig_h) = (orig_img.width(), orig_img.height());
         let img = orig_img
-            .resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3)
+            .resize_exact(
+                args.resolution,
+                args.resolution,
+                image::imageops::FilterType::Lanczos3,
+            )
             .to_rgb32f();
         let mut img = img;
         if aug_cfg.is_active() {
@@ -217,7 +256,9 @@ fn main() -> anyhow::Result<()> {
         let mut pixels = vec![0f32; 3 * hu * wu];
         for (x, y, p) in img.enumerate_pixels() {
             let (xu, yu) = (x as usize, y as usize);
-            for c in 0..3 { pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0; }
+            for c in 0..3 {
+                pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0;
+            }
         }
         let img_t = Tensor::from_vec(pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone())?
             .to_dtype(DType::BF16)?;
@@ -236,8 +277,8 @@ fn main() -> anyhow::Result<()> {
         let (clip_g_hidden, clip_g_pool) = clip_g.encode_sdxl(&ids_g)?;
 
         // Concat hidden along last dim → [1, 77, 2048]
-        let text_embedding = Tensor::cat(&[&clip_l_hidden, &clip_g_hidden], 2)?
-            .to_dtype(DType::BF16)?;
+        let text_embedding =
+            Tensor::cat(&[&clip_l_hidden, &clip_g_hidden], 2)?.to_dtype(DType::BF16)?;
 
         // SDXL audit H2: store raw CLIP-G pool [1, 1280] and raw 6-vector
         // `time_ids`; trainer rebuilds the 1536-dim sin embed and concats to

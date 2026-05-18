@@ -19,8 +19,8 @@ pub const PATCH_SIZE: usize = 2;
 /// mu(256) = 0.5  (512×512)
 /// mu(4096) = 1.15 (2048×2048)
 pub fn shift_mu_for_resolution(width: usize, height: usize) -> f32 {
-    let image_seq_len = (height / VAE_SPATIAL_SCALE / PATCH_SIZE)
-        * (width / VAE_SPATIAL_SCALE / PATCH_SIZE);
+    let image_seq_len =
+        (height / VAE_SPATIAL_SCALE / PATCH_SIZE) * (width / VAE_SPATIAL_SCALE / PATCH_SIZE);
     let t = ((image_seq_len as f32 - 256.0) / (4096.0 - 256.0)).clamp(0.0, 1.0);
     0.5 + t * (1.15 - 0.5)
 }
@@ -148,8 +148,12 @@ impl MultistepHistory {
         }
     }
 
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     pub fn push(&mut self, denoised: Tensor, lambda: f32) {
         if self.denoised.len() < self.capacity {
@@ -166,7 +170,9 @@ impl MultistepHistory {
     }
 
     pub fn get(&self, back: usize) -> Option<(&Tensor, f32)> {
-        if back >= self.len { return None; }
+        if back >= self.len {
+            return None;
+        }
         let idx = (self.head + self.capacity - back) % self.capacity;
         Some((&self.denoised[idx], self.lambdas[idx]))
     }
@@ -227,6 +233,6 @@ pub fn dpmpp_2m_step(
     let inv_2r = 0.5 / r;
 
     let c_d = -alpha_next * em1 * (1.0 + inv_2r);
-    let c_p =  alpha_next * em1 * inv_2r;
+    let c_p = alpha_next * em1 * inv_2r;
     lincomb3(x, sigma_ratio, denoised, c_d, denoised_prev, c_p)
 }

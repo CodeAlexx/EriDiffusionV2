@@ -1015,6 +1015,16 @@ fn main() -> anyhow::Result<()> {
     if std::env::var_os("FLAME_USE_STATIC_SLAB").is_none() {
         unsafe { std::env::set_var("FLAME_USE_STATIC_SLAB", "1"); }
     }
+    let profile_step = std::env::var("FLAME_PROFILE_STEP")
+        .ok()
+        .as_deref()
+        .map(|v| matches!(v, "1" | "true" | "TRUE"))
+        .unwrap_or(false)
+        || std::env::var("FLAME_KLEIN_PROFILE_STEP")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "1" | "true" | "TRUE"))
+            .unwrap_or(false);
 
     for step in start_step..args.steps {
         // ── R2b: per-step transient slab scope ───────────────────────────
@@ -1062,6 +1072,17 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("GPU health monitor triggered abort");
             }
         }
+
+            if profile_step {
+                let _ = device.synchronize();
+            }
+            let mut phase_start = std::time::Instant::now();
+            let mut data_prep_ms = 0.0_f64;
+            let mut forward_ms = 0.0_f64;
+            let mut loss_ms = 0.0_f64;
+            let mut backward_ms = 0.0_f64;
+            let mut grad_ms = 0.0_f64;
+            let mut optimizer_ms = 0.0_f64;
 
         // Phase 6: optional per-epoch cache reload. Default-off — when the
         // flag is `false` the `last_epoch` watcher fires zero times and the
@@ -1277,12 +1298,22 @@ fn main() -> anyhow::Result<()> {
             None
         };
 
+            if profile_step {
+                let _ = device.synchronize();
+                data_prep_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+                phase_start = std::time::Instant::now();
+            }
         let pred = model.forward_train(&noisy, &txt, &timestep, tread_step.as_ref())?;
         if pred.shape().dims() != target.shape().dims() {
             anyhow::bail!(
                 "predicted velocity shape {:?} != target {:?}",
                 pred.shape().dims(), target.shape().dims());
         }
+            if profile_step {
+                let _ = device.synchronize();
+                forward_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+                phase_start = std::time::Instant::now();
+            }
 
         // F32 mean MSE — matches OT default (loss_weight_fn=CONSTANT, mse_strength=1.0).
         // Phase 1: combined MSE+MAE+Huber loss + per-step loss weighting.
@@ -1328,6 +1359,11 @@ fn main() -> anyhow::Result<()> {
         )?;
         let loss_val = loss.to_vec()?[0];
         total_loss += loss_val;
+            if profile_step {
+                let _ = device.synchronize();
+                loss_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+                phase_start = std::time::Instant::now();
+            }
 
         // === OT_DEBUG_STATS-format per-step line (mirrors train_ernie + upstream Python patch) ===
         let dbg_on = dbg::enabled("OT_DEBUG_STATS");
@@ -1348,6 +1384,19 @@ fn main() -> anyhow::Result<()> {
         let forward_only_bench = std::env::var("FLAME_FORWARD_ONLY_BENCH").is_ok();
         if forward_only_bench {
             AutogradContext::clear();
+            if profile_step {
+                let _ = device.synchronize();
+                let clear_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+                log::info!(
+                    "[profile] step {} | data_prep={:.1}ms | forward={:.1}ms | loss={:.1}ms | clear={:.1}ms | total={:.1}ms | mode=fwd-only",
+                    step + 1,
+                    data_prep_ms,
+                    forward_ms,
+                    loss_ms,
+                    clear_ms,
+                    data_prep_ms + forward_ms + loss_ms + clear_ms
+                );
+            }
             eridiffusion_core::training::progress::log_step(
                 "Klein-fwd-only",
                 step, args.steps, dataset_len, args.batch_size.max(1),
@@ -1373,6 +1422,11 @@ fn main() -> anyhow::Result<()> {
         } else {
             loss.backward()?
         };
+            if profile_step {
+                let _ = device.synchronize();
+                backward_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+                phase_start = std::time::Instant::now();
+            }
 
         // clip_grad_norm = 1.0 (klein preset default; ERNIE memory: convergence killer
         // if omitted).
@@ -1467,6 +1521,11 @@ fn main() -> anyhow::Result<()> {
         if step < 5 || (step + 1) % 50 == 0 {
             log::debug!("grad_norm={:.4} (scale={:.4})", total_norm, scale);
         }
+            if profile_step {
+                let _ = device.synchronize();
+                grad_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+                phase_start = std::time::Instant::now();
+            }
 
         // Apply linear warmup → scheduled LR. Step 0 uses lr/warmup, ramps to
         // base_lr at step `warmup_steps - 1`. Then dispatches by
@@ -1494,7 +1553,28 @@ fn main() -> anyhow::Result<()> {
                     .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
             }
         }
+            if profile_step {
+                let _ = device.synchronize();
+                optimizer_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+                phase_start = std::time::Instant::now();
+            }
         AutogradContext::clear();
+            if profile_step {
+                let _ = device.synchronize();
+                let clear_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+                log::info!(
+                    "[profile] step {} | data_prep={:.1}ms | forward={:.1}ms | loss={:.1}ms | backward={:.1}ms | grad={:.1}ms | optimizer={:.1}ms | clear={:.1}ms | total={:.1}ms",
+                    step + 1,
+                    data_prep_ms,
+                    forward_ms,
+                    loss_ms,
+                    backward_ms,
+                    grad_ms,
+                    optimizer_ms,
+                    clear_ms,
+                    data_prep_ms + forward_ms + loss_ms + backward_ms + grad_ms + optimizer_ms + clear_ms
+                );
+            }
 
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
@@ -1596,7 +1676,11 @@ fn main() -> anyhow::Result<()> {
 
         // ── Periodic save + inline sample (every N steps) ───────────────
         let step_num = step + 1;
-        if periodic && step_num % args.sample_every == 0 && step_num < args.steps {
+        // Sample-at-start: fire on the first training step (step == 0,
+        // step_num == 1) so user can compare a near-pre-LoRA baseline
+        // against subsequent periodic samples. Otherwise the standard
+        // every-N-steps cadence.
+        if periodic && (step == 0 || step_num % args.sample_every == 0) && step_num < args.steps {
             // EMA swap: when `--ema --ema-validation-swap`, save and sample
             // see EMA-averaged weights. `backup` returned only in that case;
             // restored at the end of this block. Updates resume against the

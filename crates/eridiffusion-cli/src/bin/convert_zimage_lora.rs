@@ -100,36 +100,69 @@ fn main() -> anyhow::Result<()> {
         if matches!(format, ExternalFormat::DiffusersKohya) {
             for target in ["to_q", "to_k", "to_v"] {
                 convert_split_qkv_dk(
-                    &src, &mut out, layer, target,
-                    args.target_rank, &device,
-                    &mut total_modules, &mut padded_count,
+                    &src,
+                    &mut out,
+                    layer,
+                    target,
+                    args.target_rank,
+                    &device,
+                    &mut total_modules,
+                    &mut padded_count,
                 )?;
             }
             // attention.out (diffusers naming: to_out.0)
             convert_dk_module(
-                &src, &mut out, layer,
-                "attention.to_out.0", "attention.out",
-                args.target_rank, DIM, DIM,
-                &device, &mut total_modules, &mut padded_count,
+                &src,
+                &mut out,
+                layer,
+                "attention.to_out.0",
+                "attention.out",
+                args.target_rank,
+                DIM,
+                DIM,
+                &device,
+                &mut total_modules,
+                &mut padded_count,
             )?;
             // feed_forward.w1/w2/w3
             convert_dk_module(
-                &src, &mut out, layer,
-                "feed_forward.w1", "feed_forward.w1",
-                args.target_rank, DIM, MLP_HIDDEN,
-                &device, &mut total_modules, &mut padded_count,
+                &src,
+                &mut out,
+                layer,
+                "feed_forward.w1",
+                "feed_forward.w1",
+                args.target_rank,
+                DIM,
+                MLP_HIDDEN,
+                &device,
+                &mut total_modules,
+                &mut padded_count,
             )?;
             convert_dk_module(
-                &src, &mut out, layer,
-                "feed_forward.w2", "feed_forward.w2",
-                args.target_rank, MLP_HIDDEN, DIM,
-                &device, &mut total_modules, &mut padded_count,
+                &src,
+                &mut out,
+                layer,
+                "feed_forward.w2",
+                "feed_forward.w2",
+                args.target_rank,
+                MLP_HIDDEN,
+                DIM,
+                &device,
+                &mut total_modules,
+                &mut padded_count,
             )?;
             convert_dk_module(
-                &src, &mut out, layer,
-                "feed_forward.w3", "feed_forward.w3",
-                args.target_rank, DIM, MLP_HIDDEN,
-                &device, &mut total_modules, &mut padded_count,
+                &src,
+                &mut out,
+                layer,
+                "feed_forward.w3",
+                "feed_forward.w3",
+                args.target_rank,
+                DIM,
+                MLP_HIDDEN,
+                &device,
+                &mut total_modules,
+                &mut padded_count,
             )?;
             continue;
         }
@@ -165,9 +198,8 @@ fn main() -> anyhow::Result<()> {
                     // trainer's `scale_src * (B @ A)` produces the correct
                     // effective contribution. Avoids needing to plumb a
                     // separate alpha through the sample binary.
-                    let scaled_up_full = padded_up_full
-                        .to_dtype(DType::F32)?
-                        .mul_scalar(scale_src)?;
+                    let scaled_up_full =
+                        padded_up_full.to_dtype(DType::F32)?.mul_scalar(scale_src)?;
                     // Split fused up [3*DIM, target_rank] into 3 [DIM, target_rank].
                     let up_q = scaled_up_full.narrow(0, 0, DIM)?.contiguous()?;
                     let up_k = scaled_up_full.narrow(0, DIM, DIM)?.contiguous()?;
@@ -179,9 +211,7 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                     let down_f32 = padded_down.to_dtype(DType::F32)?;
-                    for (target, up_split) in
-                        [("to_q", up_q), ("to_k", up_k), ("to_v", up_v)]
-                    {
+                    for (target, up_split) in [("to_q", up_q), ("to_k", up_k), ("to_v", up_v)] {
                         let prefix = format!("layers.{layer}.attention.{target}");
                         out.insert(format!("{prefix}.lora_A"), down_f32.clone());
                         out.insert(format!("{prefix}.lora_B"), up_split);
@@ -216,19 +246,52 @@ fn main() -> anyhow::Result<()> {
 
         // feed_forward.w1/w2/w3.
         convert_full(
-            &src, &mut out, layer, "feed_forward_w1", "feed_forward.w1",
-            args.target_rank, DIM, MLP_HIDDEN, format, suffix_a, suffix_b,
-            &device, &mut total_modules, &mut padded_count,
+            &src,
+            &mut out,
+            layer,
+            "feed_forward_w1",
+            "feed_forward.w1",
+            args.target_rank,
+            DIM,
+            MLP_HIDDEN,
+            format,
+            suffix_a,
+            suffix_b,
+            &device,
+            &mut total_modules,
+            &mut padded_count,
         )?;
         convert_full(
-            &src, &mut out, layer, "feed_forward_w2", "feed_forward.w2",
-            args.target_rank, MLP_HIDDEN, DIM, format, suffix_a, suffix_b,
-            &device, &mut total_modules, &mut padded_count,
+            &src,
+            &mut out,
+            layer,
+            "feed_forward_w2",
+            "feed_forward.w2",
+            args.target_rank,
+            MLP_HIDDEN,
+            DIM,
+            format,
+            suffix_a,
+            suffix_b,
+            &device,
+            &mut total_modules,
+            &mut padded_count,
         )?;
         convert_full(
-            &src, &mut out, layer, "feed_forward_w3", "feed_forward.w3",
-            args.target_rank, DIM, MLP_HIDDEN, format, suffix_a, suffix_b,
-            &device, &mut total_modules, &mut padded_count,
+            &src,
+            &mut out,
+            layer,
+            "feed_forward_w3",
+            "feed_forward.w3",
+            args.target_rank,
+            DIM,
+            MLP_HIDDEN,
+            format,
+            suffix_a,
+            suffix_b,
+            &device,
+            &mut total_modules,
+            &mut padded_count,
         )?;
     }
 
@@ -346,9 +409,7 @@ fn convert_full(
     let padded_up = pad_cols(up, target_rank, device)?;
     // Pre-bake scale into lora_B so trainer's default scale=1.0 reproduces
     // the source LoRA's effective contribution.
-    let scaled_up = padded_up
-        .to_dtype(DType::F32)?
-        .mul_scalar(scale_src)?;
+    let scaled_up = padded_up.to_dtype(DType::F32)?.mul_scalar(scale_src)?;
     let prefix_dst = format!("layers.{layer}.{dst_suffix_dotted}");
     out.insert(
         format!("{prefix_dst}.lora_A"),
@@ -387,7 +448,10 @@ fn convert_split_qkv_dk(
     let padded_up = pad_cols(up, target_rank, device)?;
     let scaled_up = padded_up.to_dtype(DType::F32)?.mul_scalar(scale_src)?;
     let prefix_dst = format!("layers.{layer}.attention.{target}");
-    out.insert(format!("{prefix_dst}.lora_A"), padded_down.to_dtype(DType::F32)?);
+    out.insert(
+        format!("{prefix_dst}.lora_A"),
+        padded_down.to_dtype(DType::F32)?,
+    );
     out.insert(format!("{prefix_dst}.lora_B"), scaled_up);
     *count += 1;
     if rank < target_rank {
@@ -436,7 +500,10 @@ fn convert_dk_module(
     let padded_up = pad_cols(up, target_rank, device)?;
     let scaled_up = padded_up.to_dtype(DType::F32)?.mul_scalar(scale_src)?;
     let prefix_dst = format!("layers.{layer}.{dst_suffix}");
-    out.insert(format!("{prefix_dst}.lora_A"), padded_down.to_dtype(DType::F32)?);
+    out.insert(
+        format!("{prefix_dst}.lora_A"),
+        padded_down.to_dtype(DType::F32)?,
+    );
     out.insert(format!("{prefix_dst}.lora_B"), scaled_up);
     *count += 1;
     if rank < target_rank {
@@ -446,11 +513,7 @@ fn convert_dk_module(
 }
 
 /// Pad a tensor [r, c] with zeros along axis 0 to reach `target_rows`.
-fn pad_rows(
-    t: &Tensor,
-    target_rows: usize,
-    device: &Arc<CudaDevice>,
-) -> Result<Tensor> {
+fn pad_rows(t: &Tensor, target_rows: usize, device: &Arc<CudaDevice>) -> Result<Tensor> {
     let dims = t.shape().dims();
     let cur = dims[0];
     let cols = dims[1];
@@ -463,20 +526,12 @@ fn pad_rows(
         )));
     }
     let pad = target_rows - cur;
-    let zeros = Tensor::zeros_dtype(
-        Shape::from_dims(&[pad, cols]),
-        t.dtype(),
-        device.clone(),
-    )?;
+    let zeros = Tensor::zeros_dtype(Shape::from_dims(&[pad, cols]), t.dtype(), device.clone())?;
     Tensor::cat(&[t, &zeros], 0)
 }
 
 /// Pad a tensor [r, c] with zeros along axis 1 to reach `target_cols`.
-fn pad_cols(
-    t: &Tensor,
-    target_cols: usize,
-    device: &Arc<CudaDevice>,
-) -> Result<Tensor> {
+fn pad_cols(t: &Tensor, target_cols: usize, device: &Arc<CudaDevice>) -> Result<Tensor> {
     let dims = t.shape().dims();
     let rows = dims[0];
     let cur = dims[1];
@@ -489,10 +544,6 @@ fn pad_cols(
         )));
     }
     let pad = target_cols - cur;
-    let zeros = Tensor::zeros_dtype(
-        Shape::from_dims(&[rows, pad]),
-        t.dtype(),
-        device.clone(),
-    )?;
+    let zeros = Tensor::zeros_dtype(Shape::from_dims(&[rows, pad]), t.dtype(), device.clone())?;
     Tensor::cat(&[t, &zeros], 1)
 }

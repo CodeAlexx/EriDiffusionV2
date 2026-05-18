@@ -29,9 +29,6 @@
 //! as `train_klein`. Reference paper: <https://arxiv.org/abs/2311.12092>.
 
 use clap::Parser;
-use std::path::PathBuf;
-use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
-use flame_core::adam::AdamW;
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};
 use eridiffusion_core::debug as dbg;
 use eridiffusion_core::encoders::qwen3::Qwen3Encoder;
@@ -39,124 +36,172 @@ use eridiffusion_core::models::{klein::KleinModel, TrainableModel};
 use eridiffusion_core::sampler::klein_sampler;
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
-use eridiffusion_core::training::features::{
-    disk_check, multi_backend::MultiBackend,
-    noise_modifiers, sample_library::SampleLibrary, slider, tread, validation::ValidationLoop,
-};
 use eridiffusion_core::training::features::health::GpuHealthMonitor;
 use eridiffusion_core::training::features::lr_schedule;
 use eridiffusion_core::training::features::webhook::WebhookClient;
+use eridiffusion_core::training::features::{
+    disk_check, multi_backend::MultiBackend, noise_modifiers, sample_library::SampleLibrary,
+    slider, tread, validation::ValidationLoop,
+};
 use eridiffusion_core::training::training_features::OptimizerKind;
+use flame_core::adam::AdamW;
+use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
+use std::path::PathBuf;
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
 const LOGIT_NORMAL_BIAS: f32 = 0.0;
 const LOGIT_NORMAL_SCALE: f32 = 1.0;
-const TIMESTEP_SHIFT: f32 = 1.0;        // klein preset default
+const TIMESTEP_SHIFT: f32 = 1.0; // klein preset default
 const SEED: u64 = 42;
-const CLIP_GRAD_NORM: f32 = 1.0;        // klein preset default — essential for convergence
+const CLIP_GRAD_NORM: f32 = 1.0; // klein preset default — essential for convergence
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] config: PathBuf,
-    #[arg(long)] cache_dir: PathBuf,
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    cache_dir: PathBuf,
     /// Klein transformer safetensors path. Either a directory of shards or a
     /// single-file checkpoint (e.g. `flux-2-klein-base-4b.safetensors`).
-    #[arg(long)] transformer: PathBuf,
-    #[arg(long, default_value = "100")] steps: usize,
-    #[arg(long, default_value = "16")] rank: usize,
-    #[arg(long, default_value = "16.0")] lora_alpha: f64,
+    #[arg(long)]
+    transformer: PathBuf,
+    #[arg(long, default_value = "100")]
+    steps: usize,
+    #[arg(long, default_value = "16")]
+    rank: usize,
+    #[arg(long, default_value = "16.0")]
+    lora_alpha: f64,
     /// Klein 9B preset = 3e-5; 4B can usually take a touch higher.
-    #[arg(long, default_value = "3e-5")] lr: f32,
+    #[arg(long, default_value = "3e-5")]
+    lr: f32,
     /// Linear LR warmup steps. OT preset `klein9b_lora_boxjana.json` says 100.
     /// Must be > 0 to avoid contaminated AdamW moments at step 0.
-    #[arg(long, default_value = "100")] warmup_steps: usize,
+    #[arg(long, default_value = "100")]
+    warmup_steps: usize,
     /// Per-step batch size — N cached samples are loaded and stacked along
     /// dim 0 each step. upstream Python's klein9b preset uses batch=2; ED-v2
     /// previously silently used batch=1 by ignoring the config field.
-    #[arg(long, default_value = "1")] batch_size: usize,
+    #[arg(long, default_value = "1")]
+    batch_size: usize,
     /// Resume from a saved LoRA checkpoint — overwrites freshly-init zeros
     /// after model load. Use to continue training. Optimizer state NOT resumed.
-    #[arg(long, conflicts_with = "resume_full")] resume_lora: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_full")]
+    resume_lora: Option<PathBuf>,
     /// Full resume: LoRA weights + AdamW (m, v, t) + step counter. Refuses
     /// rank/alpha mismatch. `--steps N` is the TARGET total step.
-    #[arg(long, conflicts_with = "resume_lora")] resume_full: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_lora")]
+    resume_full: Option<PathBuf>,
     /// Periodic + final save mode. Default `full` (LoRA + AdamW + step) for
     /// resumable runs. `weights` writes legacy weights-only files.
-    #[arg(long, default_value = "full")] save_mode: String,
-    #[arg(long, default_value = "output")] output_dir: PathBuf,
+    #[arg(long, default_value = "full")]
+    save_mode: String,
+    #[arg(long, default_value = "output")]
+    output_dir: PathBuf,
     /// Per-block weight streaming via BlockOffloader. Mirrors `train_flux`.
     /// Klein 9B (~17.5 GB BF16) + forward/backward activations OOMs on 24 GB
     /// without this; Klein 4B fits resident. Default off so 4B users keep
     /// resident-fast path; pass `--offload` for 9B on 24 GB cards.
-    #[arg(long)] offload: bool,
+    #[arg(long)]
+    offload: bool,
 
     // ── Periodic save + sample (every N steps) ──────────────────────────
     /// Save a LoRA checkpoint AND render a sample image every N steps.
     /// `0` disables. Default 500 — matches user's iteration cadence.
-    #[arg(long, default_value = "500")] sample_every: usize,
+    #[arg(long, default_value = "500")]
+    sample_every: usize,
     /// Prompt for the periodic sample. Required if `--sample-every > 0`.
-    #[arg(long, default_value = "")] sample_prompt: String,
+    #[arg(long, default_value = "")]
+    sample_prompt: String,
     /// Negative / unconditional prompt for CFG.
-    #[arg(long, default_value = "")] sample_neg_prompt: String,
+    #[arg(long, default_value = "")]
+    sample_neg_prompt: String,
     /// Klein VAE safetensors. Required if `--sample-every > 0`.
-    #[arg(long)] sample_vae: Option<PathBuf>,
+    #[arg(long)]
+    sample_vae: Option<PathBuf>,
     /// Qwen3 weights (single file or sharded directory). Required if `--sample-every > 0`.
-    #[arg(long)] sample_qwen3: Option<PathBuf>,
+    #[arg(long)]
+    sample_qwen3: Option<PathBuf>,
     /// Qwen3 tokenizer.json. Required if `--sample-every > 0`.
-    #[arg(long)] sample_tokenizer: Option<PathBuf>,
+    #[arg(long)]
+    sample_tokenizer: Option<PathBuf>,
     /// Sample resolution. Default 1024² — gives the actual visual quality the
     /// model is targeted for. Klein 4B fits 1024² inference comfortably on
     /// 24 GB even with training state still resident (model ~8 GB + VAE 0.5 GB
     /// + sample intermediates 4-6 GB ≈ 14 GB peak; train intermediates are
     /// dropped under no_grad scope during the sample call).
-    #[arg(long, default_value = "1024")] sample_size: usize,
+    #[arg(long, default_value = "1024")]
+    sample_size: usize,
     /// Denoise steps for periodic sample. Klein is guidance-distilled-ish
     /// so default is short.
-    #[arg(long, default_value = "20")] sample_steps: usize,
+    #[arg(long, default_value = "20")]
+    sample_steps: usize,
     /// CFG scale for periodic sample. 1.0 = single forward (no CFG).
-    #[arg(long, default_value = "4.0")] sample_cfg: f32,
+    #[arg(long, default_value = "4.0")]
+    sample_cfg: f32,
     /// Fixed seed for periodic sample (so visual progression is comparable across steps).
-    #[arg(long, default_value = "42")] sample_seed: u64,
+    #[arg(long, default_value = "42")]
+    sample_seed: u64,
 
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
-    #[arg(long)] min_snr_gamma: Option<f32>,
-    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
-    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
-    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
-    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
-    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
-    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
-    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    #[arg(long)]
+    min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    caption_dropout_probability: f32,
+    #[arg(long, default_value_t = 1.0)]
+    noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)]
+    gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)]
+    huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lr_min_factor: f32,
+    #[arg(long)]
+    validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    validation_every_steps: u64,
+    #[arg(long, num_args = 0..)]
+    multi_backend_weights: Vec<f32>,
     /// Phase 2: N concept directories paired with `--multi-backend-weights`.
     /// When both have the same non-zero count, training samples are drawn
     /// across these dirs by weight instead of round-robin over `--cache-dir`.
-    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<PathBuf>,
+    #[arg(long, num_args = 0..)]
+    multi_backend_cache_dirs: Vec<PathBuf>,
     /// Phase 2: JSON file with N validation prompts × M seeds. When set the
     /// inline-sample step iterates over all (prompt, seed) pairs instead of
     /// the single `--sample-prompt` / `--sample-seed`.
-    #[arg(long)] validation_prompts_file: Option<PathBuf>,
+    #[arg(long)]
+    validation_prompts_file: Option<PathBuf>,
     /// Phase 2: log per-bucket sample counts at startup. Default on; pass
     /// `--no-bucket-report` style with `--bucket-report=false` to suppress.
-    #[arg(long, default_value_t = true)] bucket_report: bool,
-    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
-    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
-    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
-    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
-    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
+    #[arg(long, default_value_t = true)]
+    bucket_report: bool,
+    #[arg(long, default_value_t = 0.0)]
+    masked_loss_weight: f32,
+    #[arg(long, default_value_t = 1.0)]
+    ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)]
+    ema_power: f32,
+    #[arg(long, default_value_t = 0)]
+    ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)]
+    ema_min_decay: f32,
     /// Phase 3: swap EMA shadow weights into live params at sample/checkpoint
     /// time. Default false. No effect when EMA is not constructed.
-    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
-    #[arg(long)] tread_route_pattern: Option<String>,
+    #[arg(long, default_value_t = false)]
+    ema_validation_swap: bool,
+    #[arg(long)]
+    tread_route_pattern: Option<String>,
     /// Phase 4: TREAD token-keep ratio. `1.0` (default) = no routing,
     /// byte-identical to non-TREAD forward. Values in `(0, 1)` route a
     /// fraction of tokens. Phase 4 ships the CLI surface only; model
     /// integration (consuming `TreadStep` in `forward`) is Phase 4.5.
-    #[arg(long, default_value_t = 1.0)] tread_keep_ratio: f32,
+    #[arg(long, default_value_t = 1.0)]
+    tread_keep_ratio: f32,
     /// Optimizer family. Phase 1 wires the CLI flag; non-AdamW dispatch lands
     /// in Phase 5. Selecting a non-AdamW optimizer logs a warning and falls
     /// back to AdamW for now.
-    #[arg(long, default_value = "adamw")] optimizer: String,
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
 
     // ── Phase 6 multi-feature rollout ─────────────────────────────────────
     /// Per-backend repeat count (sample weight multiplier). Length must match
@@ -164,50 +209,61 @@ struct Args {
     /// proportional to `weights[i] * repeats[i]`. Default empty = identity
     /// (no repeat scaling). Common pattern: weight identical concepts equally
     /// but boost a small style backend with `repeats 1 1 5`.
-    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
+    #[arg(long, num_args = 0..)]
+    multi_backend_repeats: Vec<u32>,
     /// Phase 6 plumbing only — caption tag-shuffle is a Phase 7+ feature
     /// (cache stores encoded text). When set the trainer logs a warning and
     /// proceeds. See `caption_aug.rs` for the shuffle helper.
-    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
     /// Reload the cache_files list at every epoch boundary. Useful when a
     /// separate process is regenerating the cache mid-training. Default
     /// `false`: never reload (byte-identical to the prior commit when the
     /// cache directory is static).
-    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)]
+    cache_clear_each_epoch: bool,
     /// Phase 6 plumbing only — kept for symmetry with prepare_klein. Trainer
     /// reads pre-encoded latents; this flag is forwarded to the prep step in
     /// pipeline tooling and otherwise ignored at training time.
-    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
 
     // ── Phase 7 multi-feature rollout ─────────────────────────────────────
     /// Spawn a background NVML poller that aborts training on sustained
     /// over-temperature (≥90 °C for 30 s) or any uncorrected ECC error.
     /// Default off → no NVML init, no thread, byte-identical to Phase 6.
-    #[arg(long, default_value_t = false)] gpu_health_monitor: bool,
+    #[arg(long, default_value_t = false)]
+    gpu_health_monitor: bool,
     /// CUDA device index that the health monitor watches. Default 0.
-    #[arg(long, default_value_t = 0)] gpu_health_device: u32,
+    #[arg(long, default_value_t = 0)]
+    gpu_health_device: u32,
     /// Discord/Slack-compatible webhook URL. When set, posts JSON
     /// notifications at training start, each checkpoint save, completion,
     /// and on panic. Default unset → no notifications, no `ureq` calls.
-    #[arg(long)] webhook_url: Option<String>,
+    #[arg(long)]
+    webhook_url: Option<String>,
 
     // ── Slider-LoRA (concept slider) — REQUIRED for this binary ───────────
     /// Positive concept prompt — the direction the slider pushes toward at
     /// positive α. Encoded once at startup and reused every step.
-    #[arg(long)] slider_positive_prompt: String,
+    #[arg(long)]
+    slider_positive_prompt: String,
     /// Negative concept prompt — the direction the slider pushes away from at
     /// positive α. Encoded once at startup and reused every step.
-    #[arg(long)] slider_negative_prompt: String,
+    #[arg(long)]
+    slider_negative_prompt: String,
     /// Magnitude of the slider direction. Default 2.0 follows the original
     /// Concept Sliders paper. Larger values train a stronger slider but
     /// risk overshoot and instability; smaller values are subtler.
-    #[arg(long, default_value = "2.0")] slider_scale: f32,
+    #[arg(long, default_value = "2.0")]
+    slider_scale: f32,
 
     // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
     /// Route the backward pass through `AutogradContext::backward_v2`
     /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
-    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
 }
 
 /// LOGIT_NORMAL timestep sample. Returns continuous t in [0, 1000).
@@ -274,26 +330,28 @@ fn main() -> anyhow::Result<()> {
     config.ema_validation_swap = args.ema_validation_swap;
     config.tread_route_pattern = args.tread_route_pattern.clone();
     config.tread_keep_ratio = args.tread_keep_ratio;
-    let tread_ranges: Option<Vec<(usize, usize)>> = if config.tread_route_pattern.is_some()
-        && config.tread_keep_ratio < 1.0
-    {
-        let pat = config.tread_route_pattern.as_ref().unwrap();
-        let r = tread::TreadConfig::parse(pat)?;
-        if r.is_empty() {
-            log::warn!("[tread] route_pattern={:?} parsed to empty list — TREAD disabled", pat);
-            None
-        } else {
-            log::info!(
+    let tread_ranges: Option<Vec<(usize, usize)>> =
+        if config.tread_route_pattern.is_some() && config.tread_keep_ratio < 1.0 {
+            let pat = config.tread_route_pattern.as_ref().unwrap();
+            let r = tread::TreadConfig::parse(pat)?;
+            if r.is_empty() {
+                log::warn!(
+                    "[tread] route_pattern={:?} parsed to empty list — TREAD disabled",
+                    pat
+                );
+                None
+            } else {
+                log::info!(
                 "[tread] WIRED — route_pattern={:?} keep_ratio={} ({} range(s) over single blocks)",
                 pat,
                 config.tread_keep_ratio,
                 r.len()
             );
-            Some(r)
-        }
-    } else {
-        None
-    };
+                Some(r)
+            }
+        } else {
+            None
+        };
     config.validation_prompts_file = args.validation_prompts_file.clone();
 
     // ── Slider prompt encoding (REQUIRED) + periodic sample setup ────────
@@ -304,20 +362,32 @@ fn main() -> anyhow::Result<()> {
     // Qwen3 is dropped before DiT load.
     let periodic = args.sample_every > 0;
     if periodic {
-        let _ = args.sample_qwen3.as_ref()
+        let _ = args
+            .sample_qwen3
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-qwen3"))?;
-        let _ = args.sample_tokenizer.as_ref()
+        let _ = args
+            .sample_tokenizer
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-tokenizer"))?;
-        let _ = args.sample_vae.as_ref()
+        let _ = args
+            .sample_vae
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-vae"))?;
     }
     // Slider always requires Qwen3 + tokenizer (cache caption is ignored).
-    let qwen3_path = args.sample_qwen3.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--sample-qwen3 is required (slider needs Qwen3 to encode positive/negative prompts)"))?;
-    let tok_path = args.sample_tokenizer.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--sample-tokenizer is required (slider needs tokenizer.json)"))?;
+    let qwen3_path = args.sample_qwen3.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--sample-qwen3 is required (slider needs Qwen3 to encode positive/negative prompts)"
+        )
+    })?;
+    let tok_path = args.sample_tokenizer.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("--sample-tokenizer is required (slider needs tokenizer.json)")
+    })?;
 
-    log::info!("[slider-setup] loading Qwen3 + tokenizer to encode slider prompts (before DiT load)...");
+    log::info!(
+        "[slider-setup] loading Qwen3 + tokenizer to encode slider prompts (before DiT load)..."
+    );
     let qwen_w = klein_load_qwen3(qwen3_path, &device)?;
     let qcfg = Qwen3Encoder::config_from_weights(&qwen_w)?;
     let qwen = Qwen3Encoder::new(qwen_w, qcfg, device.clone());
@@ -327,11 +397,13 @@ fn main() -> anyhow::Result<()> {
     let slider_neg_emb = klein_encode_prompt(&qwen, &tok, &args.slider_negative_prompt)?;
     log::info!(
         "[slider-setup] positive=\"{}\" → {:?}",
-        args.slider_positive_prompt, slider_pos_emb.shape().dims()
+        args.slider_positive_prompt,
+        slider_pos_emb.shape().dims()
     );
     log::info!(
         "[slider-setup] negative=\"{}\" → {:?}",
-        args.slider_negative_prompt, slider_neg_emb.shape().dims()
+        args.slider_negative_prompt,
+        slider_neg_emb.shape().dims()
     );
     log::info!("[slider-setup] slider_scale={}", args.slider_scale);
 
@@ -339,7 +411,11 @@ fn main() -> anyhow::Result<()> {
         let vae_path = args.sample_vae.as_ref().unwrap().clone();
         let cap = klein_encode_prompt(&qwen, &tok, &args.sample_prompt)?;
         let unc = klein_encode_prompt(&qwen, &tok, &args.sample_neg_prompt)?;
-        log::info!("[sample-setup] cap={:?} uncond={:?}", cap.shape().dims(), unc.shape().dims());
+        log::info!(
+            "[sample-setup] cap={:?} uncond={:?}",
+            cap.shape().dims(),
+            unc.shape().dims()
+        );
         (Some(cap), Some(unc), Some(vae_path))
     } else {
         (None, None, None)
@@ -350,12 +426,19 @@ fn main() -> anyhow::Result<()> {
     log::info!("[slider-setup] Qwen3 dropped; DiT will load next.");
 
     let shards = collect_klein_shards(&args.transformer)?;
-    log::info!("Loading Klein transformer from {} shard(s) (rank={} alpha={})",
-        shards.len(), args.rank, args.lora_alpha);
+    log::info!(
+        "Loading Klein transformer from {} shard(s) (rank={} alpha={})",
+        shards.len(),
+        args.rank,
+        args.lora_alpha
+    );
     let mut model = KleinModel::load(&shards, &config, device.clone())?;
     if args.offload {
         model.enable_offload(shards.clone())?;
-        log::info!("  block-offload enabled — per-block streaming from {} shard(s)", shards.len());
+        log::info!(
+            "  block-offload enabled — per-block streaming from {} shard(s)",
+            shards.len()
+        );
     }
     let params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors", params.len());
@@ -389,7 +472,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(resume_path) = args.resume_lora.as_ref() {
-        log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
+        log::info!(
+            "Resuming LoRA weights only (no optimizer state) from {}",
+            resume_path.display()
+        );
         model.load_weights(&resume_path.to_string_lossy())?;
     }
 
@@ -400,10 +486,19 @@ fn main() -> anyhow::Result<()> {
         let loaded = checkpoint::load_full(resume_path, &device)?;
         let named = model.named_parameters();
         checkpoint::apply_lora_weights(&loaded, &named)?;
-        checkpoint::apply_to_optimizer(&loaded, &mut opt, &named, args.rank, args.lora_alpha as f32)?;
+        checkpoint::apply_to_optimizer(
+            &loaded,
+            &mut opt,
+            &named,
+            args.rank,
+            args.lora_alpha as f32,
+        )?;
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
-            log::warn!("Resumed step ({start_step}) >= --steps ({}) — nothing to do.", args.steps);
+            log::warn!(
+                "Resumed step ({start_step}) >= --steps ({}) — nothing to do.",
+                args.steps
+            );
             return Ok(());
         }
         log::info!("Continuing from step {start_step}/{}", args.steps);
@@ -442,10 +537,7 @@ fn main() -> anyhow::Result<()> {
                     args.multi_backend_cache_dirs.len()
                 );
             }
-            log::info!(
-                "[multi-backend-repeats] {:?}",
-                args.multi_backend_repeats
-            );
+            log::info!("[multi-backend-repeats] {:?}", args.multi_backend_repeats);
             MultiBackend::new_with_repeats(
                 &args.multi_backend_cache_dirs,
                 &args.multi_backend_weights,
@@ -484,7 +576,9 @@ fn main() -> anyhow::Result<()> {
         log::info!("[cache-invalidate] flag noted — trainer reads pre-encoded latents; this is consumed at prep-time.");
     }
     if args.cache_clear_each_epoch {
-        log::info!("[cache-clear-each-epoch] enabled — cache_files will reload at each epoch boundary");
+        log::info!(
+            "[cache-clear-each-epoch] enabled — cache_files will reload at each epoch boundary"
+        );
     }
 
     let mut cache_files: Vec<PathBuf> = std::fs::read_dir(&args.cache_dir)?
@@ -536,9 +630,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Phase 2: validation harness — held-out cache + cadence. None at default.
-    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
-        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
-    {
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) = (
+        args.validation_dataset_dir.as_ref(),
+        args.validation_every_steps,
+    ) {
         if n > 0 {
             let v = ValidationLoop::new(dir, n)?;
             log::info!(
@@ -557,17 +652,18 @@ fn main() -> anyhow::Result<()> {
     // Phase 2: optional sample-prompt library. When None, the trainer falls
     // back to the single `--sample-prompt` / `--sample-seed` path that's been
     // running since Phase 1.
-    let sample_library: Option<SampleLibrary> = if let Some(p) = args.validation_prompts_file.as_ref() {
-        let lib = SampleLibrary::from_file(p)?;
-        log::info!(
-            "[sample-library] loaded {} prompt(s) from {}",
-            lib.len(),
-            p.display()
-        );
-        Some(lib)
-    } else {
-        None
-    };
+    let sample_library: Option<SampleLibrary> =
+        if let Some(p) = args.validation_prompts_file.as_ref() {
+            let lib = SampleLibrary::from_file(p)?;
+            log::info!(
+                "[sample-library] loaded {} prompt(s) from {}",
+                lib.len(),
+                p.display()
+            );
+            Some(lib)
+        } else {
+            None
+        };
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
@@ -581,8 +677,14 @@ fn main() -> anyhow::Result<()> {
     let board = BoardWriter::open(
         &args.output_dir,
         BoardWriter::new_session_id(),
-        if start_step > 0 { Some(start_step as u64) } else { None },
-    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+        if start_step > 0 {
+            Some(start_step as u64)
+        } else {
+            None
+        },
+    )
+    .map_err(|e| log::warn!("board.db open failed: {e}"))
+    .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
     }
@@ -610,7 +712,10 @@ fn main() -> anyhow::Result<()> {
 
     // Phase 7: optional webhook client. `Option::None` → never constructed,
     // never POSTs, no `ureq` traffic.
-    let webhook = args.webhook_url.as_ref().map(|u| WebhookClient::new(u.clone()));
+    let webhook = args
+        .webhook_url
+        .as_ref()
+        .map(|u| WebhookClient::new(u.clone()));
     if let Some(ref w) = webhook {
         w.send(&format!(
             "Training started: {} steps, batch={}, output={}",
@@ -703,11 +808,15 @@ fn main() -> anyhow::Result<()> {
                 cache_files[(step * bs + b) % cache_files.len()].clone()
             };
             let sample = flame_core::serialization::load_file(&cache_path, &device)?;
-            let l = sample.get("latent")
+            let l = sample
+                .get("latent")
                 .ok_or_else(|| anyhow::anyhow!("cache {} missing 'latent'", cache_path.display()))?
                 .to_dtype(DType::BF16)?;
-            let t = sample.get("text_embedding")
-                .ok_or_else(|| anyhow::anyhow!("cache {} missing 'text_embedding'", cache_path.display()))?
+            let t = sample
+                .get("text_embedding")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cache {} missing 'text_embedding'", cache_path.display())
+                })?
                 .to_dtype(DType::BF16)?;
             // masked_loss is unused in slider mode (no noise-vs-clean target).
             let _ = config.masked_loss_weight;
@@ -781,7 +890,8 @@ fn main() -> anyhow::Result<()> {
             &mut rng,
         )?;
         let noisy = if bs == 1 {
-            perturbed_noise.mul_scalar(sigma_per_b[0])?
+            perturbed_noise
+                .mul_scalar(sigma_per_b[0])?
                 .add(&latent.mul_scalar(1.0 - sigma_per_b[0])?)?
         } else {
             // Per-element scaling. Slice batch dim, scale each, re-stack.
@@ -811,9 +921,12 @@ fn main() -> anyhow::Result<()> {
         if step == 0 {
             log::info!(
                 "step 0 | batch={} latent={:?} pos_txt={:?} neg_txt={:?} sigma[0]={:.4} (idx={})",
-                bs, latent.shape().dims(),
-                pos_txt.shape().dims(), neg_txt.shape().dims(),
-                sigma, sigma_idx
+                bs,
+                latent.shape().dims(),
+                pos_txt.shape().dims(),
+                neg_txt.shape().dims(),
+                sigma,
+                sigma_idx
             );
         }
 
@@ -912,16 +1025,20 @@ fn main() -> anyhow::Result<()> {
         // which keeps the L2 reduction on device and does ONE D2H sync at the end
         // for the host-side scale. For Klein 9B LoRA (~200 LoRA tensors) that's a
         // 200× reduction in sync count.
-        let grad_refs: Vec<&flame_core::Tensor> = params
-            .iter()
-            .filter_map(|p| grads.get(p.id()))
-            .collect();
-        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
-            .item()? as f32;
+        let grad_refs: Vec<&flame_core::Tensor> =
+            params.iter().filter_map(|p| grads.get(p.id())).collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
         if dbg_on {
-            eprintln!("[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}", step, total_norm);
+            eprintln!(
+                "[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}",
+                step, total_norm
+            );
         }
-        let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
+        let scale = if total_norm > CLIP_GRAD_NORM {
+            CLIP_GRAD_NORM / total_norm
+        } else {
+            1.0
+        };
         for param in &params {
             if let Some(g) = grads.get(param.id()) {
                 let g_scaled = if scale < 1.0 {
@@ -961,8 +1078,15 @@ fn main() -> anyhow::Result<()> {
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
             "Klein-slider-lora",
-            step, args.steps, dataset_len, args.batch_size.max(1),
-            loss_val, total_norm, cur_lr, t_start, board.as_ref(),
+            step,
+            args.steps,
+            dataset_len,
+            args.batch_size.max(1),
+            loss_val,
+            total_norm,
+            cur_lr,
+            t_start,
+            board.as_ref(),
         );
 
         // Validation pass is disabled in slider mode — the held-out cache
@@ -974,24 +1098,28 @@ fn main() -> anyhow::Result<()> {
         // ── Periodic save + inline sample (every N steps) ───────────────
         let step_num = step + 1;
         if periodic && step_num % args.sample_every == 0 && step_num < args.steps {
-            let mid_ckpt = args.output_dir.join(format!("klein_lora_step{step_num}.safetensors"));
+            let mid_ckpt = args
+                .output_dir
+                .join(format!("klein_lora_step{step_num}.safetensors"));
             // Phase 7: disk-space pre-check. 2 GB threshold covers Klein 9B
             // LoRA full save (~520 MB) + safety margin. On insufficient space
             // we LOG and SKIP the save (a partial-write checkpoint is worse
             // than no checkpoint).
             let mut skip_save = false;
-            if let Err(e) = disk_check::check_free_space(
-                &args.output_dir,
-                2 * 1024 * 1024 * 1024,
-            ) {
+            if let Err(e) = disk_check::check_free_space(&args.output_dir, 2 * 1024 * 1024 * 1024) {
                 log::warn!("[disk-check step {step_num}] {e} — skipping mid-save");
                 skip_save = true;
             }
             if !skip_save {
                 if save_mode_full {
                     let header = CkptHeader::from_adamw(
-                        "train_klein", step_num as u64, &opt,
-                        args.rank, args.lora_alpha as f32, SEED, String::new(),
+                        "train_klein",
+                        step_num as u64,
+                        &opt,
+                        args.rank,
+                        args.lora_alpha as f32,
+                        SEED,
+                        String::new(),
                     );
                     let named = model.named_parameters();
                     if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, &opt, &header) {
@@ -1012,7 +1140,11 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     0.0
                 };
-                let suffix = if skip_save { " (save SKIPPED — low disk)" } else { "" };
+                let suffix = if skip_save {
+                    " (save SKIPPED — low disk)"
+                } else {
+                    ""
+                };
                 w.send(&format!(
                     "Step {}/{}: avg loss {:.4}{}",
                     step_num, args.steps, avg_so_far, suffix
@@ -1064,12 +1196,23 @@ fn main() -> anyhow::Result<()> {
                 let sample_out = if seeds_to_render.len() == 1 {
                     args.output_dir.join(format!("sample_step{step_num}.png"))
                 } else {
-                    args.output_dir.join(format!("sample_step{step_num}_seed{si}.png"))
+                    args.output_dir
+                        .join(format!("sample_step{step_num}_seed{si}.png"))
                 };
-                log::info!("[sample step={step_num} seed={seed}] → {}", sample_out.display());
+                log::info!(
+                    "[sample step={step_num} seed={seed}] → {}",
+                    sample_out.display()
+                );
                 if let Err(e) = klein_inline_sample(
-                    &mut model, cap, unc, vae_path, &sample_out,
-                    args.sample_size, args.sample_steps, args.sample_cfg, *seed,
+                    &mut model,
+                    cap,
+                    unc,
+                    vae_path,
+                    &sample_out,
+                    args.sample_size,
+                    args.sample_steps,
+                    args.sample_cfg,
+                    *seed,
                     &device,
                 ) {
                     log::warn!("[sample step={step_num} seed={seed}] failed: {e}");
@@ -1079,26 +1222,40 @@ fn main() -> anyhow::Result<()> {
     }
 
     let trained = args.steps - start_step;
-    let avg_loss = if trained > 0 { total_loss / trained as f32 } else { 0.0 };
+    let avg_loss = if trained > 0 {
+        total_loss / trained as f32
+    } else {
+        0.0
+    };
     let wall_time = t_start.elapsed().as_secs_f64();
-    log::info!("Training complete: {trained} new steps (total={}), avg loss={:.4}", args.steps, avg_loss);
-    if let Some(b) = &board { b.set_status("completed"); }
+    log::info!(
+        "Training complete: {trained} new steps (total={}), avg loss={:.4}",
+        args.steps,
+        avg_loss
+    );
+    if let Some(b) = &board {
+        b.set_status("completed");
+    }
 
-    let ckpt = args.output_dir.join(format!("klein_lora_{}steps.safetensors", args.steps));
+    let ckpt = args
+        .output_dir
+        .join(format!("klein_lora_{}steps.safetensors", args.steps));
     // Phase 7: final-checkpoint disk-space pre-check. Skip + log on shortage.
     let mut final_skip_save = false;
-    if let Err(e) = disk_check::check_free_space(
-        &args.output_dir,
-        2 * 1024 * 1024 * 1024,
-    ) {
+    if let Err(e) = disk_check::check_free_space(&args.output_dir, 2 * 1024 * 1024 * 1024) {
         log::warn!("[disk-check final] {e} — skipping final save");
         final_skip_save = true;
     }
     if !final_skip_save {
         if save_mode_full {
             let header = CkptHeader::from_adamw(
-                "train_klein", args.steps as u64, &opt,
-                args.rank, args.lora_alpha as f32, SEED, String::new(),
+                "train_klein",
+                args.steps as u64,
+                &opt,
+                args.rank,
+                args.lora_alpha as f32,
+                SEED,
+                String::new(),
             );
             let named = model.named_parameters();
             if let Err(e) = checkpoint::save_full(&ckpt, &named, &opt, &header) {
@@ -1119,7 +1276,11 @@ fn main() -> anyhow::Result<()> {
             args.steps,
             avg_loss,
             wall_time,
-            if final_skip_save { " (final save SKIPPED — low disk)" } else { "" }
+            if final_skip_save {
+                " (final save SKIPPED — low disk)"
+            } else {
+                ""
+            }
         ));
     }
 
@@ -1138,11 +1299,24 @@ fn main() -> anyhow::Result<()> {
         let cap = sample_cap.as_ref().unwrap();
         let unc = sample_uncond.as_ref().unwrap();
         let vae_path = sample_vae_path.as_ref().unwrap();
-        let sample_out = args.output_dir.join(format!("sample_step{}.png", args.steps));
-        log::info!("[sample step={} FINAL] → {}", args.steps, sample_out.display());
+        let sample_out = args
+            .output_dir
+            .join(format!("sample_step{}.png", args.steps));
+        log::info!(
+            "[sample step={} FINAL] → {}",
+            args.steps,
+            sample_out.display()
+        );
         if let Err(e) = klein_inline_sample(
-            &mut model, cap, unc, vae_path, &sample_out,
-            args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed,
+            &mut model,
+            cap,
+            unc,
+            vae_path,
+            &sample_out,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            args.sample_seed,
             &device,
         ) {
             log::warn!("[sample final] failed: {e}");
@@ -1182,7 +1356,10 @@ fn write_iteration_tracker(
         "last_avg_loss": last_avg_loss,
         "last_loss": last_loss,
     });
-    if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap_or_default()) {
+    if let Err(e) = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
+    ) {
         log::warn!("[iteration-tracker] write {}: {e}", path.display());
     }
 }
@@ -1234,8 +1411,8 @@ fn klein_inline_sample(
     flame_core::rng::set_seed(seed)
         .map_err(|e| anyhow::anyhow!("flame_core::rng::set_seed: {e}"))?;
     let latent_shape = Shape::from_dims(&[1, 128, h_lat, w_lat]);
-    let mut latent = Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
+    let mut latent =
+        Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?.to_dtype(DType::BF16)?;
 
     for step in 0..steps {
         let sigma = timesteps[step];
@@ -1258,7 +1435,11 @@ fn klein_inline_sample(
 
     let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
     let dims = img.shape().dims();
-    let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
+    let (c, h, w) = if dims.len() == 4 {
+        (dims[1], dims[2], dims[3])
+    } else {
+        (3, dims[0], dims[1])
+    };
     let mut buf = vec![0u8; h * w * 3];
     for y in 0..h {
         for x in 0..w {
@@ -1280,7 +1461,8 @@ fn klein_encode_prompt(
     prompt: &str,
 ) -> anyhow::Result<Tensor> {
     let wrapped = format!("{KLEIN_TEMPLATE_PRE}{}{KLEIN_TEMPLATE_POST}", prompt.trim());
-    let enc = tok.encode(wrapped.as_str(), false)
+    let enc = tok
+        .encode(wrapped.as_str(), false)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
     ids.resize(KLEIN_TXT_PAD_LEN, KLEIN_PAD_TOKEN_ID);

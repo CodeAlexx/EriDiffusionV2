@@ -57,7 +57,8 @@ impl SdxlVaeEncoder {
     /// Encode `[B, 3, H, W]` pixels in `[-1, 1]` → `[B, 4, H/8, W/8]` scaled latent.
     /// Matches the SDXL `latent = (z_mean - shift) * scale` convention.
     pub fn encode(&self, image: &Tensor) -> Result<Tensor> {
-        self.inner.encode_scaled(image, SDXL_VAE_SCALE, SDXL_VAE_SHIFT)
+        self.inner
+            .encode_scaled(image, SDXL_VAE_SCALE, SDXL_VAE_SHIFT)
     }
 }
 
@@ -131,7 +132,8 @@ impl ResBlock {
         device: &Arc<CudaDevice>,
     ) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
         let mut conv1 = Conv2d::new_with_bias(in_ch, out_ch, 3, 1, 1, device.clone(), true)?;
         conv1.copy_weight_from(get(&format!("{prefix}.conv1.weight"))?)?;
@@ -179,16 +181,21 @@ impl ResBlock {
 struct AttnBlock {
     norm_w: Tensor,
     norm_b: Tensor,
-    q_w: Tensor, q_b: Tensor,
-    k_w: Tensor, k_b: Tensor,
-    v_w: Tensor, v_b: Tensor,
-    proj_out_w: Tensor, proj_out_b: Tensor,
+    q_w: Tensor,
+    q_b: Tensor,
+    k_w: Tensor,
+    k_b: Tensor,
+    v_w: Tensor,
+    v_b: Tensor,
+    proj_out_w: Tensor,
+    proj_out_b: Tensor,
 }
 
 impl AttnBlock {
     fn from_weights_ldm(w: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
         Ok(Self {
             norm_w: get(&format!("{prefix}.norm.weight"))?.clone_result()?,
@@ -213,7 +220,9 @@ impl AttnBlock {
         let q = linear_3d(&h_flat, &self.q_w, &self.q_b)?;
         let k = linear_3d(&h_flat, &self.k_w, &self.k_b)?;
         let v = linear_3d(&h_flat, &self.v_w, &self.v_b)?;
-        let q = q.unsqueeze(1)?; let k = k.unsqueeze(1)?; let v = v.unsqueeze(1)?;
+        let q = q.unsqueeze(1)?;
+        let k = k.unsqueeze(1)?;
+        let v = v.unsqueeze(1)?;
 
         // Tiled SDPA — single-head head_dim=512 falls back to the materialized
         // path (head_dim 64/96/128 only hit flash). Without tiling, an
@@ -243,16 +252,35 @@ impl AttnBlock {
 
 // --- Mid + Up blocks ------------------------------------------------------
 
-struct MidBlock { resnet0: ResBlock, attn: AttnBlock, resnet1: ResBlock }
+struct MidBlock {
+    resnet0: ResBlock,
+    attn: AttnBlock,
+    resnet1: ResBlock,
+}
 
 impl MidBlock {
     fn from_weights(
-        w: &HashMap<String, Tensor>, prefix: &str, channels: usize, device: &Arc<CudaDevice>,
+        w: &HashMap<String, Tensor>,
+        prefix: &str,
+        channels: usize,
+        device: &Arc<CudaDevice>,
     ) -> Result<Self> {
         Ok(Self {
-            resnet0: ResBlock::from_weights(w, &format!("{prefix}.block_1"), channels, channels, device)?,
+            resnet0: ResBlock::from_weights(
+                w,
+                &format!("{prefix}.block_1"),
+                channels,
+                channels,
+                device,
+            )?,
             attn: AttnBlock::from_weights_ldm(w, &format!("{prefix}.attn_1"))?,
-            resnet1: ResBlock::from_weights(w, &format!("{prefix}.block_2"), channels, channels, device)?,
+            resnet1: ResBlock::from_weights(
+                w,
+                &format!("{prefix}.block_2"),
+                channels,
+                channels,
+                device,
+            )?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -262,20 +290,35 @@ impl MidBlock {
     }
 }
 
-struct UpBlock { resnets: Vec<ResBlock>, upsample_conv: Option<Conv2d> }
+struct UpBlock {
+    resnets: Vec<ResBlock>,
+    upsample_conv: Option<Conv2d>,
+}
 
 impl UpBlock {
     fn from_weights(
-        w: &HashMap<String, Tensor>, prefix: &str, in_ch: usize, out_ch: usize,
-        num_resnets: usize, has_upsample: bool, device: &Arc<CudaDevice>,
+        w: &HashMap<String, Tensor>,
+        prefix: &str,
+        in_ch: usize,
+        out_ch: usize,
+        num_resnets: usize,
+        has_upsample: bool,
+        device: &Arc<CudaDevice>,
     ) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
         let mut resnets = Vec::new();
         let mut ch = in_ch;
         for m in 0..num_resnets {
-            resnets.push(ResBlock::from_weights(w, &format!("{prefix}.block.{m}"), ch, out_ch, device)?);
+            resnets.push(ResBlock::from_weights(
+                w,
+                &format!("{prefix}.block.{m}"),
+                ch,
+                out_ch,
+                device,
+            )?);
             ch = out_ch;
         }
         let upsample_conv = if has_upsample {
@@ -283,12 +326,19 @@ impl UpBlock {
             conv.copy_weight_from(get(&format!("{prefix}.upsample.conv.weight"))?)?;
             conv.copy_bias_from(get(&format!("{prefix}.upsample.conv.bias"))?)?;
             Some(conv)
-        } else { None };
-        Ok(Self { resnets, upsample_conv })
+        } else {
+            None
+        };
+        Ok(Self {
+            resnets,
+            upsample_conv,
+        })
     }
     fn forward(&self, x: &Tensor, kernels: &CudaKernels) -> Result<Tensor> {
         let mut x = x.clone_result()?;
-        for r in &self.resnets { x = r.forward(&x)?; }
+        for r in &self.resnets {
+            x = r.forward(&x)?;
+        }
         if let Some(ref conv) = self.upsample_conv {
             let dims = x.shape().dims();
             let h_out = dims[2] * 2;
@@ -303,10 +353,16 @@ impl UpBlock {
 // --- Diffusers→LDM key remap (so SDXL VAEs in either format load) --------
 
 fn remap_diffusers_to_ldm(w: HashMap<String, Tensor>) -> HashMap<String, Tensor> {
-    let is_diffusers = w.keys().any(|k| k.contains("mid_block") || k.contains("up_blocks"));
-    if !is_diffusers { return w; }
+    let is_diffusers = w
+        .keys()
+        .any(|k| k.contains("mid_block") || k.contains("up_blocks"));
+    if !is_diffusers {
+        return w;
+    }
     let mut out = HashMap::with_capacity(w.len());
-    for (k, v) in w { out.insert(remap_one(&k), v); }
+    for (k, v) in w {
+        out.insert(remap_one(&k), v);
+    }
     out
 }
 
@@ -319,7 +375,7 @@ fn remap_one(key: &str) -> String {
         let rest = &k["decoder.mid_block.resnets.".len()..];
         if let Some(d) = rest.find('.') {
             let idx: usize = rest[..d].parse().unwrap_or(0);
-            let suffix = &rest[d+1..];
+            let suffix = &rest[d + 1..];
             return format!("decoder.mid.block_{}.{suffix}", idx + 1);
         }
     }
@@ -343,12 +399,12 @@ fn remap_one(key: &str) -> String {
         if let Some(d) = rest.find('.') {
             let diff_idx: usize = rest[..d].parse().unwrap_or(0);
             let ldm_idx = 3 - diff_idx;
-            let inner = &rest[d+1..];
+            let inner = &rest[d + 1..];
             if inner.starts_with("resnets.") {
                 let rr = &inner["resnets.".len()..];
                 if let Some(d2) = rr.find('.') {
                     let ridx = &rr[..d2];
-                    let suf = &rr[d2+1..];
+                    let suf = &rr[d2 + 1..];
                     let suf = suf.replace("conv_shortcut.", "nin_shortcut.");
                     return format!("decoder.up.{ldm_idx}.block.{ridx}.{suf}");
                 }
@@ -391,7 +447,11 @@ impl SdxlVaeDecoder {
         let mut w = HashMap::with_capacity(raw.len());
         for (key, val) in raw {
             let k = key.strip_prefix(fsm).unwrap_or(&key).to_string();
-            let val = if val.dtype() == DType::BF16 { val } else { val.to_dtype(DType::BF16)? };
+            let val = if val.dtype() == DType::BF16 {
+                val
+            } else {
+                val.to_dtype(DType::BF16)?
+            };
             w.insert(k, val);
         }
         let w = remap_diffusers_to_ldm(w);
@@ -400,7 +460,8 @@ impl SdxlVaeDecoder {
 
     pub fn from_weights(w: HashMap<String, Tensor>, device: &Arc<CudaDevice>) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         let ch: usize = 128;
@@ -411,14 +472,23 @@ impl SdxlVaeDecoder {
         // post_quant_conv (SDXL has it; Z-Image-style VAEs do not).
         let post_quant_conv = if w.contains_key("post_quant_conv.weight") {
             let mut c = Conv2d::new_with_bias(
-                SDXL_LATENT_CHANNELS, SDXL_LATENT_CHANNELS, 1, 1, 0, device.clone(), true,
+                SDXL_LATENT_CHANNELS,
+                SDXL_LATENT_CHANNELS,
+                1,
+                1,
+                0,
+                device.clone(),
+                true,
             )?;
             c.copy_weight_from(get("post_quant_conv.weight")?)?;
             c.copy_bias_from(get("post_quant_conv.bias")?)?;
             Some(c)
-        } else { None };
+        } else {
+            None
+        };
 
-        let mut conv_in = Conv2d::new_with_bias(SDXL_LATENT_CHANNELS, top_ch, 3, 1, 1, device.clone(), true)?;
+        let mut conv_in =
+            Conv2d::new_with_bias(SDXL_LATENT_CHANNELS, top_ch, 3, 1, 1, device.clone(), true)?;
         conv_in.copy_weight_from(get("decoder.conv_in.weight")?)?;
         conv_in.copy_bias_from(get("decoder.conv_in.bias")?)?;
 
@@ -430,7 +500,13 @@ impl SdxlVaeDecoder {
             let out_ch = ch * ch_mult[ldm_idx];
             let has_up = ldm_idx > 0;
             up_blocks.push(UpBlock::from_weights(
-                &w, &format!("decoder.up.{ldm_idx}"), prev_ch, out_ch, num_resnets, has_up, device,
+                &w,
+                &format!("decoder.up.{ldm_idx}"),
+                prev_ch,
+                out_ch,
+                num_resnets,
+                has_up,
+                device,
             )?);
             prev_ch = out_ch;
         }
@@ -455,7 +531,9 @@ impl SdxlVaeDecoder {
     /// Undoes the `(z - shift) * scale` encode normalization first.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
         // Undo SDXL latent normalization: z = z / scale + shift
-        let z = z.mul_scalar(1.0 / SDXL_VAE_SCALE)?.add_scalar(SDXL_VAE_SHIFT)?;
+        let z = z
+            .mul_scalar(1.0 / SDXL_VAE_SCALE)?
+            .add_scalar(SDXL_VAE_SHIFT)?;
         let z = if let Some(ref pqc) = self.post_quant_conv {
             pqc.forward(&z)?
         } else {

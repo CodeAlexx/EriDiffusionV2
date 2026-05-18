@@ -157,7 +157,12 @@ pub fn load_full(path: &Path, device: &Arc<CudaDevice>) -> Result<LoadedCkpt> {
             lora.insert(key, t);
         }
     }
-    Ok(LoadedCkpt { header, lora_tensors: lora, opt_m, opt_v })
+    Ok(LoadedCkpt {
+        header,
+        lora_tensors: lora,
+        opt_m,
+        opt_v,
+    })
 }
 
 /// Apply a loaded checkpoint to live state.
@@ -198,14 +203,16 @@ pub fn apply_to_optimizer(
     if (live_lr - loaded.header.lr).abs() > 1e-9 {
         log::warn!(
             "[resume] LR differs: ckpt={} live={} (live wins; ckpt LR is informational)",
-            loaded.header.lr, live_lr
+            loaded.header.lr,
+            live_lr
         );
     }
     let live_wd = optimizer.weight_decay();
     if (live_wd - loaded.header.weight_decay).abs() > 1e-9 {
         log::warn!(
             "[resume] weight_decay differs: ckpt={} live={} (live wins)",
-            loaded.header.weight_decay, live_wd
+            loaded.header.weight_decay,
+            live_wd
         );
     }
 
@@ -235,10 +242,7 @@ pub fn apply_to_optimizer(
 
 /// Apply LoRA weights from a checkpoint into a name→Parameter mapping.
 /// Names not found in the checkpoint are left unchanged (logged as warn).
-pub fn apply_lora_weights(
-    loaded: &LoadedCkpt,
-    named_params: &[(String, Parameter)],
-) -> Result<()> {
+pub fn apply_lora_weights(loaded: &LoadedCkpt, named_params: &[(String, Parameter)]) -> Result<()> {
     use flame_core::DType;
     let mut applied = 0usize;
     let mut missing = 0usize;
@@ -268,7 +272,10 @@ pub fn apply_lora_weights(
             }
         }
     }
-    log::info!("[resume] LoRA weights applied: {applied}/{} ({missing} missing)", named_params.len());
+    log::info!(
+        "[resume] LoRA weights applied: {applied}/{} ({missing} missing)",
+        named_params.len()
+    );
     Ok(())
 }
 
@@ -298,7 +305,9 @@ pub fn apply_lora_weights(
 /// Map a diffusers component prefix to its Kohya prefix.
 /// Mirrors SimpleTuner `_kohya_component_prefix` (sdxl=true).
 fn kohya_component_prefix(component_prefix: &str, sdxl: bool) -> Option<&'static str> {
-    let component = component_prefix.strip_suffix('.').unwrap_or(component_prefix);
+    let component = component_prefix
+        .strip_suffix('.')
+        .unwrap_or(component_prefix);
     match component {
         "unet" => Some("lora_unet"),
         "text_encoder" => Some(if sdxl { "lora_te1" } else { "lora_te" }),
@@ -442,12 +451,16 @@ mod tests {
         for i in 0..2 {
             let a = Tensor::from_vec(
                 (0..32).map(|j| (i * 32 + j) as f32 * 0.0123).collect(),
-                Shape::from_dims(&[4, 8]), device.clone()
-            )?.requires_grad_(true);
+                Shape::from_dims(&[4, 8]),
+                device.clone(),
+            )?
+            .requires_grad_(true);
             let b = Tensor::from_vec(
                 (0..32).map(|j| (i * 32 + j) as f32 * -0.045).collect(),
-                Shape::from_dims(&[8, 4]), device.clone()
-            )?.requires_grad_(true);
+                Shape::from_dims(&[8, 4]),
+                device.clone(),
+            )?
+            .requires_grad_(true);
             named.push((format!("layers.{i}.lora_A.weight"), Parameter::new(a)));
             named.push((format!("layers.{i}.lora_B.weight"), Parameter::new(b)));
         }
@@ -457,12 +470,18 @@ mod tests {
         for (i, (_, p)) in named.iter().enumerate() {
             let dims = p.tensor()?.shape().dims().to_vec();
             let m = Tensor::from_vec(
-                (0..dims.iter().product::<usize>()).map(|j| (i + j) as f32 * 0.001).collect(),
-                Shape::from_dims(&dims), device.clone()
+                (0..dims.iter().product::<usize>())
+                    .map(|j| (i + j) as f32 * 0.001)
+                    .collect(),
+                Shape::from_dims(&dims),
+                device.clone(),
             )?;
             let v = Tensor::from_vec(
-                (0..dims.iter().product::<usize>()).map(|j| ((i + j) as f32 * 0.001).abs()).collect(),
-                Shape::from_dims(&dims), device.clone()
+                (0..dims.iter().product::<usize>())
+                    .map(|j| ((i + j) as f32 * 0.001).abs())
+                    .collect(),
+                Shape::from_dims(&dims),
+                device.clone(),
             )?;
             opt.set_state(p, m, v);
         }
@@ -472,8 +491,16 @@ mod tests {
         save_full(&tmp, &named, &opt, &header)?;
 
         // Snapshot expected values BEFORE clearing.
-        let saved_a0: Vec<f32> = named[0].1.tensor()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-        let saved_b0: Vec<f32> = named[1].1.tensor()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let saved_a0: Vec<f32> = named[0]
+            .1
+            .tensor()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        let saved_b0: Vec<f32> = named[1]
+            .1
+            .tensor()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
         let (saved_m0, saved_v0) = opt.state_for(&named[0].1).expect("m/v for first param");
         let saved_m0_vec: Vec<f32> = saved_m0.to_vec1::<f32>()?;
         let saved_v0_vec: Vec<f32> = saved_v0.to_vec1::<f32>()?;
@@ -516,18 +543,36 @@ mod tests {
         apply_to_optimizer(&loaded, &mut fresh_opt, &fresh_named, 4, 1.0)?;
 
         assert_eq!(fresh_opt.t(), 123);
-        let restored_a0: Vec<f32> = fresh_named[0].1.tensor()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let restored_a0: Vec<f32> = fresh_named[0]
+            .1
+            .tensor()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
         assert_eq!(restored_a0, saved_a0);
-        let (restored_m0, _) = fresh_opt.state_for(&fresh_named[0].1).expect("m/v after apply");
+        let (restored_m0, _) = fresh_opt
+            .state_for(&fresh_named[0].1)
+            .expect("m/v after apply");
         assert_eq!(restored_m0.to_vec1::<f32>()?, saved_m0_vec);
 
         // Wrong rank should refuse.
         let mut other = flame_core::adam::AdamW::new(3e-4, 0.9, 0.999, 1e-8, 0.01);
-        let err = apply_to_optimizer(&loaded, &mut other, &fresh_named, /*expected_rank=*/8, 1.0);
+        let err = apply_to_optimizer(
+            &loaded,
+            &mut other,
+            &fresh_named,
+            /*expected_rank=*/ 8,
+            1.0,
+        );
         assert!(err.is_err(), "rank mismatch must refuse");
 
         // Wrong alpha should refuse.
-        let err = apply_to_optimizer(&loaded, &mut other, &fresh_named, 4, /*expected_alpha=*/2.0);
+        let err = apply_to_optimizer(
+            &loaded,
+            &mut other,
+            &fresh_named,
+            4,
+            /*expected_alpha=*/ 2.0,
+        );
         assert!(err.is_err(), "alpha mismatch must refuse");
 
         let _ = std::fs::remove_file(&tmp);
@@ -542,11 +587,18 @@ mod tests {
         let tmp = std::env::temp_dir().join("eridiffusion_weights_only.safetensors");
         let _ = std::fs::remove_file(&tmp);
 
-        let mut tensors: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
-        let t = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], Shape::from_dims(&[3]), device.clone())?;
+        let mut tensors: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+        let t = Tensor::from_vec(
+            vec![1.0f32, 2.0, 3.0],
+            Shape::from_dims(&[3]),
+            device.clone(),
+        )?;
         tensors.insert("foo".into(), t);
         flame_core::serialization::save_tensors(
-            &tensors, &tmp, flame_core::serialization::SerializationFormat::SafeTensors,
+            &tensors,
+            &tmp,
+            flame_core::serialization::SerializationFormat::SafeTensors,
         )?;
 
         let res = load_full(&tmp, &device);
@@ -575,7 +627,8 @@ mod tests {
         let down = Tensor::from_vec(vec![0.5f32; 32], Shape::from_dims(&[8, 4]), device.clone())?;
         let up = Tensor::from_vec(vec![0.25f32; 32], Shape::from_dims(&[4, 8]), device.clone())?;
         sd.insert(
-            "unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_k.lora.down.weight".into(),
+            "unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_k.lora.down.weight"
+                .into(),
             down.clone(),
         );
         sd.insert(
@@ -592,10 +645,7 @@ mod tests {
         sd.insert("text_encoder_2.baz.qux.lora_B.weight".into(), te_u.clone());
 
         // .processor. substitution.
-        sd.insert(
-            "unet.x.processor.to_k.lora_A.weight".into(),
-            down.clone(),
-        );
+        sd.insert("unet.x.processor.to_k.lora_A.weight".into(), down.clone());
 
         // Pass-through: not a known component prefix.
         let pass = Tensor::from_vec(vec![7.0f32], Shape::from_dims(&[1]), device.clone())?;
@@ -607,12 +657,21 @@ mod tests {
         let out = convert_diffusers_to_comfyui_sd_lora(&sd, Some(8.0), true, &device)?;
 
         // Fixture from SimpleTuner tests/test_lora_metadata.py.
-        let expect_unet_down = "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.lora_down.weight";
-        let expect_unet_up = "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.lora_up.weight";
-        let expect_unet_alpha = "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.alpha";
-        assert!(out.contains_key(expect_unet_down), "missing {expect_unet_down}");
+        let expect_unet_down =
+            "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.lora_down.weight";
+        let expect_unet_up =
+            "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.lora_up.weight";
+        let expect_unet_alpha =
+            "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.alpha";
+        assert!(
+            out.contains_key(expect_unet_down),
+            "missing {expect_unet_down}"
+        );
         assert!(out.contains_key(expect_unet_up), "missing {expect_unet_up}");
-        assert!(out.contains_key(expect_unet_alpha), "missing alpha for unet attn key");
+        assert!(
+            out.contains_key(expect_unet_alpha),
+            "missing alpha for unet attn key"
+        );
 
         // Text encoder rewrites (sdxl → lora_te1 / lora_te2).
         assert!(out.contains_key("lora_te1_foo_bar.lora_down.weight"));
@@ -687,7 +746,8 @@ mod tests {
 
         let out = convert_sdxl_unet_to_kohya(&sd, 16.0, &device)?;
 
-        let attn_down = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_down.weight";
+        let attn_down =
+            "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_down.weight";
         let attn_up = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_up.weight";
         let attn_alpha = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.alpha";
         let ff_down = "lora_unet_middle_block_1_transformer_blocks_0_ff_net_2.lora_down.weight";
@@ -695,12 +755,18 @@ mod tests {
         let ff_alpha = "lora_unet_middle_block_1_transformer_blocks_0_ff_net_2.alpha";
 
         for k in [attn_down, attn_up, attn_alpha, ff_down, ff_up, ff_alpha] {
-            assert!(out.contains_key(k), "missing {k}; got keys: {:?}", out.keys().collect::<Vec<_>>());
+            assert!(
+                out.contains_key(k),
+                "missing {k}; got keys: {:?}",
+                out.keys().collect::<Vec<_>>()
+            );
         }
         // The pre-rewrite `.alpha` companion (LDM-style) must be gone.
         assert!(!out.contains_key("input_blocks.4.1.transformer_blocks.0.attn1.to_q.alpha"));
         // Old PEFT keys must be gone.
-        assert!(!out.keys().any(|k| k.ends_with(".lora_A.weight") || k.ends_with(".lora_B.weight")));
+        assert!(!out
+            .keys()
+            .any(|k| k.ends_with(".lora_A.weight") || k.ends_with(".lora_B.weight")));
 
         // Alpha value matches what the trainer passes (lora_alpha).
         let v: Vec<f32> = out[attn_alpha].to_vec1::<f32>()?;

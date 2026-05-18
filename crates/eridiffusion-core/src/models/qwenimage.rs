@@ -23,12 +23,14 @@
 //! Covers: attn.to_q/k/v, attn.to_out.0, attn.add_q/k/v_proj, attn.to_add_out,
 //!         img_mlp.net.0.proj, img_mlp.net.2, txt_mlp.net.0.proj, txt_mlp.net.2
 
-use flame_core::{parameter::Parameter, DType, Result, Shape, Tensor};
 use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::lora::LoRALinear;
 use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use flame_core::{parameter::Parameter, DType, Result, Shape, Tensor};
 use lycoris_rs::{
-    algorithms::{full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule},
+    algorithms::{
+        full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule,
+    },
     dora::init_magnitude,
     LycorisAdapter,
 };
@@ -39,9 +41,9 @@ pub const NUM_LAYERS: usize = 60;
 pub const DIM: usize = 3072;
 pub const NUM_HEADS: usize = 24;
 pub const HEAD_DIM: usize = 128;
-pub const IN_CHANNELS: usize = 64;  // 16 VAE channels × 2×2 pack
+pub const IN_CHANNELS: usize = 64; // 16 VAE channels × 2×2 pack
 pub const OUT_CHANNELS: usize = 16;
-pub const JOINT_DIM: usize = 3584;   // Qwen2.5-VL-7B hidden
+pub const JOINT_DIM: usize = 3584; // Qwen2.5-VL-7B hidden
 pub const MLP_HIDDEN: usize = 12288; // 4 × dim
 pub const NORM_EPS: f32 = 1e-6;
 pub const ROPE_THETA: f64 = 10000.0;
@@ -49,10 +51,18 @@ pub const ROPE_AXES_DIMS: [usize; 3] = [16, 56, 56];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LoraTarget {
-    ImgQ, ImgK, ImgV, ImgOut,
-    TxtQ, TxtK, TxtV, TxtOut,
-    ImgFfnUp, ImgFfnDown,
-    TxtFfnUp, TxtFfnDown,
+    ImgQ,
+    ImgK,
+    ImgV,
+    ImgOut,
+    TxtQ,
+    TxtK,
+    TxtV,
+    TxtOut,
+    ImgFfnUp,
+    ImgFfnDown,
+    TxtFfnUp,
+    TxtFfnDown,
 }
 
 /// Per-block target shapes — single source of truth shared by `new`/
@@ -105,7 +115,14 @@ impl QwenImageLoraBundle {
         let mut adapters = HashMap::new();
         for i in 0..num_layers {
             for &(target, in_dim, out_dim) in QWENIMAGE_TARGETS {
-                let lora = LoRALinear::new(in_dim, out_dim, rank, alpha, device.clone(), seed + i as u64)?;
+                let lora = LoRALinear::new(
+                    in_dim,
+                    out_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed + i as u64,
+                )?;
                 adapters.insert((i, target), lora);
             }
         }
@@ -136,8 +153,7 @@ impl QwenImageLoraBundle {
         if config.algo == LycorisAlgo::None {
             return Self::new(NUM_LAYERS, config.rank, config.alpha, device, seed);
         }
-        let mut lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>> =
-            HashMap::new();
+        let mut lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>> = HashMap::new();
         for i in 0..NUM_LAYERS {
             for &(target, in_dim, out_dim) in QWENIMAGE_TARGETS {
                 let wrapper = build_lycoris_linear(config, in_dim, out_dim, device.clone())?;
@@ -191,15 +207,21 @@ impl QwenImageLoraBundle {
                 skipped += 1;
                 continue;
             };
-            let did = adapter.as_ref().init_perturbed_normal_lokr(base, scale)
-                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
-                    "init_perturbed_normal_lokr({key}): {e}"
-                )))?;
-            if did { applied += 1; } else { skipped += 1; }
+            let did = adapter
+                .as_ref()
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| {
+                    flame_core::FlameError::InvalidOperation(format!(
+                        "init_perturbed_normal_lokr({key}): {e}"
+                    ))
+                })?;
+            if did {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
         }
-        log::info!(
-            "[qwenimage][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
-        );
+        log::info!("[qwenimage][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}");
         Ok(())
     }
 
@@ -258,11 +280,7 @@ impl QwenImageLoraBundle {
     /// LyCORIS map when populated; falls back to the legacy plain-LoRA map.
     /// Returns `None` when neither has an entry (e.g. full-fine-tune mode
     /// where both maps are empty).
-    pub fn adapter_for(
-        &self,
-        block_idx: usize,
-        target: LoraTarget,
-    ) -> Option<&dyn AdapterModule> {
+    pub fn adapter_for(&self, block_idx: usize, target: LoraTarget) -> Option<&dyn AdapterModule> {
         if let Some(lyc) = self.lycoris_adapters.get(&(block_idx, target)) {
             return Some(lyc.as_ref());
         }
@@ -291,7 +309,8 @@ impl QwenImageLoraBundle {
             }
         }
         flame_core::serialization::save_tensors(
-            &tensors, path,
+            &tensors,
+            path,
             flame_core::serialization::SerializationFormat::SafeTensors,
         )
     }
@@ -300,9 +319,11 @@ impl QwenImageLoraBundle {
     /// by either this trainer's `save` (or `save_weights`) OR by
     /// `checkpoint::save_full` (which embeds the same LoRA weights as plain
     /// tensor entries; the optimizer-state prefix `__opt__/` is ignored).
-    pub fn load(&self, path: &std::path::Path, device: &std::sync::Arc<cudarc::driver::CudaDevice>)
-        -> Result<()>
-    {
+    pub fn load(
+        &self,
+        path: &std::path::Path,
+        device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<()> {
         let raw = flame_core::serialization::load_file(path, device)?;
         let mut applied = 0usize;
         let mut missing = 0usize;
@@ -321,11 +342,14 @@ impl QwenImageLoraBundle {
         }
         log::info!(
             "[qwenimage] LoRA loaded: {}/{} adapters from {}",
-            applied, applied + missing, path.display()
+            applied,
+            applied + missing,
+            path.display()
         );
         if applied == 0 {
             return Err(flame_core::Error::InvalidInput(format!(
-                "no LoRA adapters matched any prefix in {}", path.display()
+                "no LoRA adapters matched any prefix in {}",
+                path.display()
             )));
         }
         // Refresh the BF16 transposed weight cache so the next forward picks
@@ -384,7 +408,9 @@ fn build_lycoris_linear(
                 device.clone(),
                 dtype,
             )
-            .map_err(|e| flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}")))?,
+            .map_err(|e| {
+                flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}"))
+            })?,
         ),
         LycorisAlgo::LoHa => LycorisAdapter::LoHa(
             LoHaModule::new_linear_for_training(
@@ -395,7 +421,9 @@ fn build_lycoris_linear(
                 device.clone(),
                 dtype,
             )
-            .map_err(|e| flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}")))?,
+            .map_err(|e| {
+                flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}"))
+            })?,
         ),
         LycorisAlgo::LoKr => LycorisAdapter::LoKr(
             LoKrModule::new_linear(
@@ -451,11 +479,7 @@ fn build_lycoris_linear(
         } else {
             flame_core::Shape::from_dims(&[1, in_features])
         };
-        let ones = Tensor::from_vec(
-            vec![1.0_f32; shape.elem_count()],
-            shape,
-            device.clone(),
-        )?;
+        let ones = Tensor::from_vec(vec![1.0_f32; shape.elem_count()], shape, device.clone())?;
         let m = init_magnitude(&ones, config.dora_wd_on_out, 0.0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("init_magnitude: {e}")))?;
         Some(m.requires_grad_(true))
@@ -489,7 +513,8 @@ pub struct QwenImageTrainingModel {
     /// the closure (instead of capturing the weights HashMap by move, which
     /// previously held 60 × ~648 MB = ~38 GB of GPU memory across all the
     /// captured closures and OOM'd training around block 24).
-    pub offloader: Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
+    pub offloader:
+        Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
     device: Arc<cudarc::driver::CudaDevice>,
 }
 
@@ -505,7 +530,8 @@ impl QwenImageTrainingModel {
         log::info!("[qwenimage-trainer] loading from {}", model_path.display());
 
         let max_blocks = std::env::var("QWENIMAGE_MAX_BLOCKS")
-            .ok().and_then(|s| s.parse::<usize>().ok())
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(NUM_LAYERS);
 
         // Decide: BlockOffloader (per-step block loading) vs resident (all blocks on GPU).
@@ -517,24 +543,29 @@ impl QwenImageTrainingModel {
             log::info!("[qwenimage-trainer] BlockOffloader mode: blocks loaded per-step");
 
             let shared_prefixes = [
-                "img_in.", "txt_norm.", "txt_in.",
-                "time_text_embed.", "norm_out.", "proj_out.",
+                "img_in.",
+                "txt_norm.",
+                "txt_in.",
+                "time_text_embed.",
+                "norm_out.",
+                "proj_out.",
             ];
 
             let mut resident = HashMap::new();
             let mut shard_paths: Vec<String> = Vec::new();
 
-            for entry in std::fs::read_dir(model_path)
-                .map_err(|e| flame_core::Error::Io(e.to_string()))?
+            for entry in
+                std::fs::read_dir(model_path).map_err(|e| flame_core::Error::Io(e.to_string()))?
             {
                 let entry = entry.map_err(|e| flame_core::Error::Io(e.to_string()))?;
                 let p = entry.path();
                 if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
                     shard_paths.push(p.to_string_lossy().into_owned());
                     // Load only shared (non-block) weights
-                    let shared = flame_core::serialization::load_file_filtered(
-                        &p, &device, |key| shared_prefixes.iter().any(|pfx| key.starts_with(pfx)),
-                    )?;
+                    let shared =
+                        flame_core::serialization::load_file_filtered(&p, &device, |key| {
+                            shared_prefixes.iter().any(|pfx| key.starts_with(pfx))
+                        })?;
                     resident.extend(shared);
                 }
             }
@@ -544,7 +575,9 @@ impl QwenImageTrainingModel {
 
             struct QwenImageFacilitator;
             impl crate::training::block_offload::BlockFacilitator for QwenImageFacilitator {
-                fn block_count(&self) -> usize { NUM_LAYERS }
+                fn block_count(&self) -> usize {
+                    NUM_LAYERS
+                }
                 fn classify_key(&self, key: &str) -> Option<usize> {
                     let rest = key.strip_prefix("transformer_blocks.")?;
                     rest.split('.').next()?.parse().ok()
@@ -555,8 +588,10 @@ impl QwenImageTrainingModel {
             // having to re-derive the key classification.
             impl crate::training::training_offload::TrainBlockFacilitator for QwenImageFacilitator {
                 fn is_trainable_key(&self, key: &str) -> bool {
-                    key.contains(".lora_A") || key.contains(".lora_B")
-                        || key.ends_with(".lora_a") || key.ends_with(".lora_b")
+                    key.contains(".lora_A")
+                        || key.contains(".lora_B")
+                        || key.ends_with(".lora_a")
+                        || key.ends_with(".lora_b")
                 }
                 fn is_frozen_block_key(&self, key: &str) -> bool {
                     key.starts_with("transformer_blocks.") && !self.is_trainable_key(key)
@@ -577,13 +612,19 @@ impl QwenImageTrainingModel {
                 .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
                 .unwrap_or(false);
             let mut offloader = if use_streaming {
-                log::info!("[qwenimage-trainer] BlockOffloader: streaming mode (QWEN_BLOCK_STREAMING=1)");
+                log::info!(
+                    "[qwenimage-trainer] BlockOffloader: streaming mode (QWEN_BLOCK_STREAMING=1)"
+                );
                 crate::training::block_offload::BlockOffloader::load_streaming(
-                    &path_refs, &QwenImageFacilitator, device.clone(),
+                    &path_refs,
+                    &QwenImageFacilitator,
+                    device.clone(),
                 )
             } else {
                 crate::training::block_offload::BlockOffloader::load(
-                    &path_refs, &QwenImageFacilitator, device.clone(),
+                    &path_refs,
+                    &QwenImageFacilitator,
+                    device.clone(),
                 )
             }
             .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader: {e}")))?;
@@ -610,15 +651,24 @@ impl QwenImageTrainingModel {
                 );
             }
 
-            log::info!("[qwenimage-trainer] BlockOffloader: {} blocks, {} shared weights",
-                offloader.block_count(), resident.len());
+            log::info!(
+                "[qwenimage-trainer] BlockOffloader: {} blocks, {} shared weights",
+                offloader.block_count(),
+                resident.len()
+            );
 
             let per_block = Vec::new(); // empty — blocks loaded per-step
-            (resident, per_block, Some(std::sync::Arc::new(std::sync::Mutex::new(offloader))))
+            (
+                resident,
+                per_block,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(offloader))),
+            )
         } else {
             // Resident path: load all blocks into GPU memory.
             let block_filter = |key: &str| -> bool {
-                if !key.starts_with("transformer_blocks.") { return true; }
+                if !key.starts_with("transformer_blocks.") {
+                    return true;
+                }
                 if let Some(rest) = key.strip_prefix("transformer_blocks.") {
                     if let Some(dot) = rest.find('.') {
                         if let Ok(idx) = rest[..dot].parse::<usize>() {
@@ -638,7 +688,9 @@ impl QwenImageTrainingModel {
                     let p = entry.path();
                     if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
                         let shard = flame_core::serialization::load_file_filtered(
-                            &p, &device, block_filter,
+                            &p,
+                            &device,
+                            block_filter,
                         )?;
                         merged.extend(shard);
                     }
@@ -647,10 +699,14 @@ impl QwenImageTrainingModel {
             } else {
                 flame_core::serialization::load_file_filtered(model_path, &device, block_filter)?
             };
-            log::info!("[qwenimage-trainer] loaded {} weight tensors (resident)", all_weights.len());
+            log::info!(
+                "[qwenimage-trainer] loaded {} weight tensors (resident)",
+                all_weights.len()
+            );
 
             let mut resident = HashMap::new();
-            let mut per_block: Vec<HashMap<String, Tensor>> = (0..NUM_LAYERS).map(|_| HashMap::new()).collect();
+            let mut per_block: Vec<HashMap<String, Tensor>> =
+                (0..NUM_LAYERS).map(|_| HashMap::new()).collect();
 
             for (key, tensor) in &all_weights {
                 if key.starts_with("transformer_blocks.") {
@@ -669,13 +725,28 @@ impl QwenImageTrainingModel {
             }
             drop(all_weights);
 
-            log::info!("[qwenimage-trainer] {} resident, {} block maps", resident.len(), per_block.len());
+            log::info!(
+                "[qwenimage-trainer] {} resident, {} block maps",
+                resident.len(),
+                per_block.len()
+            );
             (resident, per_block, None)
         };
 
-        log::info!("[qwenimage-trainer] mode: {}", if full_finetune { "full fine-tune" } else { "LoRA" });
+        log::info!(
+            "[qwenimage-trainer] mode: {}",
+            if full_finetune {
+                "full fine-tune"
+            } else {
+                "LoRA"
+            }
+        );
 
-        let actual_blocks = if use_offloader { NUM_LAYERS } else { max_blocks };
+        let actual_blocks = if use_offloader {
+            NUM_LAYERS
+        } else {
+            max_blocks
+        };
         let (bundle, fft_params) = if full_finetune {
             let mut params = HashMap::new();
             for (key, tensor) in &resident {
@@ -688,7 +759,10 @@ impl QwenImageTrainingModel {
                     params.insert(key.clone(), p);
                 }
             }
-            log::info!("[qwenimage-trainer] full fine-tune: {} trainable weight tensors", params.len());
+            log::info!(
+                "[qwenimage-trainer] full fine-tune: {} trainable weight tensors",
+                params.len()
+            );
             let bundle = QwenImageLoraBundle {
                 adapters: HashMap::new(),
                 lycoris_adapters: HashMap::new(),
@@ -698,8 +772,18 @@ impl QwenImageTrainingModel {
             };
             (bundle, Some(params))
         } else {
-            let bundle = QwenImageLoraBundle::new(actual_blocks, lora_rank, lora_alpha, device.clone(), seed)?;
-            log::info!("[qwenimage-trainer] {} LoRA adapters (rank={})", bundle.num_adapters(), lora_rank);
+            let bundle = QwenImageLoraBundle::new(
+                actual_blocks,
+                lora_rank,
+                lora_alpha,
+                device.clone(),
+                seed,
+            )?;
+            log::info!(
+                "[qwenimage-trainer] {} LoRA adapters (rank={})",
+                bundle.num_adapters(),
+                lora_rank
+            );
             (bundle, None)
         };
 
@@ -739,7 +823,8 @@ impl QwenImageTrainingModel {
                 tensors.insert(key.clone(), param.tensor()?.to_dtype(DType::BF16)?);
             }
             flame_core::serialization::save_tensors(
-                &tensors, path,
+                &tensors,
+                path,
                 flame_core::serialization::SerializationFormat::SafeTensors,
             )
         } else {
@@ -748,13 +833,15 @@ impl QwenImageTrainingModel {
     }
 
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.resident.get(key)
+        self.resident
+            .get(key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
     }
 
     fn bw(&self, block_idx: usize, suffix: &str) -> Result<&Tensor> {
         let key = format!("transformer_blocks.{block_idx}.{suffix}");
-        self.block_weights[block_idx].get(&key)
+        self.block_weights[block_idx]
+            .get(&key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
     }
 
@@ -766,24 +853,36 @@ impl QwenImageTrainingModel {
     fn matmul_bias(&self, x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let in_feat = *dims.last().unwrap();
-        let batch: usize = dims[..dims.len()-1].iter().product();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
         let out_feat = weight.shape().dims()[0];
         let x_2d = x.reshape(&[batch, in_feat])?;
         let wt = weight.transpose()?.contiguous()?;
         let mut out = x_2d.matmul(&wt)?;
-        if let Some(b) = bias { out = out.add(b)?; }
-        let mut out_shape = dims[..dims.len()-1].to_vec();
+        if let Some(b) = bias {
+            out = out.add(b)?;
+        }
+        let mut out_shape = dims[..dims.len() - 1].to_vec();
         out_shape.push(out_feat);
         out.reshape(&out_shape)
     }
 
-    fn add_lora(&self, base: Tensor, input: &Tensor, block_idx: usize, target: LoraTarget) -> Result<Tensor> {
+    fn add_lora(
+        &self,
+        base: Tensor,
+        input: &Tensor,
+        block_idx: usize,
+        target: LoraTarget,
+    ) -> Result<Tensor> {
         // Dispatch through the unified `adapter_for` accessor: prefers
         // `lycoris_adapters` when populated, else falls back to the legacy
         // plain-LoRA `adapters`. Byte-equivalent to the pre-Phase-2b path
         // when `algo == LycorisAlgo::None` (lycoris_adapters empty → legacy).
         if let Some(adapter) = self.bundle.adapter_for(block_idx, target) {
-            let input_3d = if input.shape().dims().len() == 2 { input.unsqueeze(0)? } else { input.clone() };
+            let input_3d = if input.shape().dims().len() == 2 {
+                input.unsqueeze(0)?
+            } else {
+                input.clone()
+            };
             let delta = adapter.forward_delta(&input_3d)?;
             base.add(&delta)
         } else {
@@ -802,12 +901,20 @@ impl QwenImageTrainingModel {
     /// Separate add is bit-identical to the legacy `matmul + add(bias)`
     /// path that all the other ported models use.
     fn fused_linear(&self, x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
-        let x3d = if x.shape().dims().len() == 2 { x.unsqueeze(0)? } else { x.clone() };
+        let x3d = if x.shape().dims().len() == 2 {
+            x.unsqueeze(0)?
+        } else {
+            x.clone()
+        };
         let mut out = flame_core::ops::fused_inference::fused_linear3d_native(&x3d, w, None)?;
         if let Some(bias) = b {
             out = out.add(bias)?;
         }
-        if x.shape().dims().len() == 2 { out.squeeze(Some(0)) } else { Ok(out) }
+        if x.shape().dims().len() == 2 {
+            out.squeeze(Some(0))
+        } else {
+            Ok(out)
+        }
     }
 
     /// Full training forward.
@@ -848,26 +955,47 @@ impl QwenImageTrainingModel {
 
         // Timestep embedding: sinusoidal(256) → Linear → SiLU → Linear
         let temb = sinusoidal_embedding(timestep, 256)?;
-        let temb = self.fused_linear(&temb, self.w("time_text_embed.timestep_embedder.linear_1.weight")?,
-            Some(self.w("time_text_embed.timestep_embedder.linear_1.bias")?))?;
+        let temb = self.fused_linear(
+            &temb,
+            self.w("time_text_embed.timestep_embedder.linear_1.weight")?,
+            Some(self.w("time_text_embed.timestep_embedder.linear_1.bias")?),
+        )?;
         let temb = temb.silu()?;
-        let temb = self.fused_linear(&temb, self.w("time_text_embed.timestep_embedder.linear_2.weight")?,
-            Some(self.w("time_text_embed.timestep_embedder.linear_2.bias")?))?;
+        let temb = self.fused_linear(
+            &temb,
+            self.w("time_text_embed.timestep_embedder.linear_2.weight")?,
+            Some(self.w("time_text_embed.timestep_embedder.linear_2.bias")?),
+        )?;
 
         // Image input projection: [B, seq, 64] → [B, seq, 3072]
-        let mut img = self.fused_linear(packed_noisy, self.w("img_in.weight")?, Some(self.w("img_in.bias")?))?;
+        let mut img = self.fused_linear(
+            packed_noisy,
+            self.w("img_in.weight")?,
+            Some(self.w("img_in.bias")?),
+        )?;
 
         // Text input: RMSNorm → Linear
-        let txt_normed = flame_core::norm::rms_norm(txt_embed, &[JOINT_DIM], Some(self.w("txt_norm.weight")?), NORM_EPS)?;
-        let mut txt = self.fused_linear(&txt_normed, self.w("txt_in.weight")?, Some(self.w("txt_in.bias")?))?;
+        let txt_normed = flame_core::norm::rms_norm(
+            txt_embed,
+            &[JOINT_DIM],
+            Some(self.w("txt_norm.weight")?),
+            NORM_EPS,
+        )?;
+        let mut txt = self.fused_linear(
+            &txt_normed,
+            self.w("txt_in.weight")?,
+            Some(self.w("txt_in.bias")?),
+        )?;
 
         // 60 dual-stream blocks — BlockOffloader or resident path.
         let n_blocks = if self.offloader.is_some() {
             NUM_LAYERS
         } else {
             std::env::var("QWENIMAGE_MAX_BLOCKS")
-                .ok().and_then(|s| s.parse::<usize>().ok())
-                .map(|n| n.min(NUM_LAYERS)).unwrap_or(NUM_LAYERS)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|n| n.min(NUM_LAYERS))
+                .unwrap_or(NUM_LAYERS)
         };
         if n_blocks != NUM_LAYERS {
             log::warn!("[qwenimage-trainer] QWENIMAGE_MAX_BLOCKS={n_blocks}");
@@ -891,7 +1019,8 @@ impl QwenImageTrainingModel {
             // after each block forward returns (so the next block's H2D
             // overlaps with the autograd bookkeeping for this one).
             {
-                let mut g = offloader_arc.lock()
+                let mut g = offloader_arc
+                    .lock()
                     .map_err(|e| flame_core::Error::InvalidInput(format!("offloader lock: {e}")))?;
                 g.prefetch_block(0)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
@@ -918,31 +1047,37 @@ impl QwenImageTrainingModel {
                     // Inference fast path — bisect bug: route through the
                     // verbatim iflame port (`dual_stream_block_iflame`).
                     let raw = {
-                        let mut g = offloader_arc.lock()
-                            .map_err(|e| flame_core::Error::InvalidInput(
-                                format!("offloader lock (block {i}): {e}")
-                            ))?;
-                        g.await_block(i)
-                            .map_err(|e| flame_core::Error::InvalidInput(
-                                format!("await block {i}: {e}")
-                            ))?
+                        let mut g = offloader_arc.lock().map_err(|e| {
+                            flame_core::Error::InvalidInput(format!(
+                                "offloader lock (block {i}): {e}"
+                            ))
+                        })?;
+                        g.await_block(i).map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("await block {i}: {e}"))
+                        })?
                     };
                     if i + 1 < n_blocks {
-                        let mut g = offloader_arc.lock()
-                            .map_err(|e| flame_core::Error::InvalidInput(
-                                format!("offloader lock: {e}")
-                            ))?;
-                        g.prefetch_block(i + 1)
-                            .map_err(|e| flame_core::Error::InvalidInput(
-                                format!("prefetch {}: {e}", i + 1)
-                            ))?;
+                        let mut g = offloader_arc.lock().map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("offloader lock: {e}"))
+                        })?;
+                        g.prefetch_block(i + 1).map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1))
+                        })?;
                     }
                     self.bundle.refresh_caches();
                     let (new_img, new_txt) = dual_stream_block_iflame(
-                        &img, &txt, &temb, i,
-                        &pe_cos, &pe_sin,
-                        &img_cos, &img_sin, &txt_cos, &txt_sin,
-                        &raw, &self.bundle,
+                        &img,
+                        &txt,
+                        &temb,
+                        i,
+                        &pe_cos,
+                        &pe_sin,
+                        &img_cos,
+                        &img_sin,
+                        &txt_cos,
+                        &txt_sin,
+                        &raw,
+                        &self.bundle,
                     )?;
                     drop(raw);
                     img = new_img;
@@ -963,37 +1098,34 @@ impl QwenImageTrainingModel {
                         &[img_c.clone(), txt_c.clone()],
                         move || {
                             let raw = {
-                                let mut g = off_clone.lock()
-                                    .map_err(|e| flame_core::Error::InvalidInput(
-                                        format!("offloader lock (block {i}): {e}")
-                                    ))?;
-                                g.await_block(i)
-                                    .map_err(|e| flame_core::Error::InvalidInput(
-                                        format!("await block {i}: {e}")
-                                    ))?
+                                let mut g = off_clone.lock().map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!(
+                                        "offloader lock (block {i}): {e}"
+                                    ))
+                                })?;
+                                g.await_block(i).map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!("await block {i}: {e}"))
+                                })?
                             };
                             let weights = clone_block_weights(&raw)?;
                             drop(raw);
 
                             bundle_c.refresh_caches();
                             let (new_img, new_txt) = dual_stream_block_standalone(
-                                &img_c, &txt_c, &temb_c, i,
-                                &ic, &is_, &tc, &ts,
-                                &weights, &bundle_c,
+                                &img_c, &txt_c, &temb_c, i, &ic, &is_, &tc, &ts, &weights,
+                                &bundle_c,
                             )?;
                             Tensor::cat(&[&new_img, &new_txt], 1)
                         },
                     )?;
 
                     if i + 1 < n_blocks {
-                        let mut g = offloader_arc.lock()
-                            .map_err(|e| flame_core::Error::InvalidInput(
-                                format!("offloader lock: {e}")
-                            ))?;
-                        g.prefetch_block(i + 1)
-                            .map_err(|e| flame_core::Error::InvalidInput(
-                                format!("prefetch {}: {e}", i + 1)
-                            ))?;
+                        let mut g = offloader_arc.lock().map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("offloader lock: {e}"))
+                        })?;
+                        g.prefetch_block(i + 1).map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1))
+                        })?;
                     }
 
                     let img_seq_len = img.shape().dims()[1];
@@ -1010,8 +1142,7 @@ impl QwenImageTrainingModel {
             // Resident path: all block weights already on GPU.
             for i in 0..n_blocks {
                 let (new_img, new_txt) = self.dual_stream_block(
-                    &img, &txt, &temb, i,
-                    &img_cos, &img_sin, &txt_cos, &txt_sin,
+                    &img, &txt, &temb, i, &img_cos, &img_sin, &txt_cos, &txt_sin,
                 )?;
                 img = new_img;
                 txt = new_txt;
@@ -1023,8 +1154,11 @@ impl QwenImageTrainingModel {
         // Reference: qwen_image_model.py:547-548:
         //   scale, shift = torch.chunk(emb, 2, dim=1)
         let norm_emb = temb.silu()?;
-        let norm_out = self.fused_linear(&norm_emb,
-            self.w("norm_out.linear.weight")?, Some(self.w("norm_out.linear.bias")?))?;
+        let norm_out = self.fused_linear(
+            &norm_emb,
+            self.w("norm_out.linear.weight")?,
+            Some(self.w("norm_out.linear.bias")?),
+        )?;
         let chunks = norm_out.unsqueeze(1)?.chunk(2, 2)?;
         let scale = &chunks[0];
         let shift = &chunks[1];
@@ -1034,7 +1168,11 @@ impl QwenImageTrainingModel {
         let img_out = img_norm.mul(&scale.add_scalar(1.0)?)?.add(shift)?;
 
         // proj_out: [B, seq, 3072] → [B, seq, 64]
-        self.matmul_bias(&img_out, self.w("proj_out.weight")?, Some(self.w("proj_out.bias")?))
+        self.matmul_bias(
+            &img_out,
+            self.w("proj_out.weight")?,
+            Some(self.w("proj_out.bias")?),
+        )
     }
 
     /// Edit-mode forward (Qwen-Image-Edit-2509 / 2511).
@@ -1057,7 +1195,14 @@ impl QwenImageTrainingModel {
         txt_embed: &Tensor,
         regions: &[(usize, usize)],
     ) -> Result<Tensor> {
-        self.forward_edit_inner(packed_noisy, control_packed, timestep, txt_embed, regions, false)
+        self.forward_edit_inner(
+            packed_noisy,
+            control_packed,
+            timestep,
+            txt_embed,
+            regions,
+            false,
+        )
     }
 
     /// Edit-2511 variant of `forward_edit` — applies the `zero_cond_t`
@@ -1077,7 +1222,14 @@ impl QwenImageTrainingModel {
         txt_embed: &Tensor,
         regions: &[(usize, usize)],
     ) -> Result<Tensor> {
-        self.forward_edit_inner(packed_noisy, control_packed, timestep, txt_embed, regions, true)
+        self.forward_edit_inner(
+            packed_noisy,
+            control_packed,
+            timestep,
+            txt_embed,
+            regions,
+            true,
+        )
     }
 
     fn forward_edit_inner(
@@ -1136,11 +1288,17 @@ impl QwenImageTrainingModel {
             timestep.clone()
         };
         let img_temb = sinusoidal_embedding(&timestep_for_img, 256)?;
-        let img_temb = self.fused_linear(&img_temb, self.w("time_text_embed.timestep_embedder.linear_1.weight")?,
-            Some(self.w("time_text_embed.timestep_embedder.linear_1.bias")?))?;
+        let img_temb = self.fused_linear(
+            &img_temb,
+            self.w("time_text_embed.timestep_embedder.linear_1.weight")?,
+            Some(self.w("time_text_embed.timestep_embedder.linear_1.bias")?),
+        )?;
         let img_temb = img_temb.silu()?;
-        let img_temb = self.fused_linear(&img_temb, self.w("time_text_embed.timestep_embedder.linear_2.weight")?,
-            Some(self.w("time_text_embed.timestep_embedder.linear_2.bias")?))?;
+        let img_temb = self.fused_linear(
+            &img_temb,
+            self.w("time_text_embed.timestep_embedder.linear_2.weight")?,
+            Some(self.w("time_text_embed.timestep_embedder.linear_2.bias")?),
+        )?;
         // base temb (single batch) — for txt modulation and final norm_out.
         let temb_base = if zero_cond_t {
             img_temb.narrow(0, 0, target_dims[0])?
@@ -1149,9 +1307,22 @@ impl QwenImageTrainingModel {
         };
 
         // Image input projection over the FULL [target+control] seq.
-        let mut img = self.fused_linear(&packed_all, self.w("img_in.weight")?, Some(self.w("img_in.bias")?))?;
-        let txt_normed = flame_core::norm::rms_norm(txt_embed, &[JOINT_DIM], Some(self.w("txt_norm.weight")?), NORM_EPS)?;
-        let mut txt = self.fused_linear(&txt_normed, self.w("txt_in.weight")?, Some(self.w("txt_in.bias")?))?;
+        let mut img = self.fused_linear(
+            &packed_all,
+            self.w("img_in.weight")?,
+            Some(self.w("img_in.bias")?),
+        )?;
+        let txt_normed = flame_core::norm::rms_norm(
+            txt_embed,
+            &[JOINT_DIM],
+            Some(self.w("txt_norm.weight")?),
+            NORM_EPS,
+        )?;
+        let mut txt = self.fused_linear(
+            &txt_normed,
+            self.w("txt_in.weight")?,
+            Some(self.w("txt_in.bias")?),
+        )?;
 
         // Block loop — SAME kernels as T2I. Edit-mode does not change block ops,
         // only the seq length and RoPE table. Both offloader and resident paths
@@ -1160,22 +1331,26 @@ impl QwenImageTrainingModel {
             NUM_LAYERS
         } else {
             std::env::var("QWENIMAGE_MAX_BLOCKS")
-                .ok().and_then(|s| s.parse::<usize>().ok())
-                .map(|n| n.min(NUM_LAYERS)).unwrap_or(NUM_LAYERS)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|n| n.min(NUM_LAYERS))
+                .unwrap_or(NUM_LAYERS)
         };
 
         if let Some(ref offloader_arc) = self.offloader {
             if zero_cond_t {
                 return Err(flame_core::Error::InvalidInput(
                     "edit-2511 (zero_cond_t) is not yet wired through the BlockOffloader path; \
-                     run without --block-swap or run forward_edit_2511 on the resident path.".into(),
+                     run without --block-swap or run forward_edit_2511 on the resident path."
+                        .into(),
                 ));
             }
             // Same closure-fetch-not-capture pattern as `forward()` —
             // prevents the 38 GB closure-capture leak. See `forward()` for
             // the full rationale.
             {
-                let mut g = offloader_arc.lock()
+                let mut g = offloader_arc
+                    .lock()
                     .map_err(|e| flame_core::Error::InvalidInput(format!("offloader lock: {e}")))?;
                 g.prefetch_block(0)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
@@ -1195,33 +1370,33 @@ impl QwenImageTrainingModel {
                     &[img_c.clone(), txt_c.clone()],
                     move || {
                         let raw = {
-                            let mut g = off_clone.lock()
-                                .map_err(|e| flame_core::Error::InvalidInput(
-                                    format!("offloader lock (block {i}): {e}")
-                                ))?;
-                            g.await_block(i)
-                                .map_err(|e| flame_core::Error::InvalidInput(
-                                    format!("await block {i}: {e}")
-                                ))?
+                            let mut g = off_clone.lock().map_err(|e| {
+                                flame_core::Error::InvalidInput(format!(
+                                    "offloader lock (block {i}): {e}"
+                                ))
+                            })?;
+                            g.await_block(i).map_err(|e| {
+                                flame_core::Error::InvalidInput(format!("await block {i}: {e}"))
+                            })?
                         };
                         let weights = clone_block_weights(&raw)?;
                         drop(raw);
 
                         bundle_c.refresh_caches();
                         let (new_img, new_txt) = dual_stream_block_standalone(
-                            &img_c, &txt_c, &temb_c, i,
-                            &ic, &is_, &tc, &ts,
-                            &weights, &bundle_c,
+                            &img_c, &txt_c, &temb_c, i, &ic, &is_, &tc, &ts, &weights, &bundle_c,
                         )?;
                         Tensor::cat(&[&new_img, &new_txt], 1)
                     },
                 )?;
 
                 if i + 1 < n_blocks {
-                    let mut g = offloader_arc.lock()
-                        .map_err(|e| flame_core::Error::InvalidInput(format!("offloader lock: {e}")))?;
-                    g.prefetch_block(i + 1)
-                        .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i+1)))?;
+                    let mut g = offloader_arc.lock().map_err(|e| {
+                        flame_core::Error::InvalidInput(format!("offloader lock: {e}"))
+                    })?;
+                    g.prefetch_block(i + 1).map_err(|e| {
+                        flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1))
+                    })?;
                 }
 
                 let img_seq_len = img.shape().dims()[1];
@@ -1237,14 +1412,12 @@ impl QwenImageTrainingModel {
             for i in 0..n_blocks {
                 let (new_img, new_txt) = if zero_cond_t {
                     self.dual_stream_block_2511(
-                        &img, &txt, &img_temb, &temb_base, i,
-                        &img_cos, &img_sin, &txt_cos, &txt_sin,
-                        target_seq,
+                        &img, &txt, &img_temb, &temb_base, i, &img_cos, &img_sin, &txt_cos,
+                        &txt_sin, target_seq,
                     )?
                 } else {
                     self.dual_stream_block(
-                        &img, &txt, &img_temb, i,
-                        &img_cos, &img_sin, &txt_cos, &txt_sin,
+                        &img, &txt, &img_temb, i, &img_cos, &img_sin, &txt_cos, &txt_sin,
                     )?
                 };
                 img = new_img;
@@ -1256,15 +1429,22 @@ impl QwenImageTrainingModel {
         // base (un-doubled) temb here — musubi's `qwen_image_model.py:1361`
         // does `temb = temb.chunk(2, dim=0)[0]` before final norm.
         let norm_emb = temb_base.silu()?;
-        let norm_out = self.fused_linear(&norm_emb,
-            self.w("norm_out.linear.weight")?, Some(self.w("norm_out.linear.bias")?))?;
+        let norm_out = self.fused_linear(
+            &norm_emb,
+            self.w("norm_out.linear.weight")?,
+            Some(self.w("norm_out.linear.bias")?),
+        )?;
         let chunks = norm_out.unsqueeze(1)?.chunk(2, 2)?;
         let scale = &chunks[0];
         let shift = &chunks[1];
         let hidden = img.shape().dims()[2];
         let img_norm = flame_core::layer_norm::layer_norm(&img, &[hidden], None, None, NORM_EPS)?;
         let img_out = img_norm.mul(&scale.add_scalar(1.0)?)?.add(shift)?;
-        let pred_full = self.matmul_bias(&img_out, self.w("proj_out.weight")?, Some(self.w("proj_out.bias")?))?;
+        let pred_full = self.matmul_bias(
+            &img_out,
+            self.w("proj_out.weight")?,
+            Some(self.w("proj_out.bias")?),
+        )?;
 
         // Slice target portion only. Matches `noise_pred = noise_pred[:, :img_seq_len]`
         // in musubi-tuner `qwen_image_train_network.py:567`.
@@ -1291,39 +1471,121 @@ impl QwenImageTrainingModel {
 
         // Image modulation: SiLU(temb) → Linear → 6 params
         let img_mod = temb.silu()?;
-        let img_mod = self.matmul_bias(&img_mod,
+        let img_mod = self.matmul_bias(
+            &img_mod,
             self.bw(block_idx, "img_mod.1.weight")?,
-            Some(self.bw(block_idx, "img_mod.1.bias")?))?;
+            Some(self.bw(block_idx, "img_mod.1.bias")?),
+        )?;
         let img_chunks = img_mod.unsqueeze(1)?.chunk(6, 2)?;
 
         // Text modulation
         let txt_mod = temb.silu()?;
-        let txt_mod = self.matmul_bias(&txt_mod,
+        let txt_mod = self.matmul_bias(
+            &txt_mod,
             self.bw(block_idx, "txt_mod.1.weight")?,
-            Some(self.bw(block_idx, "txt_mod.1.bias")?))?;
+            Some(self.bw(block_idx, "txt_mod.1.bias")?),
+        )?;
         let txt_chunks = txt_mod.unsqueeze(1)?.chunk(6, 2)?;
 
         // Pre-norm (parameter-free LayerNorm) + modulate
         let img_norm1 = flame_core::layer_norm::layer_norm(img, &[DIM], None, None, NORM_EPS)?;
-        let img_normed = img_norm1.mul(&img_chunks[1].add_scalar(1.0)?)?.add(&img_chunks[0])?;
+        let img_normed = img_norm1
+            .mul(&img_chunks[1].add_scalar(1.0)?)?
+            .add(&img_chunks[0])?;
 
         let txt_norm1 = flame_core::layer_norm::layer_norm(txt, &[DIM], None, None, NORM_EPS)?;
-        let txt_normed = txt_norm1.mul(&txt_chunks[1].add_scalar(1.0)?)?.add(&txt_chunks[0])?;
+        let txt_normed = txt_norm1
+            .mul(&txt_chunks[1].add_scalar(1.0)?)?
+            .add(&txt_chunks[0])?;
 
         // Q/K/V projections with LoRA
-        let img_q = self.add_lora(self.matmul_bias(&img_normed, self.bw(block_idx, "attn.to_q.weight")?, Some(self.bw(block_idx, "attn.to_q.bias")?))?, &img_normed, block_idx, LoraTarget::ImgQ)?;
-        let img_k = self.add_lora(self.matmul_bias(&img_normed, self.bw(block_idx, "attn.to_k.weight")?, Some(self.bw(block_idx, "attn.to_k.bias")?))?, &img_normed, block_idx, LoraTarget::ImgK)?;
-        let img_v = self.add_lora(self.matmul_bias(&img_normed, self.bw(block_idx, "attn.to_v.weight")?, Some(self.bw(block_idx, "attn.to_v.bias")?))?, &img_normed, block_idx, LoraTarget::ImgV)?;
+        let img_q = self.add_lora(
+            self.matmul_bias(
+                &img_normed,
+                self.bw(block_idx, "attn.to_q.weight")?,
+                Some(self.bw(block_idx, "attn.to_q.bias")?),
+            )?,
+            &img_normed,
+            block_idx,
+            LoraTarget::ImgQ,
+        )?;
+        let img_k = self.add_lora(
+            self.matmul_bias(
+                &img_normed,
+                self.bw(block_idx, "attn.to_k.weight")?,
+                Some(self.bw(block_idx, "attn.to_k.bias")?),
+            )?,
+            &img_normed,
+            block_idx,
+            LoraTarget::ImgK,
+        )?;
+        let img_v = self.add_lora(
+            self.matmul_bias(
+                &img_normed,
+                self.bw(block_idx, "attn.to_v.weight")?,
+                Some(self.bw(block_idx, "attn.to_v.bias")?),
+            )?,
+            &img_normed,
+            block_idx,
+            LoraTarget::ImgV,
+        )?;
 
-        let txt_q = self.add_lora(self.matmul_bias(&txt_normed, self.bw(block_idx, "attn.add_q_proj.weight")?, Some(self.bw(block_idx, "attn.add_q_proj.bias")?))?, &txt_normed, block_idx, LoraTarget::TxtQ)?;
-        let txt_k = self.add_lora(self.matmul_bias(&txt_normed, self.bw(block_idx, "attn.add_k_proj.weight")?, Some(self.bw(block_idx, "attn.add_k_proj.bias")?))?, &txt_normed, block_idx, LoraTarget::TxtK)?;
-        let txt_v = self.add_lora(self.matmul_bias(&txt_normed, self.bw(block_idx, "attn.add_v_proj.weight")?, Some(self.bw(block_idx, "attn.add_v_proj.bias")?))?, &txt_normed, block_idx, LoraTarget::TxtV)?;
+        let txt_q = self.add_lora(
+            self.matmul_bias(
+                &txt_normed,
+                self.bw(block_idx, "attn.add_q_proj.weight")?,
+                Some(self.bw(block_idx, "attn.add_q_proj.bias")?),
+            )?,
+            &txt_normed,
+            block_idx,
+            LoraTarget::TxtQ,
+        )?;
+        let txt_k = self.add_lora(
+            self.matmul_bias(
+                &txt_normed,
+                self.bw(block_idx, "attn.add_k_proj.weight")?,
+                Some(self.bw(block_idx, "attn.add_k_proj.bias")?),
+            )?,
+            &txt_normed,
+            block_idx,
+            LoraTarget::TxtK,
+        )?;
+        let txt_v = self.add_lora(
+            self.matmul_bias(
+                &txt_normed,
+                self.bw(block_idx, "attn.add_v_proj.weight")?,
+                Some(self.bw(block_idx, "attn.add_v_proj.bias")?),
+            )?,
+            &txt_normed,
+            block_idx,
+            LoraTarget::TxtV,
+        )?;
 
         // QK norm
-        let img_q = rms_norm_per_head(&img_q, self.bw(block_idx, "attn.norm_q.weight")?, NUM_HEADS, HEAD_DIM)?;
-        let img_k = rms_norm_per_head(&img_k, self.bw(block_idx, "attn.norm_k.weight")?, NUM_HEADS, HEAD_DIM)?;
-        let txt_q = rms_norm_per_head(&txt_q, self.bw(block_idx, "attn.norm_added_q.weight")?, NUM_HEADS, HEAD_DIM)?;
-        let txt_k = rms_norm_per_head(&txt_k, self.bw(block_idx, "attn.norm_added_k.weight")?, NUM_HEADS, HEAD_DIM)?;
+        let img_q = rms_norm_per_head(
+            &img_q,
+            self.bw(block_idx, "attn.norm_q.weight")?,
+            NUM_HEADS,
+            HEAD_DIM,
+        )?;
+        let img_k = rms_norm_per_head(
+            &img_k,
+            self.bw(block_idx, "attn.norm_k.weight")?,
+            NUM_HEADS,
+            HEAD_DIM,
+        )?;
+        let txt_q = rms_norm_per_head(
+            &txt_q,
+            self.bw(block_idx, "attn.norm_added_q.weight")?,
+            NUM_HEADS,
+            HEAD_DIM,
+        )?;
+        let txt_k = rms_norm_per_head(
+            &txt_k,
+            self.bw(block_idx, "attn.norm_added_k.weight")?,
+            NUM_HEADS,
+            HEAD_DIM,
+        )?;
 
         // Apply RoPE to img and txt Q/K separately, then concatenate
         let img_q_4d = img_q.reshape(&[b, img_seq, NUM_HEADS, HEAD_DIM])?;
@@ -1347,7 +1609,9 @@ impl QwenImageTrainingModel {
         };
 
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-        let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, total_seq, DIM])?;
+        let attn_out = attn_out
+            .permute(&[0, 2, 1, 3])?
+            .reshape(&[b, total_seq, DIM])?;
 
         // Split img/txt
         let img_attn = attn_out.narrow(1, 0, img_seq)?;
@@ -1355,11 +1619,25 @@ impl QwenImageTrainingModel {
 
         // Output projections with LoRA
         let img_attn_out = self.add_lora(
-            self.matmul_bias(&img_attn, self.bw(block_idx, "attn.to_out.0.weight")?, Some(self.bw(block_idx, "attn.to_out.0.bias")?))?,
-            &img_attn, block_idx, LoraTarget::ImgOut)?;
+            self.matmul_bias(
+                &img_attn,
+                self.bw(block_idx, "attn.to_out.0.weight")?,
+                Some(self.bw(block_idx, "attn.to_out.0.bias")?),
+            )?,
+            &img_attn,
+            block_idx,
+            LoraTarget::ImgOut,
+        )?;
         let txt_attn_out = self.add_lora(
-            self.matmul_bias(&txt_attn, self.bw(block_idx, "attn.to_add_out.weight")?, Some(self.bw(block_idx, "attn.to_add_out.bias")?))?,
-            &txt_attn, block_idx, LoraTarget::TxtOut)?;
+            self.matmul_bias(
+                &txt_attn,
+                self.bw(block_idx, "attn.to_add_out.weight")?,
+                Some(self.bw(block_idx, "attn.to_add_out.bias")?),
+            )?,
+            &txt_attn,
+            block_idx,
+            LoraTarget::TxtOut,
+        )?;
 
         // Gated residual
         let img = img.add(&img_chunks[2].mul(&img_attn_out)?)?;
@@ -1367,25 +1645,57 @@ impl QwenImageTrainingModel {
 
         // FFN with LoRA
         let img_norm2 = flame_core::layer_norm::layer_norm(&img, &[DIM], None, None, NORM_EPS)?;
-        let img_ffn_in = img_norm2.mul(&img_chunks[4].add_scalar(1.0)?)?.add(&img_chunks[3])?;
+        let img_ffn_in = img_norm2
+            .mul(&img_chunks[4].add_scalar(1.0)?)?
+            .add(&img_chunks[3])?;
         let img_ffn_up = self.add_lora(
-            self.matmul_bias(&img_ffn_in, self.bw(block_idx, "img_mlp.net.0.proj.weight")?, Some(self.bw(block_idx, "img_mlp.net.0.proj.bias")?))?,
-            &img_ffn_in, block_idx, LoraTarget::ImgFfnUp)?;
+            self.matmul_bias(
+                &img_ffn_in,
+                self.bw(block_idx, "img_mlp.net.0.proj.weight")?,
+                Some(self.bw(block_idx, "img_mlp.net.0.proj.bias")?),
+            )?,
+            &img_ffn_in,
+            block_idx,
+            LoraTarget::ImgFfnUp,
+        )?;
         let img_ffn_act = img_ffn_up.gelu()?;
         let img_ffn_down = self.add_lora(
-            self.matmul_bias(&img_ffn_act, self.bw(block_idx, "img_mlp.net.2.weight")?, Some(self.bw(block_idx, "img_mlp.net.2.bias")?))?,
-            &img_ffn_act, block_idx, LoraTarget::ImgFfnDown)?;
+            self.matmul_bias(
+                &img_ffn_act,
+                self.bw(block_idx, "img_mlp.net.2.weight")?,
+                Some(self.bw(block_idx, "img_mlp.net.2.bias")?),
+            )?,
+            &img_ffn_act,
+            block_idx,
+            LoraTarget::ImgFfnDown,
+        )?;
         let img = img.add(&img_chunks[5].mul(&img_ffn_down)?)?;
 
         let txt_norm2 = flame_core::layer_norm::layer_norm(&txt, &[DIM], None, None, NORM_EPS)?;
-        let txt_ffn_in = txt_norm2.mul(&txt_chunks[4].add_scalar(1.0)?)?.add(&txt_chunks[3])?;
+        let txt_ffn_in = txt_norm2
+            .mul(&txt_chunks[4].add_scalar(1.0)?)?
+            .add(&txt_chunks[3])?;
         let txt_ffn_up = self.add_lora(
-            self.matmul_bias(&txt_ffn_in, self.bw(block_idx, "txt_mlp.net.0.proj.weight")?, Some(self.bw(block_idx, "txt_mlp.net.0.proj.bias")?))?,
-            &txt_ffn_in, block_idx, LoraTarget::TxtFfnUp)?;
+            self.matmul_bias(
+                &txt_ffn_in,
+                self.bw(block_idx, "txt_mlp.net.0.proj.weight")?,
+                Some(self.bw(block_idx, "txt_mlp.net.0.proj.bias")?),
+            )?,
+            &txt_ffn_in,
+            block_idx,
+            LoraTarget::TxtFfnUp,
+        )?;
         let txt_ffn_act = txt_ffn_up.gelu()?;
         let txt_ffn_down = self.add_lora(
-            self.matmul_bias(&txt_ffn_act, self.bw(block_idx, "txt_mlp.net.2.weight")?, Some(self.bw(block_idx, "txt_mlp.net.2.bias")?))?,
-            &txt_ffn_act, block_idx, LoraTarget::TxtFfnDown)?;
+            self.matmul_bias(
+                &txt_ffn_act,
+                self.bw(block_idx, "txt_mlp.net.2.weight")?,
+                Some(self.bw(block_idx, "txt_mlp.net.2.bias")?),
+            )?,
+            &txt_ffn_act,
+            block_idx,
+            LoraTarget::TxtFfnDown,
+        )?;
         let txt = txt.add(&txt_chunks[5].mul(&txt_ffn_down)?)?;
 
         Ok((img, txt))
@@ -1407,8 +1717,8 @@ impl QwenImageTrainingModel {
         &self,
         img: &Tensor,
         txt: &Tensor,
-        img_temb: &Tensor,        // [2*B, dim]
-        txt_temb: &Tensor,        // [B, dim]
+        img_temb: &Tensor, // [2*B, dim]
+        txt_temb: &Tensor, // [B, dim]
         block_idx: usize,
         img_cos: &Tensor,
         img_sin: &Tensor,
@@ -1430,36 +1740,41 @@ impl QwenImageTrainingModel {
 
         // Image modulation on the doubled batch.
         let img_mod = img_temb.silu()?;
-        let img_mod = self.matmul_bias(&img_mod,
+        let img_mod = self.matmul_bias(
+            &img_mod,
             self.bw(block_idx, "img_mod.1.weight")?,
-            Some(self.bw(block_idx, "img_mod.1.bias")?))?;
+            Some(self.bw(block_idx, "img_mod.1.bias")?),
+        )?;
         // [2*B, 6*dim] -> [2*B, 1, 6*dim] -> chunk(6) along last dim.
         let img_chunks = img_mod.unsqueeze(1)?.chunk(6, 2)?;
 
         // Text modulation on the base-only batch.
         let txt_mod = txt_temb.silu()?;
-        let txt_mod = self.matmul_bias(&txt_mod,
+        let txt_mod = self.matmul_bias(
+            &txt_mod,
             self.bw(block_idx, "txt_mod.1.weight")?,
-            Some(self.bw(block_idx, "txt_mod.1.bias")?))?;
+            Some(self.bw(block_idx, "txt_mod.1.bias")?),
+        )?;
         let txt_chunks = txt_mod.unsqueeze(1)?.chunk(6, 2)?;
 
         // Per-region modulate helper: x is [B, img_seq, dim]; chunk is
         // [2*B, 1, dim]. Splits chunk into base/ext halves on batch dim and
         // applies different shift/scale to the two image regions.
-        let modulate_split = |x: &Tensor, scale_chunk: &Tensor, shift_chunk: &Tensor| -> Result<Tensor> {
-            let s_base = scale_chunk.narrow(0, 0, b)?;
-            let s_ext = scale_chunk.narrow(0, b, b)?;
-            let h_base = shift_chunk.narrow(0, 0, b)?;
-            let h_ext = shift_chunk.narrow(0, b, b)?;
-            let x_base = x.narrow(1, 0, target_seq)?;
-            let part_base = x_base.mul(&s_base.add_scalar(1.0)?)?.add(&h_base)?;
-            if ext_seq == 0 {
-                return Ok(part_base);
-            }
-            let x_ext = x.narrow(1, target_seq, ext_seq)?;
-            let part_ext = x_ext.mul(&s_ext.add_scalar(1.0)?)?.add(&h_ext)?;
-            Tensor::cat(&[&part_base, &part_ext], 1)
-        };
+        let modulate_split =
+            |x: &Tensor, scale_chunk: &Tensor, shift_chunk: &Tensor| -> Result<Tensor> {
+                let s_base = scale_chunk.narrow(0, 0, b)?;
+                let s_ext = scale_chunk.narrow(0, b, b)?;
+                let h_base = shift_chunk.narrow(0, 0, b)?;
+                let h_ext = shift_chunk.narrow(0, b, b)?;
+                let x_base = x.narrow(1, 0, target_seq)?;
+                let part_base = x_base.mul(&s_base.add_scalar(1.0)?)?.add(&h_base)?;
+                if ext_seq == 0 {
+                    return Ok(part_base);
+                }
+                let x_ext = x.narrow(1, target_seq, ext_seq)?;
+                let part_ext = x_ext.mul(&s_ext.add_scalar(1.0)?)?.add(&h_ext)?;
+                Tensor::cat(&[&part_base, &part_ext], 1)
+            };
         // Per-region gate helper: gate_chunk is [2*B, 1, dim]; broadcast
         // base across the target seq, ext across the rest.
         let gate_split = |out: &Tensor, gate_chunk: &Tensor| -> Result<Tensor> {
@@ -1480,21 +1795,97 @@ impl QwenImageTrainingModel {
         let img_normed = modulate_split(&img_norm1, &img_chunks[1], &img_chunks[0])?;
 
         let txt_norm1 = flame_core::layer_norm::layer_norm(txt, &[DIM], None, None, NORM_EPS)?;
-        let txt_normed = txt_norm1.mul(&txt_chunks[1].add_scalar(1.0)?)?.add(&txt_chunks[0])?;
+        let txt_normed = txt_norm1
+            .mul(&txt_chunks[1].add_scalar(1.0)?)?
+            .add(&txt_chunks[0])?;
 
         // Q/K/V projections with LoRA — identical to T2I path.
-        let img_q = self.add_lora(self.matmul_bias(&img_normed, self.bw(block_idx, "attn.to_q.weight")?, Some(self.bw(block_idx, "attn.to_q.bias")?))?, &img_normed, block_idx, LoraTarget::ImgQ)?;
-        let img_k = self.add_lora(self.matmul_bias(&img_normed, self.bw(block_idx, "attn.to_k.weight")?, Some(self.bw(block_idx, "attn.to_k.bias")?))?, &img_normed, block_idx, LoraTarget::ImgK)?;
-        let img_v = self.add_lora(self.matmul_bias(&img_normed, self.bw(block_idx, "attn.to_v.weight")?, Some(self.bw(block_idx, "attn.to_v.bias")?))?, &img_normed, block_idx, LoraTarget::ImgV)?;
-        let txt_q = self.add_lora(self.matmul_bias(&txt_normed, self.bw(block_idx, "attn.add_q_proj.weight")?, Some(self.bw(block_idx, "attn.add_q_proj.bias")?))?, &txt_normed, block_idx, LoraTarget::TxtQ)?;
-        let txt_k = self.add_lora(self.matmul_bias(&txt_normed, self.bw(block_idx, "attn.add_k_proj.weight")?, Some(self.bw(block_idx, "attn.add_k_proj.bias")?))?, &txt_normed, block_idx, LoraTarget::TxtK)?;
-        let txt_v = self.add_lora(self.matmul_bias(&txt_normed, self.bw(block_idx, "attn.add_v_proj.weight")?, Some(self.bw(block_idx, "attn.add_v_proj.bias")?))?, &txt_normed, block_idx, LoraTarget::TxtV)?;
+        let img_q = self.add_lora(
+            self.matmul_bias(
+                &img_normed,
+                self.bw(block_idx, "attn.to_q.weight")?,
+                Some(self.bw(block_idx, "attn.to_q.bias")?),
+            )?,
+            &img_normed,
+            block_idx,
+            LoraTarget::ImgQ,
+        )?;
+        let img_k = self.add_lora(
+            self.matmul_bias(
+                &img_normed,
+                self.bw(block_idx, "attn.to_k.weight")?,
+                Some(self.bw(block_idx, "attn.to_k.bias")?),
+            )?,
+            &img_normed,
+            block_idx,
+            LoraTarget::ImgK,
+        )?;
+        let img_v = self.add_lora(
+            self.matmul_bias(
+                &img_normed,
+                self.bw(block_idx, "attn.to_v.weight")?,
+                Some(self.bw(block_idx, "attn.to_v.bias")?),
+            )?,
+            &img_normed,
+            block_idx,
+            LoraTarget::ImgV,
+        )?;
+        let txt_q = self.add_lora(
+            self.matmul_bias(
+                &txt_normed,
+                self.bw(block_idx, "attn.add_q_proj.weight")?,
+                Some(self.bw(block_idx, "attn.add_q_proj.bias")?),
+            )?,
+            &txt_normed,
+            block_idx,
+            LoraTarget::TxtQ,
+        )?;
+        let txt_k = self.add_lora(
+            self.matmul_bias(
+                &txt_normed,
+                self.bw(block_idx, "attn.add_k_proj.weight")?,
+                Some(self.bw(block_idx, "attn.add_k_proj.bias")?),
+            )?,
+            &txt_normed,
+            block_idx,
+            LoraTarget::TxtK,
+        )?;
+        let txt_v = self.add_lora(
+            self.matmul_bias(
+                &txt_normed,
+                self.bw(block_idx, "attn.add_v_proj.weight")?,
+                Some(self.bw(block_idx, "attn.add_v_proj.bias")?),
+            )?,
+            &txt_normed,
+            block_idx,
+            LoraTarget::TxtV,
+        )?;
 
         // QK norm
-        let img_q = rms_norm_per_head(&img_q, self.bw(block_idx, "attn.norm_q.weight")?, NUM_HEADS, HEAD_DIM)?;
-        let img_k = rms_norm_per_head(&img_k, self.bw(block_idx, "attn.norm_k.weight")?, NUM_HEADS, HEAD_DIM)?;
-        let txt_q = rms_norm_per_head(&txt_q, self.bw(block_idx, "attn.norm_added_q.weight")?, NUM_HEADS, HEAD_DIM)?;
-        let txt_k = rms_norm_per_head(&txt_k, self.bw(block_idx, "attn.norm_added_k.weight")?, NUM_HEADS, HEAD_DIM)?;
+        let img_q = rms_norm_per_head(
+            &img_q,
+            self.bw(block_idx, "attn.norm_q.weight")?,
+            NUM_HEADS,
+            HEAD_DIM,
+        )?;
+        let img_k = rms_norm_per_head(
+            &img_k,
+            self.bw(block_idx, "attn.norm_k.weight")?,
+            NUM_HEADS,
+            HEAD_DIM,
+        )?;
+        let txt_q = rms_norm_per_head(
+            &txt_q,
+            self.bw(block_idx, "attn.norm_added_q.weight")?,
+            NUM_HEADS,
+            HEAD_DIM,
+        )?;
+        let txt_k = rms_norm_per_head(
+            &txt_k,
+            self.bw(block_idx, "attn.norm_added_k.weight")?,
+            NUM_HEADS,
+            HEAD_DIM,
+        )?;
 
         // Apply RoPE
         let img_q_4d = img_q.reshape(&[b, img_seq, NUM_HEADS, HEAD_DIM])?;
@@ -1518,17 +1909,33 @@ impl QwenImageTrainingModel {
         };
 
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-        let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, total_seq, DIM])?;
+        let attn_out = attn_out
+            .permute(&[0, 2, 1, 3])?
+            .reshape(&[b, total_seq, DIM])?;
 
         let img_attn = attn_out.narrow(1, 0, img_seq)?;
         let txt_attn = attn_out.narrow(1, img_seq, txt_seq)?;
 
         let img_attn_out = self.add_lora(
-            self.matmul_bias(&img_attn, self.bw(block_idx, "attn.to_out.0.weight")?, Some(self.bw(block_idx, "attn.to_out.0.bias")?))?,
-            &img_attn, block_idx, LoraTarget::ImgOut)?;
+            self.matmul_bias(
+                &img_attn,
+                self.bw(block_idx, "attn.to_out.0.weight")?,
+                Some(self.bw(block_idx, "attn.to_out.0.bias")?),
+            )?,
+            &img_attn,
+            block_idx,
+            LoraTarget::ImgOut,
+        )?;
         let txt_attn_out = self.add_lora(
-            self.matmul_bias(&txt_attn, self.bw(block_idx, "attn.to_add_out.weight")?, Some(self.bw(block_idx, "attn.to_add_out.bias")?))?,
-            &txt_attn, block_idx, LoraTarget::TxtOut)?;
+            self.matmul_bias(
+                &txt_attn,
+                self.bw(block_idx, "attn.to_add_out.weight")?,
+                Some(self.bw(block_idx, "attn.to_add_out.bias")?),
+            )?,
+            &txt_attn,
+            block_idx,
+            LoraTarget::TxtOut,
+        )?;
 
         // Per-region gated residual (img); txt unchanged.
         let img_gate1 = gate_split(&img_attn_out, &img_chunks[2])?;
@@ -1539,24 +1946,54 @@ impl QwenImageTrainingModel {
         let img_norm2 = flame_core::layer_norm::layer_norm(&img, &[DIM], None, None, NORM_EPS)?;
         let img_ffn_in = modulate_split(&img_norm2, &img_chunks[4], &img_chunks[3])?;
         let img_ffn_up = self.add_lora(
-            self.matmul_bias(&img_ffn_in, self.bw(block_idx, "img_mlp.net.0.proj.weight")?, Some(self.bw(block_idx, "img_mlp.net.0.proj.bias")?))?,
-            &img_ffn_in, block_idx, LoraTarget::ImgFfnUp)?;
+            self.matmul_bias(
+                &img_ffn_in,
+                self.bw(block_idx, "img_mlp.net.0.proj.weight")?,
+                Some(self.bw(block_idx, "img_mlp.net.0.proj.bias")?),
+            )?,
+            &img_ffn_in,
+            block_idx,
+            LoraTarget::ImgFfnUp,
+        )?;
         let img_ffn_act = img_ffn_up.gelu()?;
         let img_ffn_down = self.add_lora(
-            self.matmul_bias(&img_ffn_act, self.bw(block_idx, "img_mlp.net.2.weight")?, Some(self.bw(block_idx, "img_mlp.net.2.bias")?))?,
-            &img_ffn_act, block_idx, LoraTarget::ImgFfnDown)?;
+            self.matmul_bias(
+                &img_ffn_act,
+                self.bw(block_idx, "img_mlp.net.2.weight")?,
+                Some(self.bw(block_idx, "img_mlp.net.2.bias")?),
+            )?,
+            &img_ffn_act,
+            block_idx,
+            LoraTarget::ImgFfnDown,
+        )?;
         let img_gate2 = gate_split(&img_ffn_down, &img_chunks[5])?;
         let img = img.add(&img_gate2)?;
 
         let txt_norm2 = flame_core::layer_norm::layer_norm(&txt, &[DIM], None, None, NORM_EPS)?;
-        let txt_ffn_in = txt_norm2.mul(&txt_chunks[4].add_scalar(1.0)?)?.add(&txt_chunks[0 + 3])?;
+        let txt_ffn_in = txt_norm2
+            .mul(&txt_chunks[4].add_scalar(1.0)?)?
+            .add(&txt_chunks[0 + 3])?;
         let txt_ffn_up = self.add_lora(
-            self.matmul_bias(&txt_ffn_in, self.bw(block_idx, "txt_mlp.net.0.proj.weight")?, Some(self.bw(block_idx, "txt_mlp.net.0.proj.bias")?))?,
-            &txt_ffn_in, block_idx, LoraTarget::TxtFfnUp)?;
+            self.matmul_bias(
+                &txt_ffn_in,
+                self.bw(block_idx, "txt_mlp.net.0.proj.weight")?,
+                Some(self.bw(block_idx, "txt_mlp.net.0.proj.bias")?),
+            )?,
+            &txt_ffn_in,
+            block_idx,
+            LoraTarget::TxtFfnUp,
+        )?;
         let txt_ffn_act = txt_ffn_up.gelu()?;
         let txt_ffn_down = self.add_lora(
-            self.matmul_bias(&txt_ffn_act, self.bw(block_idx, "txt_mlp.net.2.weight")?, Some(self.bw(block_idx, "txt_mlp.net.2.bias")?))?,
-            &txt_ffn_act, block_idx, LoraTarget::TxtFfnDown)?;
+            self.matmul_bias(
+                &txt_ffn_act,
+                self.bw(block_idx, "txt_mlp.net.2.weight")?,
+                Some(self.bw(block_idx, "txt_mlp.net.2.bias")?),
+            )?,
+            &txt_ffn_act,
+            block_idx,
+            LoraTarget::TxtFfnDown,
+        )?;
         let txt = txt.add(&txt_chunks[5].mul(&txt_ffn_down)?)?;
 
         Ok((img, txt))
@@ -1574,7 +2011,9 @@ pub fn sinusoidal_embedding_pub(t: &Tensor) -> Result<Tensor> {
 
 impl QwenImageTrainingModel {
     /// Public access to a resident weight tensor (used by parity test).
-    pub fn w_pub(&self, key: &str) -> Result<&Tensor> { self.w(key) }
+    pub fn w_pub(&self, key: &str) -> Result<&Tensor> {
+        self.w(key)
+    }
     /// Public access to fused_linear (used by parity test).
     pub fn fused_linear_pub(&self, x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
         self.fused_linear(x, w, b)
@@ -1595,25 +2034,45 @@ impl QwenImageTrainingModel {
         let (txt_cos, txt_sin) = compute_text_rope(txt_seq, pack_h, pack_w, ROPE_THETA)?;
 
         let temb = sinusoidal_embedding(timestep, 256)?;
-        let temb = self.fused_linear(&temb, self.w("time_text_embed.timestep_embedder.linear_1.weight")?,
-            Some(self.w("time_text_embed.timestep_embedder.linear_1.bias")?))?;
+        let temb = self.fused_linear(
+            &temb,
+            self.w("time_text_embed.timestep_embedder.linear_1.weight")?,
+            Some(self.w("time_text_embed.timestep_embedder.linear_1.bias")?),
+        )?;
         let temb = temb.silu()?;
-        let temb = self.fused_linear(&temb, self.w("time_text_embed.timestep_embedder.linear_2.weight")?,
-            Some(self.w("time_text_embed.timestep_embedder.linear_2.bias")?))?;
+        let temb = self.fused_linear(
+            &temb,
+            self.w("time_text_embed.timestep_embedder.linear_2.weight")?,
+            Some(self.w("time_text_embed.timestep_embedder.linear_2.bias")?),
+        )?;
 
-        let mut img = self.fused_linear(packed_noisy, self.w("img_in.weight")?, Some(self.w("img_in.bias")?))?;
-        let txt_normed = flame_core::norm::rms_norm(txt_embed, &[JOINT_DIM], Some(self.w("txt_norm.weight")?), NORM_EPS)?;
-        let mut txt = self.fused_linear(&txt_normed, self.w("txt_in.weight")?, Some(self.w("txt_in.bias")?))?;
+        let mut img = self.fused_linear(
+            packed_noisy,
+            self.w("img_in.weight")?,
+            Some(self.w("img_in.bias")?),
+        )?;
+        let txt_normed = flame_core::norm::rms_norm(
+            txt_embed,
+            &[JOINT_DIM],
+            Some(self.w("txt_norm.weight")?),
+            NORM_EPS,
+        )?;
+        let mut txt = self.fused_linear(
+            &txt_normed,
+            self.w("txt_in.weight")?,
+            Some(self.w("txt_in.bias")?),
+        )?;
 
         let n_blocks = std::env::var("QWENIMAGE_MAX_BLOCKS")
-            .ok().and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.min(NUM_LAYERS)).unwrap_or(NUM_LAYERS);
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.min(NUM_LAYERS))
+            .unwrap_or(NUM_LAYERS);
 
         let mut block_outputs = Vec::new();
         for i in 0..n_blocks {
-            let (new_img, new_txt) = self.dual_stream_block(
-                &img, &txt, &temb, i, &img_cos, &img_sin, &txt_cos, &txt_sin,
-            )?;
+            let (new_img, new_txt) = self
+                .dual_stream_block(&img, &txt, &temb, i, &img_cos, &img_sin, &txt_cos, &txt_sin)?;
             img = new_img;
             txt = new_txt;
             block_outputs.push((img.clone(), txt.clone()));
@@ -1621,14 +2080,21 @@ impl QwenImageTrainingModel {
 
         let hidden = img.shape().dims()[2];
         let norm_emb = temb.silu()?;
-        let norm_out = self.fused_linear(&norm_emb,
-            self.w("norm_out.linear.weight")?, Some(self.w("norm_out.linear.bias")?))?;
+        let norm_out = self.fused_linear(
+            &norm_emb,
+            self.w("norm_out.linear.weight")?,
+            Some(self.w("norm_out.linear.bias")?),
+        )?;
         let chunks = norm_out.unsqueeze(1)?.chunk(2, 2)?;
         let scale = &chunks[0];
         let shift = &chunks[1];
         let img_norm = flame_core::layer_norm::layer_norm(&img, &[hidden], None, None, NORM_EPS)?;
         let img_out = img_norm.mul(&scale.add_scalar(1.0)?)?.add(shift)?;
-        let pred = self.matmul_bias(&img_out, self.w("proj_out.weight")?, Some(self.w("proj_out.bias")?))?;
+        let pred = self.matmul_bias(
+            &img_out,
+            self.w("proj_out.weight")?,
+            Some(self.w("proj_out.bias")?),
+        )?;
 
         Ok((pred, block_outputs))
     }
@@ -1671,7 +2137,8 @@ fn dual_stream_block_standalone(
 
     let bw = |suffix: &str| -> Result<&Tensor> {
         let key = format!("transformer_blocks.{block_idx}.{suffix}");
-        weights.get(&key)
+        weights
+            .get(&key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
     };
 
@@ -1685,12 +2152,14 @@ fn dual_stream_block_standalone(
         // had `weight.transpose()?` here but never ran (untested code).
         let dims = x.shape().dims().to_vec();
         let in_feat = *dims.last().unwrap();
-        let batch: usize = dims[..dims.len()-1].iter().product();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
         let out_feat = weight.shape().dims()[1];
         let x_2d = x.reshape(&[batch, in_feat])?;
         let mut out = x_2d.matmul(weight)?;
-        if let Some(b) = bias { out = out.add(b)?; }
-        let mut out_shape = dims[..dims.len()-1].to_vec();
+        if let Some(b) = bias {
+            out = out.add(b)?;
+        }
+        let mut out_shape = dims[..dims.len() - 1].to_vec();
         out_shape.push(out_feat);
         out.reshape(&out_shape)
     };
@@ -1701,7 +2170,11 @@ fn dual_stream_block_standalone(
         // falls back to the legacy plain-LoRA map. Byte-equivalent to the
         // pre-Phase-2b path when no LyCORIS algo is active.
         if let Some(adapter) = bundle.adapter_for(block_idx, target) {
-            let input_3d = if input.shape().dims().len() == 2 { input.unsqueeze(0)? } else { input.clone() };
+            let input_3d = if input.shape().dims().len() == 2 {
+                input.unsqueeze(0)?
+            } else {
+                input.clone()
+            };
             let delta = adapter.forward_delta(&input_3d)?;
             base.add(&delta)
         } else {
@@ -1719,21 +2192,31 @@ fn dual_stream_block_standalone(
 
     // Image modulation
     let img_mod = temb.silu()?;
-    let img_mod = matmul_bias(&img_mod, bw("img_mod.1.weight")?, Some(bw("img_mod.1.bias")?))?;
+    let img_mod = matmul_bias(
+        &img_mod,
+        bw("img_mod.1.weight")?,
+        Some(bw("img_mod.1.bias")?),
+    )?;
 
     // DIAG-STD: dump img_mod (post-projection, pre-chunk).
     if block_idx <= 1 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1") {
         let v = img_mod.to_dtype(DType::F32)?.to_vec()?;
         let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         let mean_abs: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
-        log::warn!("[DIAG-STD b{block_idx}] img_mod (post-proj): max={max_abs:.2} mean={mean_abs:.4}");
+        log::warn!(
+            "[DIAG-STD b{block_idx}] img_mod (post-proj): max={max_abs:.2} mean={mean_abs:.4}"
+        );
     }
 
     let img_chunks = img_mod.unsqueeze(1)?.chunk(6, 2)?;
 
     // Text modulation
     let txt_mod = temb.silu()?;
-    let txt_mod = matmul_bias(&txt_mod, bw("txt_mod.1.weight")?, Some(bw("txt_mod.1.bias")?))?;
+    let txt_mod = matmul_bias(
+        &txt_mod,
+        bw("txt_mod.1.weight")?,
+        Some(bw("txt_mod.1.bias")?),
+    )?;
     let txt_chunks = txt_mod.unsqueeze(1)?.chunk(6, 2)?;
 
     // Side-by-side: also call dual_stream_block_iflame in no_grad mode at
@@ -1742,32 +2225,42 @@ fn dual_stream_block_standalone(
     if block_idx == 0 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1") {
         // Build joint pe_cos/pe_sin from per-stream tables (txt-first cat).
         let pe_cos = flame_core::tensor::Tensor::cat(&[txt_cos, img_cos], 0)?
-            .unsqueeze(0)?.unsqueeze(0)?;
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
         let pe_sin = flame_core::tensor::Tensor::cat(&[txt_sin, img_sin], 0)?
-            .unsqueeze(0)?.unsqueeze(0)?;
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
         let _guard = flame_core::autograd::AutogradContext::no_grad();
         // Discard outputs — we only care about the dump_iflame side-effects.
         let _ = dual_stream_block_iflame(
-            img, txt, temb, block_idx,
-            &pe_cos, &pe_sin, img_cos, img_sin, txt_cos, txt_sin,
+            img, txt, temb, block_idx, &pe_cos, &pe_sin, img_cos, img_sin, txt_cos, txt_sin,
             weights, bundle,
         );
     }
 
     // Pre-norm + modulate
     let img_norm1 = flame_core::layer_norm::layer_norm(img, &[DIM], None, None, NORM_EPS)?;
-    let img_normed = img_norm1.mul(&img_chunks[1].add_scalar(1.0)?)?.add(&img_chunks[0])?;
+    let img_normed = img_norm1
+        .mul(&img_chunks[1].add_scalar(1.0)?)?
+        .add(&img_chunks[0])?;
     let txt_norm1 = flame_core::layer_norm::layer_norm(txt, &[DIM], None, None, NORM_EPS)?;
-    let txt_normed = txt_norm1.mul(&txt_chunks[1].add_scalar(1.0)?)?.add(&txt_chunks[0])?;
+    let txt_normed = txt_norm1
+        .mul(&txt_chunks[1].add_scalar(1.0)?)?
+        .add(&txt_chunks[0])?;
 
     // DIAG: bisect where the magnitude blows up
     let diag = block_idx <= 2 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1");
     let dump = |name: &str, t: &Tensor| -> Result<()> {
-        if !diag { return Ok(()); }
+        if !diag {
+            return Ok(());
+        }
         let v = t.to_dtype(DType::F32)?.to_vec()?;
         let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         let mean_abs: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
-        log::warn!("[DIAG b{block_idx}] {name}: max={max_abs:.2} mean={mean_abs:.4} numel={}", v.len());
+        log::warn!(
+            "[DIAG b{block_idx}] {name}: max={max_abs:.2} mean={mean_abs:.4} numel={}",
+            v.len()
+        );
         Ok(())
     };
     dump("img_in", img)?;
@@ -1777,14 +2270,62 @@ fn dual_stream_block_standalone(
     dump("img_chunks[0]_shift", &img_chunks[0])?;
 
     // Q/K/V with LoRA
-    let img_q = add_lora(matmul_bias(&img_normed, bw("attn.to_q.weight")?, Some(bw("attn.to_q.bias")?))?, &img_normed, LoraTarget::ImgQ)?;
-    let img_k = add_lora(matmul_bias(&img_normed, bw("attn.to_k.weight")?, Some(bw("attn.to_k.bias")?))?, &img_normed, LoraTarget::ImgK)?;
-    let img_v = add_lora(matmul_bias(&img_normed, bw("attn.to_v.weight")?, Some(bw("attn.to_v.bias")?))?, &img_normed, LoraTarget::ImgV)?;
+    let img_q = add_lora(
+        matmul_bias(
+            &img_normed,
+            bw("attn.to_q.weight")?,
+            Some(bw("attn.to_q.bias")?),
+        )?,
+        &img_normed,
+        LoraTarget::ImgQ,
+    )?;
+    let img_k = add_lora(
+        matmul_bias(
+            &img_normed,
+            bw("attn.to_k.weight")?,
+            Some(bw("attn.to_k.bias")?),
+        )?,
+        &img_normed,
+        LoraTarget::ImgK,
+    )?;
+    let img_v = add_lora(
+        matmul_bias(
+            &img_normed,
+            bw("attn.to_v.weight")?,
+            Some(bw("attn.to_v.bias")?),
+        )?,
+        &img_normed,
+        LoraTarget::ImgV,
+    )?;
     dump("img_q", &img_q)?;
     dump("img_v", &img_v)?;
-    let txt_q = add_lora(matmul_bias(&txt_normed, bw("attn.add_q_proj.weight")?, Some(bw("attn.add_q_proj.bias")?))?, &txt_normed, LoraTarget::TxtQ)?;
-    let txt_k = add_lora(matmul_bias(&txt_normed, bw("attn.add_k_proj.weight")?, Some(bw("attn.add_k_proj.bias")?))?, &txt_normed, LoraTarget::TxtK)?;
-    let txt_v = add_lora(matmul_bias(&txt_normed, bw("attn.add_v_proj.weight")?, Some(bw("attn.add_v_proj.bias")?))?, &txt_normed, LoraTarget::TxtV)?;
+    let txt_q = add_lora(
+        matmul_bias(
+            &txt_normed,
+            bw("attn.add_q_proj.weight")?,
+            Some(bw("attn.add_q_proj.bias")?),
+        )?,
+        &txt_normed,
+        LoraTarget::TxtQ,
+    )?;
+    let txt_k = add_lora(
+        matmul_bias(
+            &txt_normed,
+            bw("attn.add_k_proj.weight")?,
+            Some(bw("attn.add_k_proj.bias")?),
+        )?,
+        &txt_normed,
+        LoraTarget::TxtK,
+    )?;
+    let txt_v = add_lora(
+        matmul_bias(
+            &txt_normed,
+            bw("attn.add_v_proj.weight")?,
+            Some(bw("attn.add_v_proj.bias")?),
+        )?,
+        &txt_normed,
+        LoraTarget::TxtV,
+    )?;
 
     // QK norm
     let img_q = rms_norm_per_head(&img_q, bw("attn.norm_q.weight")?, NUM_HEADS, HEAD_DIM)?;
@@ -1814,7 +2355,9 @@ fn dual_stream_block_standalone(
     dump("v", &v)?;
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
     dump("attn_out_pre_perm", &attn_out)?;
-    let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, total_seq, DIM])?;
+    let attn_out = attn_out
+        .permute(&[0, 2, 1, 3])?
+        .reshape(&[b, total_seq, DIM])?;
     dump("attn_out_post_reshape", &attn_out)?;
 
     // Split img/txt
@@ -1824,11 +2367,23 @@ fn dual_stream_block_standalone(
 
     // Output projections with LoRA
     let img_attn_out = add_lora(
-        matmul_bias(&img_attn, bw("attn.to_out.0.weight")?, Some(bw("attn.to_out.0.bias")?))?,
-        &img_attn, LoraTarget::ImgOut)?;
+        matmul_bias(
+            &img_attn,
+            bw("attn.to_out.0.weight")?,
+            Some(bw("attn.to_out.0.bias")?),
+        )?,
+        &img_attn,
+        LoraTarget::ImgOut,
+    )?;
     let txt_attn_out = add_lora(
-        matmul_bias(&txt_attn, bw("attn.to_add_out.weight")?, Some(bw("attn.to_add_out.bias")?))?,
-        &txt_attn, LoraTarget::TxtOut)?;
+        matmul_bias(
+            &txt_attn,
+            bw("attn.to_add_out.weight")?,
+            Some(bw("attn.to_add_out.bias")?),
+        )?,
+        &txt_attn,
+        LoraTarget::TxtOut,
+    )?;
 
     // Gated residual
     let img = img.add(&img_chunks[2].mul(&img_attn_out)?)?;
@@ -1836,25 +2391,53 @@ fn dual_stream_block_standalone(
 
     // FFN with LoRA
     let img_norm2 = flame_core::layer_norm::layer_norm(&img, &[DIM], None, None, NORM_EPS)?;
-    let img_ffn_in = img_norm2.mul(&img_chunks[4].add_scalar(1.0)?)?.add(&img_chunks[3])?;
+    let img_ffn_in = img_norm2
+        .mul(&img_chunks[4].add_scalar(1.0)?)?
+        .add(&img_chunks[3])?;
     let img_ffn_up = add_lora(
-        matmul_bias(&img_ffn_in, bw("img_mlp.net.0.proj.weight")?, Some(bw("img_mlp.net.0.proj.bias")?))?,
-        &img_ffn_in, LoraTarget::ImgFfnUp)?;
+        matmul_bias(
+            &img_ffn_in,
+            bw("img_mlp.net.0.proj.weight")?,
+            Some(bw("img_mlp.net.0.proj.bias")?),
+        )?,
+        &img_ffn_in,
+        LoraTarget::ImgFfnUp,
+    )?;
     let img_ffn_act = img_ffn_up.gelu()?;
     let img_ffn_down = add_lora(
-        matmul_bias(&img_ffn_act, bw("img_mlp.net.2.weight")?, Some(bw("img_mlp.net.2.bias")?))?,
-        &img_ffn_act, LoraTarget::ImgFfnDown)?;
+        matmul_bias(
+            &img_ffn_act,
+            bw("img_mlp.net.2.weight")?,
+            Some(bw("img_mlp.net.2.bias")?),
+        )?,
+        &img_ffn_act,
+        LoraTarget::ImgFfnDown,
+    )?;
     let img = img.add(&img_chunks[5].mul(&img_ffn_down)?)?;
 
     let txt_norm2 = flame_core::layer_norm::layer_norm(&txt, &[DIM], None, None, NORM_EPS)?;
-    let txt_ffn_in = txt_norm2.mul(&txt_chunks[4].add_scalar(1.0)?)?.add(&txt_chunks[3])?;
+    let txt_ffn_in = txt_norm2
+        .mul(&txt_chunks[4].add_scalar(1.0)?)?
+        .add(&txt_chunks[3])?;
     let txt_ffn_up = add_lora(
-        matmul_bias(&txt_ffn_in, bw("txt_mlp.net.0.proj.weight")?, Some(bw("txt_mlp.net.0.proj.bias")?))?,
-        &txt_ffn_in, LoraTarget::TxtFfnUp)?;
+        matmul_bias(
+            &txt_ffn_in,
+            bw("txt_mlp.net.0.proj.weight")?,
+            Some(bw("txt_mlp.net.0.proj.bias")?),
+        )?,
+        &txt_ffn_in,
+        LoraTarget::TxtFfnUp,
+    )?;
     let txt_ffn_act = txt_ffn_up.gelu()?;
     let txt_ffn_down = add_lora(
-        matmul_bias(&txt_ffn_act, bw("txt_mlp.net.2.weight")?, Some(bw("txt_mlp.net.2.bias")?))?,
-        &txt_ffn_act, LoraTarget::TxtFfnDown)?;
+        matmul_bias(
+            &txt_ffn_act,
+            bw("txt_mlp.net.2.weight")?,
+            Some(bw("txt_mlp.net.2.bias")?),
+        )?,
+        &txt_ffn_act,
+        LoraTarget::TxtFfnDown,
+    )?;
     let txt = txt.add(&txt_chunks[5].mul(&txt_ffn_down)?)?;
 
     Ok((img, txt))
@@ -1911,7 +2494,8 @@ fn dual_stream_block_iflame(
 
     let w = |suffix: &str| -> Result<&Tensor> {
         let key = format!("{prefix}.{suffix}");
-        weights.get(&key)
+        weights
+            .get(&key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {key}")))
     };
 
@@ -1927,20 +2511,19 @@ fn dual_stream_block_iflame(
     //
     // Offloader is configured with `native_layout=false` (legacy default)
     // so weights arrive logically `[Cin, Cout]` already.
-    let linear_bias =
-        |x: &Tensor, weight: &Tensor, bias: &Tensor| -> Result<Tensor> {
-            let _ = fused_linear3d_native;
-            let dims = x.shape().dims().to_vec();
-            let in_feat = *dims.last().unwrap();
-            let batch: usize = dims[..dims.len()-1].iter().product();
-            let out_feat = weight.shape().dims()[1];
-            let x_2d = x.reshape(&[batch, in_feat])?;
-            let mut out = x_2d.matmul(weight)?;
-            out = out.add(bias)?;
-            let mut out_shape = dims[..dims.len()-1].to_vec();
-            out_shape.push(out_feat);
-            out.reshape(&out_shape)
-        };
+    let linear_bias = |x: &Tensor, weight: &Tensor, bias: &Tensor| -> Result<Tensor> {
+        let _ = fused_linear3d_native;
+        let dims = x.shape().dims().to_vec();
+        let in_feat = *dims.last().unwrap();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
+        let out_feat = weight.shape().dims()[1];
+        let x_2d = x.reshape(&[batch, in_feat])?;
+        let mut out = x_2d.matmul(weight)?;
+        out = out.add(bias)?;
+        let mut out_shape = dims[..dims.len() - 1].to_vec();
+        out_shape.push(out_feat);
+        out.reshape(&out_shape)
+    };
 
     // LoRA adapter: maps the inference-flame weight suffix to EDv2's
     // `LoraTarget` enum and applies `forward_delta` if a per-block adapter
@@ -1966,7 +2549,11 @@ fn dual_stream_block_iflame(
         };
         if let Some(target) = target {
             if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
-                let input_3d = if x.shape().dims().len() == 2 { x.unsqueeze(0)? } else { x.clone() };
+                let input_3d = if x.shape().dims().len() == 2 {
+                    x.unsqueeze(0)?
+                } else {
+                    x.clone()
+                };
                 let delta = lora.forward_delta(&input_3d)?;
                 return base.add(&delta);
             }
@@ -2018,15 +2605,26 @@ fn dual_stream_block_iflame(
     // `temb` arrives as [B, dim]. The Linear expects 3D input; unsqueeze to
     // [B, 1, dim] and squeeze back.
     let temb_silu = temb.silu()?;
-    let img_mods = lin_lora(&temb_silu.unsqueeze(1)?, "img_mod.1.weight", "img_mod.1.bias")?
-        .squeeze(Some(1))?;
-    let txt_mods = lin_lora(&temb_silu.unsqueeze(1)?, "txt_mod.1.weight", "txt_mod.1.bias")?
-        .squeeze(Some(1))?;
+    let img_mods = lin_lora(
+        &temb_silu.unsqueeze(1)?,
+        "img_mod.1.weight",
+        "img_mod.1.bias",
+    )?
+    .squeeze(Some(1))?;
+    let txt_mods = lin_lora(
+        &temb_silu.unsqueeze(1)?,
+        "txt_mod.1.weight",
+        "txt_mod.1.bias",
+    )?
+    .squeeze(Some(1))?;
 
     // Side-by-side bisect with standalone path. Set QWEN_DIAG_BISECT=1.
-    let diag_iflame = block_idx <= 1 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1");
+    let diag_iflame =
+        block_idx <= 1 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1");
     let dump_iflame = |name: &str, t: &Tensor| -> Result<()> {
-        if !diag_iflame { return Ok(()); }
+        if !diag_iflame {
+            return Ok(());
+        }
         let v = t.to_dtype(DType::F32)?.to_vec()?;
         let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         let mean_abs: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
@@ -2045,17 +2643,17 @@ fn dual_stream_block_iflame(
 
     let img_shift1 = img_mod1.narrow(1, 0, dim)?;
     let img_scale1 = img_mod1.narrow(1, dim, dim)?;
-    let img_gate1  = img_mod1.narrow(1, 2 * dim, dim)?;
+    let img_gate1 = img_mod1.narrow(1, 2 * dim, dim)?;
     let img_shift2 = img_mod2.narrow(1, 0, dim)?;
     let img_scale2 = img_mod2.narrow(1, dim, dim)?;
-    let img_gate2  = img_mod2.narrow(1, 2 * dim, dim)?;
+    let img_gate2 = img_mod2.narrow(1, 2 * dim, dim)?;
 
     let txt_shift1 = txt_mod1.narrow(1, 0, dim)?;
     let txt_scale1 = txt_mod1.narrow(1, dim, dim)?;
-    let txt_gate1  = txt_mod1.narrow(1, 2 * dim, dim)?;
+    let txt_gate1 = txt_mod1.narrow(1, 2 * dim, dim)?;
     let txt_shift2 = txt_mod2.narrow(1, 0, dim)?;
     let txt_scale2 = txt_mod2.narrow(1, dim, dim)?;
-    let txt_gate2  = txt_mod2.narrow(1, 2 * dim, dim)?;
+    let txt_gate2 = txt_mod2.narrow(1, 2 * dim, dim)?;
 
     // ── norm1 + modulate for both streams ──
     //   norm(x) * (1 + scale)[:, None] + shift[:, None]
@@ -2079,12 +2677,24 @@ fn dual_stream_block_iflame(
     let img_v = lin_lora(&img_modulated, "attn.to_v.weight", "attn.to_v.bias")?
         .reshape(&[b, n_img, h, d])?;
 
-    let txt_q = lin_lora(&txt_modulated, "attn.add_q_proj.weight", "attn.add_q_proj.bias")?
-        .reshape(&[b, n_txt, h, d])?;
-    let txt_k = lin_lora(&txt_modulated, "attn.add_k_proj.weight", "attn.add_k_proj.bias")?
-        .reshape(&[b, n_txt, h, d])?;
-    let txt_v = lin_lora(&txt_modulated, "attn.add_v_proj.weight", "attn.add_v_proj.bias")?
-        .reshape(&[b, n_txt, h, d])?;
+    let txt_q = lin_lora(
+        &txt_modulated,
+        "attn.add_q_proj.weight",
+        "attn.add_q_proj.bias",
+    )?
+    .reshape(&[b, n_txt, h, d])?;
+    let txt_k = lin_lora(
+        &txt_modulated,
+        "attn.add_k_proj.weight",
+        "attn.add_k_proj.bias",
+    )?
+    .reshape(&[b, n_txt, h, d])?;
+    let txt_v = lin_lora(
+        &txt_modulated,
+        "attn.add_v_proj.weight",
+        "attn.add_v_proj.bias",
+    )?
+    .reshape(&[b, n_txt, h, d])?;
 
     // ── QK RMSNorm — legacy `rms_norm_per_head` operates on
     // [B, S, H*D] (pre-reshape) and reshapes to [B*S*H, D] internally;
@@ -2114,7 +2724,9 @@ fn dual_stream_block_iflame(
 
     // ── Split img + txt back out (legacy order; matches the cat above) ──
     let total_n = n_txt + n_img;
-    let attn_2d = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, total_n, dim])?;
+    let attn_2d = attn_out
+        .permute(&[0, 2, 1, 3])?
+        .reshape(&[b, total_n, dim])?;
     let img_attn = attn_2d.narrow(1, 0, n_img)?;
     let txt_attn = attn_2d.narrow(1, n_img, n_txt)?;
 
@@ -2130,7 +2742,11 @@ fn dual_stream_block_iflame(
     let img_mlp_in = img_normed2
         .mul(&img_scale2.add_scalar(1.0)?.unsqueeze(1)?)?
         .add(&img_shift2.unsqueeze(1)?)?;
-    let img_mlp = lin_lora(&img_mlp_in, "img_mlp.net.0.proj.weight", "img_mlp.net.0.proj.bias")?;
+    let img_mlp = lin_lora(
+        &img_mlp_in,
+        "img_mlp.net.0.proj.weight",
+        "img_mlp.net.0.proj.bias",
+    )?;
     let img_mlp = img_mlp.gelu()?;
     let img_mlp = lin_lora(&img_mlp, "img_mlp.net.2.weight", "img_mlp.net.2.bias")?;
     let img = img.add(&img_gate2.unsqueeze(1)?.mul(&img_mlp)?)?;
@@ -2140,7 +2756,11 @@ fn dual_stream_block_iflame(
     let txt_mlp_in = txt_normed2
         .mul(&txt_scale2.add_scalar(1.0)?.unsqueeze(1)?)?
         .add(&txt_shift2.unsqueeze(1)?)?;
-    let txt_mlp = lin_lora(&txt_mlp_in, "txt_mlp.net.0.proj.weight", "txt_mlp.net.0.proj.bias")?;
+    let txt_mlp = lin_lora(
+        &txt_mlp_in,
+        "txt_mlp.net.0.proj.weight",
+        "txt_mlp.net.0.proj.bias",
+    )?;
     let txt_mlp = txt_mlp.gelu()?;
     let txt_mlp = lin_lora(&txt_mlp, "txt_mlp.net.2.weight", "txt_mlp.net.2.bias")?;
     let txt = txt.add(&txt_gate2.unsqueeze(1)?.mul(&txt_mlp)?)?;
@@ -2166,7 +2786,11 @@ fn rope_freqs_1d(positions: &[f32], dim: usize, theta: f64) -> Result<(Tensor, T
             sin_data[p_idx * half + k] = freq.sin() as f32;
         }
     }
-    let cos = Tensor::from_vec(cos_data, Shape::from_dims(&[positions.len(), half]), device.clone())?;
+    let cos = Tensor::from_vec(
+        cos_data,
+        Shape::from_dims(&[positions.len(), half]),
+        device.clone(),
+    )?;
     let sin = Tensor::from_vec(sin_data, Shape::from_dims(&[positions.len(), half]), device)?;
     Ok((cos, sin))
 }
@@ -2175,9 +2799,7 @@ fn rope_freqs_1d(positions: &[f32], dim: usize, theta: f64) -> Result<(Tensor, T
 ///
 /// `scale_rope=true`: center-symmetric positions for H/W.
 /// Returns `(cos, sin)` each `[img_seq, HEAD_DIM/2]` in BF16.
-pub fn compute_image_rope(
-    height: usize, width: usize, theta: f64,
-) -> Result<(Tensor, Tensor)> {
+pub fn compute_image_rope(height: usize, width: usize, theta: f64) -> Result<(Tensor, Tensor)> {
     let [frame_dim, h_dim, w_dim] = ROPE_AXES_DIMS;
     let frame = 1usize; // single image
 
@@ -2190,7 +2812,9 @@ pub fn compute_image_rope(
     // positions: [-(H-H/2)+1, ..., -1, 0, 1, ..., H/2-1] → centered
     let h_pos: Vec<f32> = {
         let half = height / 2;
-        let neg: Vec<f32> = (0..height - half).map(|i| -((height - half - i) as f32)).collect();
+        let neg: Vec<f32> = (0..height - half)
+            .map(|i| -((height - half - i) as f32))
+            .collect();
         let pos: Vec<f32> = (0..half).map(|i| i as f32).collect();
         [neg, pos].concat()
     };
@@ -2199,7 +2823,9 @@ pub fn compute_image_rope(
     // Width axis: same center-symmetric
     let w_pos: Vec<f32> = {
         let half = width / 2;
-        let neg: Vec<f32> = (0..width - half).map(|i| -((width - half - i) as f32)).collect();
+        let neg: Vec<f32> = (0..width - half)
+            .map(|i| -((width - half - i) as f32))
+            .collect();
         let pos: Vec<f32> = (0..half).map(|i| i as f32).collect();
         [neg, pos].concat()
     };
@@ -2252,8 +2878,12 @@ pub fn compute_image_rope(
         }
     }
 
-    let cos = Tensor::from_vec(cos_host, Shape::from_dims(&[seq, half_head]), device.clone())?
-        .to_dtype(DType::BF16)?;
+    let cos = Tensor::from_vec(
+        cos_host,
+        Shape::from_dims(&[seq, half_head]),
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
     let sin = Tensor::from_vec(sin_host, Shape::from_dims(&[seq, half_head]), device)?
         .to_dtype(DType::BF16)?;
     Ok((cos, sin))
@@ -2268,7 +2898,10 @@ pub fn compute_image_rope(
 ///
 /// Returns `(cos, sin)` each `[txt_seq, HEAD_DIM/2]` in BF16.
 pub fn compute_text_rope(
-    txt_seq: usize, height: usize, width: usize, theta: f64,
+    txt_seq: usize,
+    height: usize,
+    width: usize,
+    theta: f64,
 ) -> Result<(Tensor, Tensor)> {
     // scale_rope=True: text positions start at max(H/2, W/2)
     let max_vid_idx = (height / 2).max(width / 2);
@@ -2338,7 +2971,9 @@ pub fn compute_image_rope_multi(
         // Center-symmetric H (scale_rope=True)
         let h_pos: Vec<f32> = {
             let half = height / 2;
-            let neg: Vec<f32> = (0..height - half).map(|i| -((height - half - i) as f32)).collect();
+            let neg: Vec<f32> = (0..height - half)
+                .map(|i| -((height - half - i) as f32))
+                .collect();
             let pos: Vec<f32> = (0..half).map(|i| i as f32).collect();
             [neg, pos].concat()
         };
@@ -2349,7 +2984,9 @@ pub fn compute_image_rope_multi(
         // Center-symmetric W
         let w_pos: Vec<f32> = {
             let half = width / 2;
-            let neg: Vec<f32> = (0..width - half).map(|i| -((width - half - i) as f32)).collect();
+            let neg: Vec<f32> = (0..width - half)
+                .map(|i| -((width - half - i) as f32))
+                .collect();
             let pos: Vec<f32> = (0..half).map(|i| i as f32).collect();
             [neg, pos].concat()
         };
@@ -2378,8 +3015,12 @@ pub fn compute_image_rope_multi(
         cursor += height * width;
     }
 
-    let cos = Tensor::from_vec(cos_host, Shape::from_dims(&[total_seq, half_head]), device.clone())?
-        .to_dtype(DType::BF16)?;
+    let cos = Tensor::from_vec(
+        cos_host,
+        Shape::from_dims(&[total_seq, half_head]),
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
     let sin = Tensor::from_vec(sin_host, Shape::from_dims(&[total_seq, half_head]), device)?
         .to_dtype(DType::BF16)?;
     Ok((cos, sin))
@@ -2394,7 +3035,8 @@ pub fn compute_text_rope_multi(
     regions: &[(usize, usize)],
     theta: f64,
 ) -> Result<(Tensor, Tensor)> {
-    let max_vid_idx: usize = regions.iter()
+    let max_vid_idx: usize = regions
+        .iter()
         .map(|&(h, w)| (h / 2).max(w / 2))
         .max()
         .unwrap_or(0);
@@ -2435,11 +3077,17 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&out_re, &out_im], 4)?.reshape(&[b, s, h, d])
 }
 
-fn rms_norm_per_head(x: &Tensor, weight: &Tensor, num_heads: usize, head_dim: usize) -> Result<Tensor> {
+fn rms_norm_per_head(
+    x: &Tensor,
+    weight: &Tensor,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
     let dims = x.shape().dims().to_vec();
-    let batch: usize = dims[..dims.len()-1].iter().product();
+    let batch: usize = dims[..dims.len() - 1].iter().product();
     let flat = x.reshape(&[batch * num_heads, head_dim])?;
-    let normed = flame_core::norm::rms_norm(&flat.unsqueeze(0)?, &[head_dim], Some(weight), NORM_EPS)?;
+    let normed =
+        flame_core::norm::rms_norm(&flat.unsqueeze(0)?, &[head_dim], Some(weight), NORM_EPS)?;
     normed.reshape(&dims)
 }
 

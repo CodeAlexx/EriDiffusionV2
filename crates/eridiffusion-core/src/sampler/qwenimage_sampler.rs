@@ -5,9 +5,9 @@
 //! decoder (16-channel, same family as Z-Image but different scale/shift).
 //! Saves the output as a PNG preview.
 
+use crate::encoders::wan21_decoder::Wan21VaeDecoder;
 use cudarc::driver::CudaDevice;
 use flame_core::{autograd::AutogradContext, DType, Result, Shape, Tensor};
-use crate::encoders::wan21_decoder::Wan21VaeDecoder;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -153,12 +153,8 @@ fn sample_inner(
         let sigma_next = sigmas[step + 1];
         let dt = sigma_next - sigma_curr;
 
-        let t_vec = Tensor::from_vec(
-            vec![sigma_curr],
-            Shape::from_dims(&[1]),
-            device.clone(),
-        )?
-        .to_dtype(DType::BF16)?;
+        let t_vec = Tensor::from_vec(vec![sigma_curr], Shape::from_dims(&[1]), device.clone())?
+            .to_dtype(DType::BF16)?;
 
         // Conditional prediction
         let cond_pred = model.forward(&x, &t_vec, txt_embed, latent_h, latent_w)?;
@@ -212,10 +208,7 @@ fn sample_inner(
     // `qwenimage_decoder.rs::decode` → `wan21_vae::decode_image`, which
     // always applies `z = z * STD + MEAN` before forward).
     let t_vae = std::time::Instant::now();
-    let vae = Wan21VaeDecoder::from_safetensors(
-        &vae_path.to_string_lossy(),
-        device,
-    )?;
+    let vae = Wan21VaeDecoder::from_safetensors(&vae_path.to_string_lossy(), device)?;
     let rgb = vae.decode_image_normalized(&latent)?;
     log::info!("  VAE decoded in {:.1}s", t_vae.elapsed().as_secs_f32());
 
@@ -232,7 +225,9 @@ fn sample_inner(
 /// Returns None on failure (caller falls back to plain `comb`).
 fn norm_rescale_cfg(cond: &Tensor, comb: &Tensor) -> Option<Tensor> {
     let last_dim = cond.shape().dims().len().saturating_sub(1);
-    if last_dim == 0 { return None; }
+    if last_dim == 0 {
+        return None;
+    }
     let cond_sq = cond.mul(cond).ok()?;
     let comb_sq = comb.mul(comb).ok()?;
     let cond_sum = cond_sq.sum_dim_keepdim(last_dim).ok()?;
@@ -255,8 +250,7 @@ fn save_tensor_as_png(rgb: &Tensor, path: &Path) -> Result<()> {
         for x in 0..w {
             for ch in 0..3.min(c) {
                 let val = data[ch * h * w + y * w + x];
-                pixels[(y * w + x) * 3 + ch] =
-                    ((val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
+                pixels[(y * w + x) * 3 + ch] = ((val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
             }
         }
     }

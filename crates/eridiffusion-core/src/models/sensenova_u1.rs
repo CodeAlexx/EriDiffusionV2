@@ -139,9 +139,9 @@
 // BlockFacilitator + BlockOffloader were the only flame-diffusion types
 // the file referenced; EDv2 carries the same trait + struct under
 // `crate::training::block_offload::*`.
+use crate::training::block_offload::{BlockFacilitator, BlockOffloader};
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Error, Result, Shape, Tensor};
-use crate::training::block_offload::{BlockFacilitator, BlockOffloader};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -182,40 +182,40 @@ pub struct SenseNovaU1Config {
     pub max_position_embeddings: usize,    // 262144 (t-axis)
     pub max_position_embeddings_hw: usize, // 10000  (h/w axes)
     // Token IDs (sourced from config.json + tokenizer_config.json):
-    pub bos_token_id: i64,                 // 151643
-    pub eos_token_id: i64,                 // 151645
-    pub pad_token_id: i64,                 // 151643
+    pub bos_token_id: i64, // 151643
+    pub eos_token_id: i64, // 151645
+    pub pad_token_id: i64, // 151643
 
     // ---- Image / patching ----
-    pub patch_size: usize,        // 16
-    pub downsample_ratio: f32,    // 0.5  ⇒ merge_size = 1/0.5 = 2 (2×2 patch merge)
+    pub patch_size: usize,     // 16
+    pub downsample_ratio: f32, // 0.5  ⇒ merge_size = 1/0.5 = 2 (2×2 patch merge)
 
     // ---- Vision-model gen path (NEOVisionEmbeddings under fm_modules.vision_model_mot_gen) ----
-    pub vision_hidden_size: usize,        // 1024
-    pub rope_theta_vision: f64,           // 10_000.0
+    pub vision_hidden_size: usize,             // 1024
+    pub rope_theta_vision: f64,                // 10_000.0
     pub max_position_embeddings_vision: usize, // 10000
 
     // ---- Flow-matching ----
-    pub timestep_shift_train: f32,        // 1.0  (config "timestep_shift")  — training default
-    pub time_schedule: TimeSchedule,      // "standard"
-    pub time_shift_type: TimeShiftType,   // "exponential"
-    pub base_shift: f32,                  // 0.5
-    pub max_shift: f32,                   // 1.15
-    pub base_image_seq_len: usize,        // 64
-    pub max_image_seq_len: usize,         // 4096
+    pub timestep_shift_train: f32, // 1.0  (config "timestep_shift")  — training default
+    pub time_schedule: TimeSchedule, // "standard"
+    pub time_shift_type: TimeShiftType, // "exponential"
+    pub base_shift: f32,           // 0.5
+    pub max_shift: f32,            // 1.15
+    pub base_image_seq_len: usize, // 64
+    pub max_image_seq_len: usize,  // 4096
     pub noise_scale_mode: NoiseScaleMode, // "resolution"
     pub noise_scale_base_image_seq_len: usize, // 64
-    pub add_noise_scale_embedding: bool,  // true
-    pub noise_scale_max_value: f32,       // 8.0
-    pub noise_scale: f32,                 // 1.0
-    pub t_eps: f32,                       // 0.05
+    pub add_noise_scale_embedding: bool, // true
+    pub noise_scale_max_value: f32, // 8.0
+    pub noise_scale: f32,          // 1.0
+    pub t_eps: f32,                // 0.05
 
     // ---- fm_head ----
-    pub fm_head_dim: usize,        // 1536
-    pub fm_head_layers: usize,     // 2
-    pub use_pixel_head: bool,      // false
-    pub use_deep_fm_head: bool,    // false (config is silent → defaults to false)
-    pub use_adaln: bool,           // false
+    pub fm_head_dim: usize,     // 1536
+    pub fm_head_layers: usize,  // 2
+    pub use_pixel_head: bool,   // false
+    pub use_deep_fm_head: bool, // false (config is silent → defaults to false)
+    pub use_adaln: bool,        // false
 }
 
 impl Default for SenseNovaU1Config {
@@ -365,8 +365,7 @@ impl KvCache {
     /// keys sort lexicographically). Metadata header carries `prefix_len`,
     /// `next_t_index`, `num_layers` as strings.
     pub fn save_safetensors(&self, path: &Path) -> Result<()> {
-        let mut tensors: HashMap<String, Tensor> =
-            HashMap::with_capacity(self.layers.len() * 2);
+        let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(self.layers.len() * 2);
         for (i, (k, v)) in self.layers.iter().enumerate() {
             tensors.insert(format!("layer_{:03}.k", i), k.clone());
             tensors.insert(format!("layer_{:03}.v", i), v.clone());
@@ -389,7 +388,8 @@ impl KvCache {
             meta.get(k)
                 .ok_or_else(|| {
                     Error::InvalidInput(format!(
-                        "KvCache::load_safetensors: metadata missing `{k}` in {:?}", path
+                        "KvCache::load_safetensors: metadata missing `{k}` in {:?}",
+                        path
                     ))
                 })?
                 .parse::<usize>()
@@ -415,17 +415,23 @@ impl KvCache {
             let v_key = format!("layer_{:03}.v", i);
             let k = tensors.get(&k_key).ok_or_else(|| {
                 Error::InvalidInput(format!(
-                    "KvCache::load_safetensors: missing key {k_key} in {:?}", path
+                    "KvCache::load_safetensors: missing key {k_key} in {:?}",
+                    path
                 ))
             })?;
             let v = tensors.get(&v_key).ok_or_else(|| {
                 Error::InvalidInput(format!(
-                    "KvCache::load_safetensors: missing key {v_key} in {:?}", path
+                    "KvCache::load_safetensors: missing key {v_key} in {:?}",
+                    path
                 ))
             })?;
             layers.push((k.clone(), v.clone()));
         }
-        Ok(KvCache { layers, prefix_len, next_t_index })
+        Ok(KvCache {
+            layers,
+            prefix_len,
+            next_t_index,
+        })
     }
 }
 
@@ -495,8 +501,12 @@ pub struct SenseNovaU1 {
 }
 
 impl SenseNovaU1 {
-    pub fn config(&self) -> &SenseNovaU1Config { &self.config }
-    pub fn device(&self) -> &Arc<CudaDevice> { &self.device }
+    pub fn config(&self) -> &SenseNovaU1Config {
+        &self.config
+    }
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
+    }
 
     // -----------------------------------------------------------------------
     // Step A: Loader (Phase 5 will swap the resident layer storage for a
@@ -546,10 +556,7 @@ impl SenseNovaU1 {
             .into_iter()
             .collect();
         shard_names.sort();
-        let shard_paths: Vec<PathBuf> = shard_names
-            .iter()
-            .map(|n| weights_dir.join(n))
-            .collect();
+        let shard_paths: Vec<PathBuf> = shard_names.iter().map(|n| weights_dir.join(n)).collect();
         let shard_strs: Vec<String> = shard_paths
             .iter()
             .map(|p| {
@@ -566,9 +573,7 @@ impl SenseNovaU1 {
             num_blocks: config.num_layers,
         };
         let mut offloader = BlockOffloader::load(&shard_refs, &facilitator, device.clone())
-            .map_err(|e| {
-                Error::InvalidInput(format!("SenseNovaU1 BlockOffloader::load: {e}"))
-            })?;
+            .map_err(|e| Error::InvalidInput(format!("SenseNovaU1 BlockOffloader::load: {e}")))?;
 
         // Phase 2 FlexTensor port: opt into Adaptive resident-set strategy
         // when `FLAME_OFFLOAD_ADAPTIVE=1`. Default behavior (no env var or
@@ -662,33 +667,117 @@ impl SenseNovaU1 {
     /// as BF16 tensors (for any inference-style consumer), and ALSO get an
     /// F32 master copy in `trainable_params`. Forward-pass readers prefer
     /// the trainable Parameter when present (via `shared_or_param_bf16`).
-    pub fn load_for_training_mvp(
-        weights_dir: &Path,
-        device: &Arc<CudaDevice>,
-    ) -> Result<Self> {
-        use flame_core::parameter::Parameter;
+    ///
+    /// Implemented as a thin wrapper around [`Self::promote_unfreeze`] with
+    /// per-key exact-match regexes derived from `MVP_TRAINABLE_KEYS`. Kept
+    /// for backward compatibility with existing callers.
+    pub fn load_for_training_mvp(weights_dir: &Path, device: &Arc<CudaDevice>) -> Result<Self> {
         let mut model = Self::load(weights_dir, device)?;
-        let mut total_params: usize = 0;
-        for &key in Self::MVP_TRAINABLE_KEYS {
-            let base = model.shared.get(key).ok_or_else(|| {
+        // Synthesize exact-match anchored regexes from each MVP key. The `.`s in
+        // the key string are regex metachars that must be escaped to match
+        // literally; `regex::escape` handles that.
+        let exact_patterns: Vec<String> = Self::MVP_TRAINABLE_KEYS
+            .iter()
+            .map(|k| format!("^{}$", regex::escape(k)))
+            .collect();
+        let promoted = model.promote_unfreeze(&exact_patterns)?;
+        if promoted != Self::MVP_TRAINABLE_KEYS.len() {
+            return Err(Error::InvalidInput(format!(
+                "load_for_training_mvp: expected {} promoted Parameters, got {}",
+                Self::MVP_TRAINABLE_KEYS.len(),
+                promoted,
+            )));
+        }
+        Ok(model)
+    }
+
+    /// Generalized regex-driven trainable-parameter promotion. For every key
+    /// in `self.shared` that matches ANY of the supplied regex patterns,
+    /// install an F32 master `Parameter` into `self.trainable_params`. Returns
+    /// the number of Parameters promoted by this call (NOT the cumulative
+    /// count). Idempotent on the same key — re-promoting overwrites the prior
+    /// entry with a fresh F32 master initialized from the (frozen) BF16
+    /// `shared` tensor.
+    ///
+    /// Combine with `load_for_training_lora` / `attach_lora_adapters` for
+    /// v16c-style "LoRA + partial-FT" recipes:
+    ///
+    /// ```ignore
+    /// let mut model = SenseNovaU1::load_for_training_lora(weights, dev, specs, seed)?;
+    /// let n = model.promote_unfreeze(&[
+    ///     r"^fm_modules\.timestep_embedder\.".to_string(),
+    ///     r"^fm_modules\.noise_scale_embedder\.".to_string(),
+    ///     r"^fm_modules\.vision_model_mot_gen\.".to_string(),
+    ///     r"^fm_modules\.fm_head\.".to_string(),
+    /// ])?;
+    /// ```
+    ///
+    /// Only keys read via `shared_or_param_bf16` in the forward pass will see
+    /// gradients flow back. Keys read via the frozen `shared_get` path are
+    /// silently promoted but their Parameters will receive zero grads — guard
+    /// with `FLAME_ASSERT_GRAD_FLOW=1` to catch this at step 1.
+    pub fn promote_unfreeze(&mut self, regexes: &[String]) -> Result<usize> {
+        use flame_core::parameter::Parameter;
+        if regexes.is_empty() {
+            return Ok(0);
+        }
+        // Compile each pattern up-front; bad regex is a hard error.
+        let mut compiled: Vec<regex::Regex> = Vec::with_capacity(regexes.len());
+        for (i, pat) in regexes.iter().enumerate() {
+            let re = regex::Regex::new(pat).map_err(|e| {
                 Error::InvalidInput(format!(
-                    "load_for_training_mvp: required trainable key missing from shared: {key}"
+                    "promote_unfreeze: regex #{i} {pat:?} failed to compile: {e}"
                 ))
             })?;
+            compiled.push(re);
+        }
+        // Collect matched keys first (avoid holding an immutable borrow of
+        // `self.shared` while we mutate `self.trainable_params`). Sort for
+        // deterministic promotion / log order.
+        let mut matched_keys: Vec<String> = Vec::new();
+        for key in self.shared.keys() {
+            if compiled.iter().any(|re| re.is_match(key)) {
+                matched_keys.push(key.clone());
+            }
+        }
+        matched_keys.sort();
+        // Per-regex hit counts so we can WARN on misspelled patterns.
+        let mut per_regex_hits: Vec<usize> = vec![0; regexes.len()];
+        for key in &matched_keys {
+            for (i, re) in compiled.iter().enumerate() {
+                if re.is_match(key) {
+                    per_regex_hits[i] += 1;
+                }
+            }
+        }
+        for (i, hits) in per_regex_hits.iter().enumerate() {
+            if *hits == 0 {
+                log::warn!(
+                    "[SenseNovaU1] promote_unfreeze: regex #{i} {:?} matched zero keys in self.shared — typo?",
+                    regexes[i],
+                );
+            }
+        }
+        let mut total_params: usize = 0;
+        let mut promoted: usize = 0;
+        for key in &matched_keys {
+            // unwrap safe: key came from self.shared.keys() above.
+            let base = self.shared.get(key).expect("key from self.shared.keys()");
             let numel: usize = base.shape().dims().iter().product();
             total_params += numel;
             let f32_master = base.to_dtype(DType::F32)?.requires_grad_(true);
-            model
-                .trainable_params
-                .insert(key.to_string(), Parameter::new(f32_master));
+            self.trainable_params
+                .insert(key.clone(), Parameter::new(f32_master));
+            promoted += 1;
         }
         log::info!(
-            "[SenseNovaU1] training (mvp): {} trainable Parameters wrapped, {} total elements (F32 master ~{:.1} MB)",
-            model.trainable_params.len(),
+            "[SenseNovaU1] promote_unfreeze: {} Parameters wrapped from {} regex(es), {} total elements (F32 master ~{:.1} MB)",
+            promoted,
+            regexes.len(),
             total_params,
             (total_params * 4) as f64 / 1.0e6,
         );
-        Ok(model)
+        Ok(promoted)
     }
 
     /// Look up a `shared` weight and return a BF16 Tensor. When the key is
@@ -703,24 +792,24 @@ impl SenseNovaU1 {
             return p.tensor()?.to_dtype(DType::BF16);
         }
         let t = self.shared.get(key).ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "shared_or_param_bf16: missing key {key}"
-            ))
+            Error::InvalidInput(format!("shared_or_param_bf16: missing key {key}"))
         })?;
         Ok(t.clone())
     }
 
-    /// All trainable Parameters: mvp surface (when wrapped) + every LoRA
-    /// adapter's `down` + `up`. Deterministic order: mvp keys first (by
-    /// `MVP_TRAINABLE_KEYS`), then LoRA pairs (by lexicographic key).
+    /// All trainable Parameters: every entry in `self.trainable_params`
+    /// (sorted by key for deterministic order) followed by every LoRA
+    /// adapter's `down` + `up` (sorted by adapter key). The `trainable_params`
+    /// map is populated by `load_for_training_mvp` and/or
+    /// [`Self::promote_unfreeze`] — both LoRA-only and combined LoRA+unfreeze
+    /// recipes (v16c) enumerate correctly.
     pub fn parameters(&self) -> Vec<flame_core::parameter::Parameter> {
-        let mut out: Vec<flame_core::parameter::Parameter> = Vec::with_capacity(
-            self.trainable_params.len() + 2 * self.lora_adapters.len(),
-        );
-        for &key in Self::MVP_TRAINABLE_KEYS {
-            if let Some(p) = self.trainable_params.get(key) {
-                out.push(p.clone());
-            }
+        let mut out: Vec<flame_core::parameter::Parameter> =
+            Vec::with_capacity(self.trainable_params.len() + 2 * self.lora_adapters.len());
+        let mut tp_keys: Vec<&String> = self.trainable_params.keys().collect();
+        tp_keys.sort();
+        for k in tp_keys {
+            out.push(self.trainable_params[k].clone());
         }
         let mut lora_keys: Vec<&String> = self.lora_adapters.keys().collect();
         lora_keys.sort();
@@ -735,16 +824,14 @@ impl SenseNovaU1 {
     /// `(name, Parameter)` pairs in the same order as `parameters()`. Names
     /// for LoRA adapters use the upstream PEFT convention:
     /// `<adapter_key>.lora_down.weight` / `<adapter_key>.lora_up.weight`.
-    pub fn named_parameters(
-        &self,
-    ) -> Vec<(String, flame_core::parameter::Parameter)> {
-        let mut out: Vec<(String, flame_core::parameter::Parameter)> = Vec::with_capacity(
-            self.trainable_params.len() + 2 * self.lora_adapters.len(),
-        );
-        for &key in Self::MVP_TRAINABLE_KEYS {
-            if let Some(p) = self.trainable_params.get(key) {
-                out.push((key.to_string(), p.clone()));
-            }
+    /// Promoted-unfreeze Parameters use their full `shared` key verbatim.
+    pub fn named_parameters(&self) -> Vec<(String, flame_core::parameter::Parameter)> {
+        let mut out: Vec<(String, flame_core::parameter::Parameter)> =
+            Vec::with_capacity(self.trainable_params.len() + 2 * self.lora_adapters.len());
+        let mut tp_keys: Vec<&String> = self.trainable_params.keys().collect();
+        tp_keys.sort();
+        for k in tp_keys {
+            out.push((k.clone(), self.trainable_params[k].clone()));
         }
         let mut lora_keys: Vec<&String> = self.lora_adapters.keys().collect();
         lora_keys.sort();
@@ -771,16 +858,24 @@ impl SenseNovaU1 {
             num_layers: model.config.num_layers,
             hidden_size: model.config.hidden_size,
             intermediate_size: model.config.intermediate_size,
-            fm_head_hidden: 4096,           // fm_head MLP hidden, U1 default
+            fm_head_hidden: 4096, // fm_head MLP hidden, U1 default
             fm_head_out: model.config.fm_head_out_dim(),
         };
-        let adapters = super::sensenova_u1_lora::build_lora_adapters(
-            specs, dims, seed, device.clone(),
-        )?;
-        let total_params: usize = adapters.values().map(|a| {
-            a.down.tensor().map(|t| t.shape().dims().iter().product::<usize>()).unwrap_or(0)
-            + a.up.tensor().map(|t| t.shape().dims().iter().product::<usize>()).unwrap_or(0)
-        }).sum();
+        let adapters =
+            super::sensenova_u1_lora::build_lora_adapters(specs, dims, seed, device.clone())?;
+        let total_params: usize = adapters
+            .values()
+            .map(|a| {
+                a.down
+                    .tensor()
+                    .map(|t| t.shape().dims().iter().product::<usize>())
+                    .unwrap_or(0)
+                    + a.up
+                        .tensor()
+                        .map(|t| t.shape().dims().iter().product::<usize>())
+                        .unwrap_or(0)
+            })
+            .sum();
         log::info!(
             "[SenseNovaU1] training (lora): {} adapters wrapped, {} total LoRA params (~{:.1} MB F32)",
             adapters.len(),
@@ -804,13 +899,13 @@ impl SenseNovaU1 {
 
     /// Borrow the resident shared weights (e.g. for the embed_tokens lookup,
     /// fm_head, vision_model_mot_gen embedder, final norms, lm_head).
-    pub fn shared(&self) -> &HashMap<String, Tensor> { &self.shared }
+    pub fn shared(&self) -> &HashMap<String, Tensor> {
+        &self.shared
+    }
 
     /// Borrow the LoRA adapter map (keyed by full module path). Useful for
     /// trainer code that needs to enumerate adapters (e.g. for save).
-    pub fn lora_adapters(
-        &self,
-    ) -> &HashMap<String, super::sensenova_u1_lora::U1LoraAdapter> {
+    pub fn lora_adapters(&self) -> &HashMap<String, super::sensenova_u1_lora::U1LoraAdapter> {
         &self.lora_adapters
     }
 
@@ -870,29 +965,30 @@ impl SenseNovaU1 {
     //       x = residual + x
     //   x = rms_norm(x, language_model.model.norm.weight)   # final, BASE norm
     //   return (cache, x)
-    pub fn forward_und(
-        &mut self,
-        token_ids: &[i32],
-    ) -> Result<(KvCache, Tensor)> {
+    pub fn forward_und(&mut self, token_ids: &[i32]) -> Result<(KvCache, Tensor)> {
         let seq_len = token_ids.len();
         if seq_len == 0 {
-            return Err(Error::InvalidInput(
-                "forward_und: empty token_ids".into(),
-            ));
+            return Err(Error::InvalidInput("forward_und: empty token_ids".into()));
         }
 
         // Split-borrow self so the offloader can be borrowed `&mut` while
         // shared/config/device stay `&`. `trainable_params` is not used in
         // forward_und (base path is frozen in `mvp`).
-        let Self { config, shared, device, offloader, .. } = self;
+        let Self {
+            config,
+            shared,
+            device,
+            offloader,
+            ..
+        } = self;
         let cfg = &*config;
 
         // ---- Embed tokens → [1, N, hidden] ----
         let embed_w = shared
             .get("language_model.model.embed_tokens.weight")
-            .ok_or_else(|| Error::InvalidInput(
-                "forward_und: missing embed_tokens.weight".into(),
-            ))?;
+            .ok_or_else(|| {
+                Error::InvalidInput("forward_und: missing embed_tokens.weight".into())
+            })?;
         let ids = Tensor::from_vec(
             token_ids.iter().map(|&id| id as f32).collect(),
             Shape::from_dims(&[seq_len]),
@@ -911,7 +1007,8 @@ impl SenseNovaU1 {
         // ---- 42 Qwen3 layers, base path — streamed via offloader ----
         let total = cfg.num_layers;
         {
-            let mut off = offloader.lock()
+            let mut off = offloader
+                .lock()
                 .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
             off.prefetch_block(0)
                 .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
@@ -919,13 +1016,16 @@ impl SenseNovaU1 {
         let mut cache_layers: Vec<(Tensor, Tensor)> = Vec::with_capacity(total);
         for i in 0..total {
             let raw = {
-                let mut off = offloader.lock()
+                let mut off = offloader
+                    .lock()
                     .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
-                let r = off.await_block(i)
+                let r = off
+                    .await_block(i)
                     .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
                 if i + 1 < total {
-                    off.prefetch_block(i + 1)
-                        .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
+                    off.prefetch_block(i + 1).map_err(|e| {
+                        Error::InvalidInput(format!("prefetch block {}: {e}", i + 1))
+                    })?;
                 }
                 r
             };
@@ -939,9 +1039,9 @@ impl SenseNovaU1 {
         // ---- Final norm (BASE path: language_model.model.norm.weight) ----
         let final_norm = shared
             .get("language_model.model.norm.weight")
-            .ok_or_else(|| Error::InvalidInput(
-                "forward_und: missing language_model.model.norm.weight".into(),
-            ))?;
+            .ok_or_else(|| {
+                Error::InvalidInput("forward_und: missing language_model.model.norm.weight".into())
+            })?;
         hidden = Self::rms_norm_apply(&hidden, final_norm, cfg.rms_norm_eps)?;
 
         Ok((
@@ -980,9 +1080,7 @@ impl SenseNovaU1 {
 
         let lget = |k: &str| -> Result<&Tensor> {
             lw.get(k).ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "SenseNovaU1: missing layer-{i} weight {k}"
-                ))
+                Error::InvalidInput(format!("SenseNovaU1: missing layer-{i} weight {k}"))
             })
         };
 
@@ -1101,9 +1199,9 @@ impl SenseNovaU1 {
     // -----------------------------------------------------------------------
 
     fn shared_get(&self, key: &str) -> Result<&Tensor> {
-        self.shared.get(key).ok_or_else(|| {
-            Error::InvalidInput(format!("SenseNovaU1: missing shared weight {key}"))
-        })
+        self.shared
+            .get(key)
+            .ok_or_else(|| Error::InvalidInput(format!("SenseNovaU1: missing shared weight {key}")))
     }
 
     /// `fused_linear3d_native(x, w, None)` — preserves the [..., last] shape
@@ -1240,13 +1338,22 @@ impl SenseNovaU1 {
                 "forward_gen: image_embeds must be [B, L, hidden], got {dims:?}"
             )));
         }
-        let Self { config, shared, device, offloader, trainable_params, lora_adapters } = self;
+        let Self {
+            config,
+            shared,
+            device,
+            offloader,
+            trainable_params,
+            lora_adapters,
+        } = self;
         let cfg = &*config;
         let l = dims[1];
         if l != grid_h * grid_w {
             return Err(Error::InvalidInput(format!(
                 "forward_gen: L={l} must equal grid_h*grid_w={}*{}={}",
-                grid_h, grid_w, grid_h * grid_w
+                grid_h,
+                grid_w,
+                grid_h * grid_w
             )));
         }
         if cache.layers.len() != cfg.num_layers {
@@ -1284,7 +1391,8 @@ impl SenseNovaU1 {
         // matching Python's `gc_skip_last=6` memory profile.
         let total = cfg.num_layers;
         {
-            let mut off = offloader.lock()
+            let mut off = offloader
+                .lock()
                 .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
             off.prefetch_block(0)
                 .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
@@ -1297,7 +1405,8 @@ impl SenseNovaU1 {
             // Forward prefetch of next block (best-effort; doesn't affect
             // backward replay path which has no prefetch hint).
             if i + 1 < total {
-                let mut off = offloader.lock()
+                let mut off = offloader
+                    .lock()
                     .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
                 off.prefetch_block(i + 1)
                     .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
@@ -1326,17 +1435,31 @@ impl SenseNovaU1 {
             // offloader, untranspose, run gen_layer_standalone, drop on exit.
             let run_layer = move |hidden_in: &Tensor| -> Result<Tensor> {
                 let raw = {
-                    let mut off = offloader_c.lock()
+                    let mut off = offloader_c
+                        .lock()
                         .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
                     off.await_block(layer_idx)
                         .map_err(|e| Error::InvalidInput(format!("await block {layer_idx}: {e}")))?
                 };
                 let lw = SenseNovaU1::untranspose_block_weights(&raw)?;
                 gen_layer_standalone(
-                    &cfg_c, layer_idx, &lw, hidden_in,
-                    &cos_t_c, &sin_t_c, &cos_h_c, &sin_h_c, &cos_w_c, &sin_w_c,
-                    &kv_c, attn_mask_c.as_ref(),
-                    if lora_c.is_empty() { None } else { Some(&lora_c) },
+                    &cfg_c,
+                    layer_idx,
+                    &lw,
+                    hidden_in,
+                    &cos_t_c,
+                    &sin_t_c,
+                    &cos_h_c,
+                    &sin_h_c,
+                    &cos_w_c,
+                    &sin_w_c,
+                    &kv_c,
+                    attn_mask_c.as_ref(),
+                    if lora_c.is_empty() {
+                        None
+                    } else {
+                        Some(&lora_c)
+                    },
                 )
             };
 
@@ -1363,18 +1486,19 @@ impl SenseNovaU1 {
         // Trainable in `mvp`: cast F32 master → BF16 with autograd recording
         // so grad flows back to the Parameter. Falls back to the BF16 shared
         // tensor when no Parameter is registered (inference mode).
-        let final_norm: Tensor = if let Some(p) = trainable_params
-            .get("language_model.model.norm_mot_gen.weight")
-        {
-            p.tensor()?.to_dtype(DType::BF16)?
-        } else {
-            shared
-                .get("language_model.model.norm_mot_gen.weight")
-                .ok_or_else(|| Error::InvalidInput(
-                    "forward_gen: missing language_model.model.norm_mot_gen.weight".into(),
-                ))?
-                .clone()
-        };
+        let final_norm: Tensor =
+            if let Some(p) = trainable_params.get("language_model.model.norm_mot_gen.weight") {
+                p.tensor()?.to_dtype(DType::BF16)?
+            } else {
+                shared
+                    .get("language_model.model.norm_mot_gen.weight")
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "forward_gen: missing language_model.model.norm_mot_gen.weight".into(),
+                        )
+                    })?
+                    .clone()
+            };
         Self::rms_norm_apply(&hidden, &final_norm, cfg.rms_norm_eps)
     }
 
@@ -1410,9 +1534,7 @@ impl SenseNovaU1 {
 
         let lget = |k: &str| -> Result<&Tensor> {
             lw.get(k).ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "SenseNovaU1: missing layer-{i} weight {k}"
-                ))
+                Error::InvalidInput(format!("SenseNovaU1: missing layer-{i} weight {k}"))
             })
         };
 
@@ -1477,10 +1599,28 @@ impl SenseNovaU1 {
         ))?;
 
         let q = Self::apply_3d_rope(
-            &q, q_norm, q_norm_hw, cfg.rms_norm_eps, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+            &q,
+            q_norm,
+            q_norm_hw,
+            cfg.rms_norm_eps,
+            cos_t,
+            sin_t,
+            cos_h,
+            sin_h,
+            cos_w,
+            sin_w,
         )?;
         let k = Self::apply_3d_rope(
-            &k, k_norm, k_norm_hw, cfg.rms_norm_eps, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+            &k,
+            k_norm,
+            k_norm_hw,
+            cfg.rms_norm_eps,
+            cos_t,
+            sin_t,
+            cos_h,
+            sin_h,
+            cos_w,
+            sin_w,
         )?;
 
         // ---- Concat with cached K/V along seq dim, then GQA repeat ----
@@ -1517,15 +1657,15 @@ impl SenseNovaU1 {
         let down_w = lget(&format!(
             "language_model.model.layers.{i}.mlp_mot_gen.down_proj.weight"
         ))?;
-        let gate = super::sensenova_u1_lora::linear_with_lora(
-            &n2, gate_w, aget("mlp_mot_gen.gate_proj"),
-        )?;
-        let up = super::sensenova_u1_lora::linear_with_lora(
-            &n2, up_w, aget("mlp_mot_gen.up_proj"),
-        )?;
+        let gate =
+            super::sensenova_u1_lora::linear_with_lora(&n2, gate_w, aget("mlp_mot_gen.gate_proj"))?;
+        let up =
+            super::sensenova_u1_lora::linear_with_lora(&n2, up_w, aget("mlp_mot_gen.up_proj"))?;
         let mlp = gate.silu()?.mul(&up)?;
         let mlp = super::sensenova_u1_lora::linear_with_lora(
-            &mlp, down_w, aget("mlp_mot_gen.down_proj"),
+            &mlp,
+            down_w,
+            aget("mlp_mot_gen.down_proj"),
         )?;
         hidden.add(&mlp)
     }
@@ -1635,18 +1775,20 @@ impl SenseNovaU1 {
         let token_h = grid_h / merge;
         let token_w = grid_w / merge;
 
-        let pe_w = self.shared_get(
-            "fm_modules.vision_model_mot_gen.embeddings.patch_embedding.weight",
-        )?;
-        let pe_b = self.shared_get(
-            "fm_modules.vision_model_mot_gen.embeddings.patch_embedding.bias",
-        )?;
-        let de_w = self.shared_get(
-            "fm_modules.vision_model_mot_gen.embeddings.dense_embedding.weight",
-        )?;
-        let de_b = self.shared_get(
-            "fm_modules.vision_model_mot_gen.embeddings.dense_embedding.bias",
-        )?;
+        // Use autograd-aware reader so when these keys are promoted via
+        // `promote_unfreeze` (v16c recipe `^fm_modules\.vision_model_mot_gen\.`)
+        // the F32 master Parameter's grad flows back through the F32→BF16
+        // cast. When NOT promoted, this returns a cheap clone of the frozen
+        // BF16 tensor (no autograd overhead) — identical semantics to the
+        // prior `shared_get` path.
+        let pe_w =
+            self.shared_or_param_bf16("fm_modules.vision_model_mot_gen.embeddings.patch_embedding.weight")?;
+        let pe_b =
+            self.shared_or_param_bf16("fm_modules.vision_model_mot_gen.embeddings.patch_embedding.bias")?;
+        let de_w =
+            self.shared_or_param_bf16("fm_modules.vision_model_mot_gen.embeddings.dense_embedding.weight")?;
+        let de_b =
+            self.shared_or_param_bf16("fm_modules.vision_model_mot_gen.embeddings.dense_embedding.bias")?;
 
         // (1) Conv2d-as-matmul patch embedding. pe_w is [1024, 3, 16, 16];
         //     reshape to [1024, 768] preserves C-major (Cin, kH, kW) order.
@@ -1658,7 +1800,7 @@ impl SenseNovaU1 {
         let h = flame_core::ops::fused_inference::fused_linear3d_native(
             &pixel_3d,
             &pe_w_flat,
-            Some(pe_b),
+            Some(&pe_b),
         )?
         .reshape(&[bn, self.config.vision_hidden_size])?; // [B*N, 1024]
 
@@ -1696,18 +1838,22 @@ impl SenseNovaU1 {
         //     Pack so the inner-most axis is (Cin, kH, kW) C-major to match the
         //     reshape of dense_embedding.weight.
         let h = h.reshape(&[b, grid_h, grid_w, self.config.vision_hidden_size])?;
-        let h = h.reshape(&[b, token_h, merge, token_w, merge, self.config.vision_hidden_size])?;
+        let h = h.reshape(&[
+            b,
+            token_h,
+            merge,
+            token_w,
+            merge,
+            self.config.vision_hidden_size,
+        ])?;
         // Source axes 0=B 1=token_h 2=kH 3=token_w 4=kW 5=Cin
         // Target order: B token_h token_w Cin kH kW  →  permute [0, 1, 3, 5, 2, 4]
         let h = h.permute(&[0, 1, 3, 5, 2, 4])?;
         let merge_flat = self.config.vision_hidden_size * merge * merge;
         let h = h.reshape(&[1, b * token_h * token_w, merge_flat])?;
         let de_w_flat = de_w.reshape(&[self.config.hidden_size, merge_flat])?;
-        let h = flame_core::ops::fused_inference::fused_linear3d_native(
-            &h,
-            &de_w_flat,
-            Some(de_b),
-        )?; // [1, B*token_h*token_w, hidden_size]
+        let h =
+            flame_core::ops::fused_inference::fused_linear3d_native(&h, &de_w_flat, Some(&de_b))?; // [1, B*token_h*token_w, hidden_size]
 
         // (5) Reshape to [B, L, hidden_size]
         h.reshape(&[b, token_h * token_w, self.config.hidden_size])
@@ -1798,16 +1944,20 @@ impl SenseNovaU1 {
         let h = Tensor::cat(&[&h_x, &h_y], 1)?;
 
         let h = h.reshape(&[b, grid_h, grid_w, self.config.vision_hidden_size])?;
-        let h = h.reshape(&[b, token_h, merge, token_w, merge, self.config.vision_hidden_size])?;
+        let h = h.reshape(&[
+            b,
+            token_h,
+            merge,
+            token_w,
+            merge,
+            self.config.vision_hidden_size,
+        ])?;
         let h = h.permute(&[0, 1, 3, 5, 2, 4])?;
         let merge_flat = self.config.vision_hidden_size * merge * merge;
         let h = h.reshape(&[1, b * token_h * token_w, merge_flat])?;
         let de_w_flat = de_w.reshape(&[self.config.hidden_size, merge_flat])?;
-        let h = flame_core::ops::fused_inference::fused_linear3d_native(
-            &h,
-            &de_w_flat,
-            Some(de_b),
-        )?;
+        let h =
+            flame_core::ops::fused_inference::fused_linear3d_native(&h, &de_w_flat, Some(de_b))?;
         h.reshape(&[b, token_h * token_w, self.config.hidden_size])
     }
 
@@ -1953,7 +2103,10 @@ impl SenseNovaU1 {
         if np_dims[2] != grid_h * p || np_dims[3] != grid_w * p {
             return Err(Error::InvalidInput(format!(
                 "forward_t2i_step: noisy_pixel_values H×W={}×{} != grid_h*p × grid_w*p = {}×{}",
-                np_dims[2], np_dims[3], grid_h * p, grid_w * p
+                np_dims[2],
+                np_dims[3],
+                grid_h * p,
+                grid_w * p
             )));
         }
         if grid_h % merge != 0 || grid_w % merge != 0 {
@@ -2018,9 +2171,8 @@ impl SenseNovaU1 {
         let text_len = cache_ref.prefix_len;
 
         // --- (7) Gen-path forward ---------------------------------------
-        let hidden_image = self.forward_gen(
-            &image_embeds, text_len, token_h, token_w, cache_ref, None,
-        )?;
+        let hidden_image =
+            self.forward_gen(&image_embeds, text_len, token_h, token_w, cache_ref, None)?;
 
         // --- (8) fm_head → x_pred ---------------------------------------
         let x_pred = self.fm_head_forward(&hidden_image)?;
@@ -2151,39 +2303,53 @@ impl SenseNovaU1 {
 
         let lget = |k: &str| -> Result<&Tensor> {
             lw.get(k).ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "SenseNovaU1: missing layer-{i} weight {k}"
-                ))
+                Error::InvalidInput(format!("SenseNovaU1: missing layer-{i} weight {k}"))
             })
         };
 
         let normed = Self::rms_norm_apply(
             hidden,
-            lget(&format!("language_model.model.layers.{i}.input_layernorm.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.input_layernorm.weight"
+            ))?,
             cfg.rms_norm_eps,
         )?;
 
         let q = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.q_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.q_proj.weight"
+            ))?,
         )?;
         let k = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.k_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.k_proj.weight"
+            ))?,
         )?;
         let v = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.v_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.v_proj.weight"
+            ))?,
         )?;
 
         let q = q.reshape(&[b, n, h_total, d])?.permute(&[0, 2, 1, 3])?;
         let k = k.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
         let v = v.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
 
-        let q_norm = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm.weight"))?;
-        let q_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm_hw.weight"))?;
-        let k_norm = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm.weight"))?;
-        let k_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm_hw.weight"))?;
+        let q_norm = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.q_norm.weight"
+        ))?;
+        let q_norm_hw = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.q_norm_hw.weight"
+        ))?;
+        let k_norm = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.k_norm.weight"
+        ))?;
+        let k_norm_hw = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.k_norm_hw.weight"
+        ))?;
 
         // Decoded text tokens carry h_idx = w_idx = 0 (identity RoPE) so we
         // skip the h/w rotations entirely. Same shortcut `und_layer` takes.
@@ -2210,7 +2376,9 @@ impl SenseNovaU1 {
         let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h_total * d])?;
         let attn = Self::linear_no_bias(
             &attn,
-            lget(&format!("language_model.model.layers.{i}.self_attn.o_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.o_proj.weight"
+            ))?,
         )?;
         let hidden = hidden.add(&attn)?;
 
@@ -2218,9 +2386,15 @@ impl SenseNovaU1 {
             "language_model.model.layers.{i}.post_attention_layernorm.weight"
         ))?;
         let n2 = Self::rms_norm_apply(&hidden, post_norm_w, cfg.rms_norm_eps)?;
-        let gate_w = lget(&format!("language_model.model.layers.{i}.mlp.gate_proj.weight"))?;
-        let up_w = lget(&format!("language_model.model.layers.{i}.mlp.up_proj.weight"))?;
-        let down_w = lget(&format!("language_model.model.layers.{i}.mlp.down_proj.weight"))?;
+        let gate_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.gate_proj.weight"
+        ))?;
+        let up_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.up_proj.weight"
+        ))?;
+        let down_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.down_proj.weight"
+        ))?;
         let gate = Self::linear_no_bias(&n2, gate_w)?;
         let up = Self::linear_no_bias(&n2, up_w)?;
         let mlp = gate.silu()?.mul(&up)?;
@@ -2342,39 +2516,40 @@ impl SenseNovaU1 {
 
             // 2) Embed and run through 42 layers; append K/V to cache.
             let mut hidden = self.embed_one(next_id)?; // [1, 1, hidden]
-            // RoPE for the new token's t-position.
+                                                       // RoPE for the new token's t-position.
             let pos = cache.next_t_index as i32;
-            let (cos_t, sin_t) = build_rope_for_positions(
-                &[pos],
-                dim_t,
-                cfg.rope_theta,
-                &self.device,
-            )?;
+            let (cos_t, sin_t) =
+                build_rope_for_positions(&[pos], dim_t, cfg.rope_theta, &self.device)?;
 
             // Step the offloader through all 42 base-path blocks.
             {
-                let mut off = self.offloader.lock()
+                let mut off = self
+                    .offloader
+                    .lock()
                     .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
                 off.prefetch_block(0)
                     .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
             }
             for i in 0..total {
                 let raw = {
-                    let mut off = self.offloader.lock()
+                    let mut off = self
+                        .offloader
+                        .lock()
                         .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
-                    let r = off.await_block(i)
+                    let r = off
+                        .await_block(i)
                         .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
                     if i + 1 < total {
-                        off.prefetch_block(i + 1)
-                            .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
+                        off.prefetch_block(i + 1).map_err(|e| {
+                            Error::InvalidInput(format!("prefetch block {}: {e}", i + 1))
+                        })?;
                     }
                     r
                 };
                 let lw = Self::untranspose_block_weights(&raw)?;
                 let (past_k, past_v) = &cache.layers[i];
-                let (new_h, k_full, v_full) = Self::und_layer_step(
-                    cfg, i, &lw, &hidden, &cos_t, &sin_t, past_k, past_v,
-                )?;
+                let (new_h, k_full, v_full) =
+                    Self::und_layer_step(cfg, i, &lw, &hidden, &cos_t, &sin_t, past_k, past_v)?;
                 cache.layers[i] = (k_full, v_full);
                 hidden = new_h;
             }
@@ -2419,7 +2594,8 @@ impl SenseNovaU1 {
             .get("language_model.model.norm.weight")
             .ok_or_else(|| {
                 Error::InvalidInput(
-                    "extend_cache_with_text_tokens: missing language_model.model.norm.weight".into(),
+                    "extend_cache_with_text_tokens: missing language_model.model.norm.weight"
+                        .into(),
                 )
             })?
             .clone();
@@ -2437,15 +2613,9 @@ impl SenseNovaU1 {
         .to_dtype(DType::I32)?;
         let mut hidden = embed_w.index_select0(&ids)?.unsqueeze(0)?; // [1, N, h]
 
-        let positions: Vec<i32> = (0..n)
-            .map(|i| (cache.next_t_index + i) as i32)
-            .collect();
-        let (cos_t, sin_t) = build_rope_for_positions(
-            &positions,
-            dim_t,
-            cfg.rope_theta,
-            &self.device,
-        )?;
+        let positions: Vec<i32> = (0..n).map(|i| (cache.next_t_index + i) as i32).collect();
+        let (cos_t, sin_t) =
+            build_rope_for_positions(&positions, dim_t, cfg.rope_theta, &self.device)?;
 
         // Block-causal mask for the appended chunk attending to itself + the
         // entire past. The Python reference (`_append_text_tokens_to_cache`)
@@ -2471,20 +2641,26 @@ impl SenseNovaU1 {
         .to_dtype(DType::BF16)?;
 
         {
-            let mut off = self.offloader.lock()
+            let mut off = self
+                .offloader
+                .lock()
                 .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
             off.prefetch_block(0)
                 .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
         }
         for i in 0..total {
             let raw = {
-                let mut off = self.offloader.lock()
+                let mut off = self
+                    .offloader
+                    .lock()
                     .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
-                let r = off.await_block(i)
+                let r = off
+                    .await_block(i)
                     .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
                 if i + 1 < total {
-                    off.prefetch_block(i + 1)
-                        .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
+                    off.prefetch_block(i + 1).map_err(|e| {
+                        Error::InvalidInput(format!("prefetch block {}: {e}", i + 1))
+                    })?;
                 }
                 r
             };
@@ -2529,37 +2705,51 @@ impl SenseNovaU1 {
 
         let lget = |k: &str| -> Result<&Tensor> {
             lw.get(k).ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "SenseNovaU1: missing layer-{i} weight {k}"
-                ))
+                Error::InvalidInput(format!("SenseNovaU1: missing layer-{i} weight {k}"))
             })
         };
 
         let normed = Self::rms_norm_apply(
             hidden,
-            lget(&format!("language_model.model.layers.{i}.input_layernorm.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.input_layernorm.weight"
+            ))?,
             cfg.rms_norm_eps,
         )?;
         let q = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.q_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.q_proj.weight"
+            ))?,
         )?;
         let k = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.k_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.k_proj.weight"
+            ))?,
         )?;
         let v = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.v_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.v_proj.weight"
+            ))?,
         )?;
         let q = q.reshape(&[b, n, h_total, d])?.permute(&[0, 2, 1, 3])?;
         let k = k.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
         let v = v.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
 
-        let q_norm = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm.weight"))?;
-        let q_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm_hw.weight"))?;
-        let k_norm = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm.weight"))?;
-        let k_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm_hw.weight"))?;
+        let q_norm = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.q_norm.weight"
+        ))?;
+        let q_norm_hw = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.q_norm_hw.weight"
+        ))?;
+        let k_norm = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.k_norm.weight"
+        ))?;
+        let k_norm_hw = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.k_norm_hw.weight"
+        ))?;
 
         let (q_t, q_hw) = Self::chunk_last_half(&q)?;
         let q_t = Self::head_rms_norm(&q_t, q_norm, cfg.rms_norm_eps)?;
@@ -2580,7 +2770,9 @@ impl SenseNovaU1 {
         let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h_total * d])?;
         let attn = Self::linear_no_bias(
             &attn,
-            lget(&format!("language_model.model.layers.{i}.self_attn.o_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.o_proj.weight"
+            ))?,
         )?;
         let hidden = hidden.add(&attn)?;
 
@@ -2588,9 +2780,15 @@ impl SenseNovaU1 {
             "language_model.model.layers.{i}.post_attention_layernorm.weight"
         ))?;
         let n2 = Self::rms_norm_apply(&hidden, post_norm_w, cfg.rms_norm_eps)?;
-        let gate_w = lget(&format!("language_model.model.layers.{i}.mlp.gate_proj.weight"))?;
-        let up_w = lget(&format!("language_model.model.layers.{i}.mlp.up_proj.weight"))?;
-        let down_w = lget(&format!("language_model.model.layers.{i}.mlp.down_proj.weight"))?;
+        let gate_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.gate_proj.weight"
+        ))?;
+        let up_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.up_proj.weight"
+        ))?;
+        let down_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.down_proj.weight"
+        ))?;
         let gate = Self::linear_no_bias(&n2, gate_w)?;
         let up = Self::linear_no_bias(&n2, up_w)?;
         let mlp = gate.silu()?.mul(&up)?;
@@ -2644,11 +2842,19 @@ impl SenseNovaU1 {
         if t_indexes.len() != n || h_indexes.len() != n || w_indexes.len() != n {
             return Err(Error::InvalidInput(format!(
                 "forward_mixed_prefix: index arrays must all be length N={n}, got t={} h={} w={}",
-                t_indexes.len(), h_indexes.len(), w_indexes.len()
+                t_indexes.len(),
+                h_indexes.len(),
+                w_indexes.len()
             )));
         }
 
-        let Self { config, shared, device, offloader, .. } = self;
+        let Self {
+            config,
+            shared,
+            device,
+            offloader,
+            ..
+        } = self;
         let cfg = &*config;
         let total = cfg.num_layers;
         let (dim_t, dim_h, dim_w) = cfg.rope_dims();
@@ -2663,7 +2869,8 @@ impl SenseNovaU1 {
         let attn_mask = build_block_causal_mask(t_indexes, device)?;
 
         {
-            let mut off = offloader.lock()
+            let mut off = offloader
+                .lock()
                 .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
             off.prefetch_block(0)
                 .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
@@ -2672,20 +2879,22 @@ impl SenseNovaU1 {
         let mut cache_layers: Vec<(Tensor, Tensor)> = Vec::with_capacity(total);
         for i in 0..total {
             let raw = {
-                let mut off = offloader.lock()
+                let mut off = offloader
+                    .lock()
                     .map_err(|_| Error::InvalidInput("offloader mutex poisoned".into()))?;
-                let r = off.await_block(i)
+                let r = off
+                    .await_block(i)
                     .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
                 if i + 1 < total {
-                    off.prefetch_block(i + 1)
-                        .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
+                    off.prefetch_block(i + 1).map_err(|e| {
+                        Error::InvalidInput(format!("prefetch block {}: {e}", i + 1))
+                    })?;
                 }
                 r
             };
             let lw = Self::untranspose_block_weights(&raw)?;
             let (new_h, k_cache, v_cache) = Self::und_layer_3d(
-                cfg, i, &lw, &hidden,
-                &cos_t, &sin_t, &cos_h, &sin_h, &cos_w, &sin_w, &attn_mask,
+                cfg, i, &lw, &hidden, &cos_t, &sin_t, &cos_h, &sin_h, &cos_w, &sin_w, &attn_mask,
             )?;
             cache_layers.push((k_cache, v_cache));
             hidden = new_h;
@@ -2747,38 +2956,70 @@ impl SenseNovaU1 {
 
         let normed = Self::rms_norm_apply(
             hidden,
-            lget(&format!("language_model.model.layers.{i}.input_layernorm.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.input_layernorm.weight"
+            ))?,
             cfg.rms_norm_eps,
         )?;
         let q = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.q_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.q_proj.weight"
+            ))?,
         )?;
         let k = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.k_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.k_proj.weight"
+            ))?,
         )?;
         let v = Self::linear_no_bias(
             &normed,
-            lget(&format!("language_model.model.layers.{i}.self_attn.v_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.v_proj.weight"
+            ))?,
         )?;
 
         let q = q.reshape(&[b, n, h_total, d])?.permute(&[0, 2, 1, 3])?;
         let k = k.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
         let v = v.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
 
-        let q_norm = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm.weight"))?;
-        let q_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm_hw.weight"))?;
-        let k_norm = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm.weight"))?;
-        let k_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm_hw.weight"))?;
+        let q_norm = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.q_norm.weight"
+        ))?;
+        let q_norm_hw = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.q_norm_hw.weight"
+        ))?;
+        let k_norm = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.k_norm.weight"
+        ))?;
+        let k_norm_hw = lget(&format!(
+            "language_model.model.layers.{i}.self_attn.k_norm_hw.weight"
+        ))?;
 
         let q = Self::apply_3d_rope(
-            &q, q_norm, q_norm_hw, cfg.rms_norm_eps,
-            cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+            &q,
+            q_norm,
+            q_norm_hw,
+            cfg.rms_norm_eps,
+            cos_t,
+            sin_t,
+            cos_h,
+            sin_h,
+            cos_w,
+            sin_w,
         )?;
         let k = Self::apply_3d_rope(
-            &k, k_norm, k_norm_hw, cfg.rms_norm_eps,
-            cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+            &k,
+            k_norm,
+            k_norm_hw,
+            cfg.rms_norm_eps,
+            cos_t,
+            sin_t,
+            cos_h,
+            sin_h,
+            cos_w,
+            sin_w,
         )?;
 
         let k_cache = k.clone();
@@ -2790,7 +3031,9 @@ impl SenseNovaU1 {
         let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h_total * d])?;
         let attn = Self::linear_no_bias(
             &attn,
-            lget(&format!("language_model.model.layers.{i}.self_attn.o_proj.weight"))?,
+            lget(&format!(
+                "language_model.model.layers.{i}.self_attn.o_proj.weight"
+            ))?,
         )?;
         let hidden = hidden.add(&attn)?;
 
@@ -2798,9 +3041,15 @@ impl SenseNovaU1 {
             "language_model.model.layers.{i}.post_attention_layernorm.weight"
         ))?;
         let n2 = Self::rms_norm_apply(&hidden, post_norm_w, cfg.rms_norm_eps)?;
-        let gate_w = lget(&format!("language_model.model.layers.{i}.mlp.gate_proj.weight"))?;
-        let up_w = lget(&format!("language_model.model.layers.{i}.mlp.up_proj.weight"))?;
-        let down_w = lget(&format!("language_model.model.layers.{i}.mlp.down_proj.weight"))?;
+        let gate_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.gate_proj.weight"
+        ))?;
+        let up_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.up_proj.weight"
+        ))?;
+        let down_w = lget(&format!(
+            "language_model.model.layers.{i}.mlp.down_proj.weight"
+        ))?;
         let gate = Self::linear_no_bias(&n2, gate_w)?;
         let up = Self::linear_no_bias(&n2, up_w)?;
         let mlp = gate.silu()?.mul(&up)?;
@@ -2829,11 +3078,16 @@ impl SenseNovaU1 {
         image_grid: &[(usize, usize)],
     ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<bool>)> {
         let n = input_ids.len();
-        let img_start_shift: Vec<i32> = std::iter::once(0)
-            .chain(input_ids.iter().take(n - 1).map(|&id| {
-                if id == img_start_token_id { 1 } else { 0 }
-            }))
-            .collect();
+        let img_start_shift: Vec<i32> =
+            std::iter::once(0)
+                .chain(input_ids.iter().take(n - 1).map(|&id| {
+                    if id == img_start_token_id {
+                        1
+                    } else {
+                        0
+                    }
+                }))
+                .collect();
         let not_img: Vec<i32> = input_ids
             .iter()
             .map(|&id| if id != img_context_token_id { 1 } else { 0 })
@@ -2846,7 +3100,10 @@ impl SenseNovaU1 {
         }
         let mut h_indexes: Vec<i32> = vec![0; n];
         let mut w_indexes: Vec<i32> = vec![0; n];
-        let image_mask: Vec<bool> = input_ids.iter().map(|&id| id == img_context_token_id).collect();
+        let image_mask: Vec<bool> = input_ids
+            .iter()
+            .map(|&id| id == img_context_token_id)
+            .collect();
 
         // Walk runs of `<IMG_CONTEXT>` and assign h/w from the next image grid.
         let mut img_idx = 0usize;
@@ -3003,23 +3260,31 @@ pub fn gen_layer_standalone(
 
     let normed = SenseNovaU1::rms_norm_apply(
         hidden,
-        lget(&format!("language_model.model.layers.{i}.input_layernorm_mot_gen.weight"))?,
+        lget(&format!(
+            "language_model.model.layers.{i}.input_layernorm_mot_gen.weight"
+        ))?,
         cfg.rms_norm_eps,
     )?;
 
     let q = super::sensenova_u1_lora::linear_with_lora(
         &normed,
-        lget(&format!("language_model.model.layers.{i}.self_attn.q_proj_mot_gen.weight"))?,
+        lget(&format!(
+            "language_model.model.layers.{i}.self_attn.q_proj_mot_gen.weight"
+        ))?,
         aget("q_proj_mot_gen"),
     )?;
     let k = super::sensenova_u1_lora::linear_with_lora(
         &normed,
-        lget(&format!("language_model.model.layers.{i}.self_attn.k_proj_mot_gen.weight"))?,
+        lget(&format!(
+            "language_model.model.layers.{i}.self_attn.k_proj_mot_gen.weight"
+        ))?,
         aget("k_proj_mot_gen"),
     )?;
     let v = super::sensenova_u1_lora::linear_with_lora(
         &normed,
-        lget(&format!("language_model.model.layers.{i}.self_attn.v_proj_mot_gen.weight"))?,
+        lget(&format!(
+            "language_model.model.layers.{i}.self_attn.v_proj_mot_gen.weight"
+        ))?,
         aget("v_proj_mot_gen"),
     )?;
 
@@ -3027,16 +3292,42 @@ pub fn gen_layer_standalone(
     let k = k.reshape(&[b, l, h_kv, d])?.permute(&[0, 2, 1, 3])?;
     let v = v.reshape(&[b, l, h_kv, d])?.permute(&[0, 2, 1, 3])?;
 
-    let q_norm = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm_mot_gen.weight"))?;
-    let q_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm_hw_mot_gen.weight"))?;
-    let k_norm = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm_mot_gen.weight"))?;
-    let k_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm_hw_mot_gen.weight"))?;
+    let q_norm = lget(&format!(
+        "language_model.model.layers.{i}.self_attn.q_norm_mot_gen.weight"
+    ))?;
+    let q_norm_hw = lget(&format!(
+        "language_model.model.layers.{i}.self_attn.q_norm_hw_mot_gen.weight"
+    ))?;
+    let k_norm = lget(&format!(
+        "language_model.model.layers.{i}.self_attn.k_norm_mot_gen.weight"
+    ))?;
+    let k_norm_hw = lget(&format!(
+        "language_model.model.layers.{i}.self_attn.k_norm_hw_mot_gen.weight"
+    ))?;
 
     let q = SenseNovaU1::apply_3d_rope(
-        &q, q_norm, q_norm_hw, cfg.rms_norm_eps, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+        &q,
+        q_norm,
+        q_norm_hw,
+        cfg.rms_norm_eps,
+        cos_t,
+        sin_t,
+        cos_h,
+        sin_h,
+        cos_w,
+        sin_w,
     )?;
     let k = SenseNovaU1::apply_3d_rope(
-        &k, k_norm, k_norm_hw, cfg.rms_norm_eps, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+        &k,
+        k_norm,
+        k_norm_hw,
+        cfg.rms_norm_eps,
+        cos_t,
+        sin_t,
+        cos_h,
+        sin_h,
+        cos_w,
+        sin_w,
     )?;
 
     let (past_k, past_v) = kv;
@@ -3049,7 +3340,9 @@ pub fn gen_layer_standalone(
     let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, l, h_total * d])?;
     let attn = super::sensenova_u1_lora::linear_with_lora(
         &attn,
-        lget(&format!("language_model.model.layers.{i}.self_attn.o_proj_mot_gen.weight"))?,
+        lget(&format!(
+            "language_model.model.layers.{i}.self_attn.o_proj_mot_gen.weight"
+        ))?,
         aget("o_proj_mot_gen"),
     )?;
     let hidden = hidden.add(&attn)?;
@@ -3058,13 +3351,21 @@ pub fn gen_layer_standalone(
         "language_model.model.layers.{i}.post_attention_layernorm_mot_gen.weight"
     ))?;
     let n2 = SenseNovaU1::rms_norm_apply(&hidden, post_norm_w, cfg.rms_norm_eps)?;
-    let gate_w = lget(&format!("language_model.model.layers.{i}.mlp_mot_gen.gate_proj.weight"))?;
-    let up_w = lget(&format!("language_model.model.layers.{i}.mlp_mot_gen.up_proj.weight"))?;
-    let down_w = lget(&format!("language_model.model.layers.{i}.mlp_mot_gen.down_proj.weight"))?;
-    let gate = super::sensenova_u1_lora::linear_with_lora(&n2, gate_w, aget("mlp_mot_gen.gate_proj"))?;
+    let gate_w = lget(&format!(
+        "language_model.model.layers.{i}.mlp_mot_gen.gate_proj.weight"
+    ))?;
+    let up_w = lget(&format!(
+        "language_model.model.layers.{i}.mlp_mot_gen.up_proj.weight"
+    ))?;
+    let down_w = lget(&format!(
+        "language_model.model.layers.{i}.mlp_mot_gen.down_proj.weight"
+    ))?;
+    let gate =
+        super::sensenova_u1_lora::linear_with_lora(&n2, gate_w, aget("mlp_mot_gen.gate_proj"))?;
     let up = super::sensenova_u1_lora::linear_with_lora(&n2, up_w, aget("mlp_mot_gen.up_proj"))?;
     let mlp = gate.silu()?.mul(&up)?;
-    let mlp = super::sensenova_u1_lora::linear_with_lora(&mlp, down_w, aget("mlp_mot_gen.down_proj"))?;
+    let mlp =
+        super::sensenova_u1_lora::linear_with_lora(&mlp, down_w, aget("mlp_mot_gen.down_proj"))?;
     hidden.add(&mlp)
 }
 
@@ -3102,8 +3403,16 @@ fn build_rope_table_1d(
     let pos_col = pos.reshape(&[seq_len, 1])?;
     let freq_row = log_freqs.reshape(&[1, half])?;
     let angles = pos_col.matmul(&freq_row)?;
-    let cos = angles.cos()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
-    let sin = angles.sin()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
+    let cos = angles
+        .cos()?
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .to_dtype(DType::BF16)?;
+    let sin = angles
+        .sin()?
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .to_dtype(DType::BF16)?;
     Ok((cos, sin))
 }
 
@@ -3173,8 +3482,16 @@ fn build_rope_for_positions(
     let pos_col = pos.reshape(&[n, 1])?;
     let freq_row = log_freqs.reshape(&[1, half])?;
     let angles = pos_col.matmul(&freq_row)?;
-    let cos = angles.cos()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
-    let sin = angles.sin()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
+    let cos = angles
+        .cos()?
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .to_dtype(DType::BF16)?;
+    let sin = angles
+        .sin()?
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .to_dtype(DType::BF16)?;
     Ok((cos, sin))
 }
 
@@ -3182,11 +3499,7 @@ fn build_rope_for_positions(
 /// `flame_core::attention::sdpa`. `1` = keep, `0` = block.
 ///
 /// Allows `i` to attend to `j` iff `j <= i AND j < real_len`.
-fn build_causal_mask(
-    seq_len: usize,
-    real_len: usize,
-    device: &Arc<CudaDevice>,
-) -> Result<Tensor> {
+fn build_causal_mask(seq_len: usize, real_len: usize, device: &Arc<CudaDevice>) -> Result<Tensor> {
     let mut data = vec![0.0f32; seq_len * seq_len];
     for i in 0..seq_len {
         for j in 0..seq_len {
@@ -3207,10 +3520,7 @@ fn build_causal_mask(
 /// `create_block_causal_mask` (modeling_qwen3.py:152). Token i may attend to
 /// token j when either `t_index[j] == t_index[i]` (same-t block, bidirectional)
 /// or `j <= i` (sequence-order causal). Returns `[1, 1, L, L]` BF16 0/1.
-fn build_block_causal_mask(
-    t_indexes: &[i32],
-    device: &Arc<CudaDevice>,
-) -> Result<Tensor> {
+fn build_block_causal_mask(t_indexes: &[i32], device: &Arc<CudaDevice>) -> Result<Tensor> {
     let l = t_indexes.len();
     let mut data = vec![0.0f32; l * l];
     for i in 0..l {
@@ -3316,12 +3626,7 @@ pub fn linear_z_t(x0_patch: &Tensor, eps: &Tensor, t: &Tensor) -> Result<Tensor>
 
 /// `v_pred = (x_pred - z_t) / max(1 - t, t_eps)`. Mirrors
 /// `_t2i_predict_v` (modeling_neo_chat.py L562).
-pub fn predict_v_from_x(
-    x_pred: &Tensor,
-    z_t: &Tensor,
-    t: &Tensor,
-    t_eps: f32,
-) -> Result<Tensor> {
+pub fn predict_v_from_x(x_pred: &Tensor, z_t: &Tensor, t: &Tensor, t_eps: f32) -> Result<Tensor> {
     let t_dims = t.shape().dims();
     if t_dims.len() != 1 {
         return Err(Error::InvalidInput(format!(
@@ -3510,7 +3815,11 @@ mod tests {
     fn per_layer_keys_all_classify_to_their_layer() {
         for i in [0usize, 7, 13, 41] {
             for k in expected_per_layer_keys(i) {
-                assert_eq!(classify_layer_key(&k), Some(i), "key {k} should classify to layer {i}");
+                assert_eq!(
+                    classify_layer_key(&k),
+                    Some(i),
+                    "key {k} should classify to layer {i}"
+                );
             }
         }
     }
@@ -3550,7 +3859,9 @@ mod tests {
     fn index_json_total_count_matches_expectation() {
         let dir = std::env::var("SENSENOVA_U1_WEIGHTS")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("/home/alex/.serenity/models/sensenova_u1"));
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from("/home/alex/.serenity/models/sensenova_u1")
+            });
         let index = dir.join("model.safetensors.index.json");
         if !index.exists() {
             eprintln!("[skip] {index:?} not present");

@@ -41,8 +41,17 @@ pub fn log_step(
     board: Option<&BoardWriter>,
 ) {
     log_step_with_resume(
-        tag, step, 0, total_steps, dataset_len, batch_size,
-        loss, grad_norm, lr, t_start, board,
+        tag,
+        step,
+        0,
+        total_steps,
+        dataset_len,
+        batch_size,
+        loss,
+        grad_norm,
+        lr,
+        t_start,
+        board,
     );
 }
 
@@ -70,8 +79,7 @@ pub fn log_step_with_resume(
     let bs = batch_size.max(1);
     let steps_per_epoch = (dataset_len.max(1) + bs - 1) / bs;
     let cur_epoch = (absolute_step / steps_per_epoch.max(1)) + 1;
-    let total_epochs =
-        (total + steps_per_epoch.saturating_sub(1)) / steps_per_epoch.max(1);
+    let total_epochs = (total + steps_per_epoch.saturating_sub(1)) / steps_per_epoch.max(1);
 
     let elapsed = t_start.elapsed().as_secs_f32();
     // s/step is measured over THIS run's wall clock — divide by run-local
@@ -97,7 +105,11 @@ pub fn log_step_with_resume(
     );
 
     if let Some(b) = board {
-        let steps_per_sec = if sec_per_step > 0.0 { 1.0 / sec_per_step } else { 0.0 };
+        let steps_per_sec = if sec_per_step > 0.0 {
+            1.0 / sec_per_step
+        } else {
+            0.0
+        };
         b.log_scalars(
             absolute_step_1based as u64,
             &[

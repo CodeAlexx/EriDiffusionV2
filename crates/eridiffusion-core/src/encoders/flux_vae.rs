@@ -7,8 +7,8 @@
 //! Reference: `inference-flame/src/vae/ldm_{encoder,decoder}.rs` (verified
 //! pure-Rust forward), `/home/alex/upstream Python/modules/model/FluxModel.py:VAE`.
 
-pub use crate::encoders::flux_vae_encoder::LdmVAEEncoder as FluxVaeEncoder;
 pub use crate::encoders::flux_vae_decoder::LdmVAEDecoder as FluxVaeDecoder;
+pub use crate::encoders::flux_vae_encoder::LdmVAEEncoder as FluxVaeEncoder;
 
 /// Flux 1 latent channels.
 pub const LATENT_CHANNELS: usize = 16;

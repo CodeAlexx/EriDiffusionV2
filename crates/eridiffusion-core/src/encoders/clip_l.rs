@@ -107,13 +107,17 @@ impl ClipEncoder {
         config: ClipConfig,
         device: Arc<CudaDevice>,
     ) -> Self {
-        Self { weights, config, device }
+        Self {
+            weights,
+            config,
+            device,
+        }
     }
 
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.weights.get(key).ok_or_else(|| {
-            flame_core::Error::InvalidInput(format!("Missing CLIP weight: {key}"))
-        })
+        self.weights
+            .get(key)
+            .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing CLIP weight: {key}")))
     }
 
     /// Linear: [B, N, C] x [out, in]^T -> [B, N, out], with optional bias.
@@ -137,9 +141,7 @@ impl ClipEncoder {
         let hidden = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
         let x_2d = x.reshape(&[batch, hidden])?;
-        let out = flame_core::cuda_ops_bf16::layer_norm_bf16(
-            &x_2d, Some(weight), Some(bias), eps,
-        )?;
+        let out = flame_core::cuda_ops_bf16::layer_norm_bf16(&x_2d, Some(weight), Some(bias), eps)?;
         out.reshape(&dims)
     }
 
@@ -164,7 +166,8 @@ impl ClipEncoder {
             data,
             Shape::from_dims(&[1, 1, seq_len, seq_len]),
             device.clone(),
-        )?.to_dtype(DType::BF16)
+        )?
+        .to_dtype(DType::BF16)
     }
 
     /// Combined causal + key-padding mask.
@@ -211,12 +214,7 @@ impl ClipEncoder {
     /// hidden_states = self.mlp(hidden_states)  # fc1 -> quick_gelu -> fc2
     /// hidden_states = residual + hidden_states
     /// ```
-    fn layer_forward(
-        &self,
-        hidden: &Tensor,
-        layer_idx: usize,
-        mask: &Tensor,
-    ) -> Result<Tensor> {
+    fn layer_forward(&self, hidden: &Tensor, layer_idx: usize, mask: &Tensor) -> Result<Tensor> {
         let cfg = &self.config;
         let h = cfg.num_heads;
         let d = cfg.head_dim;
@@ -372,7 +370,8 @@ impl ClipEncoder {
             padded.iter().map(|&id| id as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
-        )?.to_dtype(DType::I32)?;
+        )?
+        .to_dtype(DType::I32)?;
 
         let token_embeds = token_w.index_select0(&ids)?;
 
@@ -381,7 +380,8 @@ impl ClipEncoder {
             (0..seq_len as i32).map(|i| i as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
-        )?.to_dtype(DType::I32)?;
+        )?
+        .to_dtype(DType::I32)?;
         let pos_embeds = pos_w.index_select0(&pos_ids)?;
 
         let mut hidden = token_embeds.add(&pos_embeds)?.unsqueeze(0)?; // [1, seq, 768]
@@ -460,14 +460,16 @@ impl ClipEncoder {
             padded.iter().map(|&id| id as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
-        )?.to_dtype(DType::I32)?;
+        )?
+        .to_dtype(DType::I32)?;
         let token_embeds = token_w.index_select0(&ids)?;
 
         let pos_ids = Tensor::from_vec(
             (0..seq_len as i32).map(|i| i as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
-        )?.to_dtype(DType::I32)?;
+        )?
+        .to_dtype(DType::I32)?;
         let pos_embeds = pos_w.index_select0(&pos_ids)?;
 
         let mut hidden = token_embeds.add(&pos_embeds)?.unsqueeze(0)?;
@@ -548,14 +550,16 @@ impl ClipEncoder {
             padded.iter().map(|&id| id as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
-        )?.to_dtype(DType::I32)?;
+        )?
+        .to_dtype(DType::I32)?;
         let token_embeds = token_w.index_select0(&ids)?;
 
         let pos_ids = Tensor::from_vec(
             (0..seq_len as i32).map(|i| i as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
-        )?.to_dtype(DType::I32)?;
+        )?
+        .to_dtype(DType::I32)?;
         let pos_embeds = pos_w.index_select0(&pos_ids)?;
 
         let mut hidden = token_embeds.add(&pos_embeds)?.unsqueeze(0)?; // [1, seq, C]
@@ -580,7 +584,8 @@ impl ClipEncoder {
         //    `clip_text` and the post-LN+projected pool separately.
         let final_ln_w = self.w("text_model.final_layer_norm.weight")?;
         let final_ln_b = self.w("text_model.final_layer_norm.bias")?;
-        let last_hidden_post_ln = Self::layer_norm(&hidden, final_ln_w, final_ln_b, cfg.layer_norm_eps)?;
+        let last_hidden_post_ln =
+            Self::layer_norm(&hidden, final_ln_w, final_ln_b, cfg.layer_norm_eps)?;
 
         // 5. Pooled: gather EOS position, then project.
         let eos_pos = padded
@@ -588,7 +593,9 @@ impl ClipEncoder {
             .position(|&id| id == cfg.eos_token_id)
             .unwrap_or(seq_len - 1);
         // [1, 1, C] -> [1, C]
-        let pooled_pre_proj = last_hidden_post_ln.narrow(1, eos_pos, 1)?.squeeze(Some(1))?;
+        let pooled_pre_proj = last_hidden_post_ln
+            .narrow(1, eos_pos, 1)?
+            .squeeze(Some(1))?;
 
         // text_projection: [1280, 1280]; apply as pooled_pre @ text_projection.T
         // PyTorch nn.Linear: y = x @ W.T, weight shape [out, in] -> we apply via linear().

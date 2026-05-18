@@ -1,38 +1,98 @@
+use super::enums::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use super::enums::*;
 
 // For serde default = "path" references — keeps the module clean.
-fn default_true() -> bool { true }
-fn default_false() -> bool { false }
-fn default_one() -> f64 { 1.0 }
-fn default_one_u64() -> u64 { 1 }
-fn default_none_f64() -> Option<f64> { None }
-fn default_none_u64() -> Option<u64> { None }
-fn default_zero() -> f64 { 0.0 }
-fn default_zero_u64() -> u64 { 0 }
-fn default_empty() -> String { String::new() }
-fn default_full() -> String { "full".to_string() }
-fn default_workspace() -> String { "workspace/run".to_string() }
-fn default_cache() -> String { "workspace-cache/run".to_string() }
-fn default_lr() -> f64 { 3e-6 }
-fn default_lr_opt() -> Option<f64> { None }
-fn default_wd() -> f64 { 0.01 }
-fn default_eps() -> f64 { 1e-8 }
-fn default_b1() -> f64 { 0.9 }
-fn default_b2() -> f64 { 0.999 }
-fn default_clip() -> f64 { 1.0 }
-fn default_ema_decay() -> f64 { 0.999 }
-fn default_rank() -> u64 { 16 }
-fn default_alpha() -> f64 { 1.0 }
-fn default_warmup() -> f64 { 200.0 }
-fn default_epochs() -> u64 { 100 }
-fn default_backup_mins() -> u64 { 30 }
-fn default_save_sample10() -> u64 { 10 }
-fn default_resolution() -> String { "1024".to_string() }
-fn default_optimizer() -> String { "adamw".to_string() }
-fn default_one_f32() -> f32 { 1.0 }
-fn default_ema_power() -> f32 { 0.6667 }
+fn default_true() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
+fn default_one() -> f64 {
+    1.0
+}
+fn default_one_u64() -> u64 {
+    1
+}
+fn default_none_f64() -> Option<f64> {
+    None
+}
+fn default_none_u64() -> Option<u64> {
+    None
+}
+fn default_zero() -> f64 {
+    0.0
+}
+fn default_zero_u64() -> u64 {
+    0
+}
+fn default_empty() -> String {
+    String::new()
+}
+fn default_full() -> String {
+    "full".to_string()
+}
+fn default_workspace() -> String {
+    "workspace/run".to_string()
+}
+fn default_cache() -> String {
+    "workspace-cache/run".to_string()
+}
+fn default_lr() -> f64 {
+    3e-6
+}
+fn default_lr_opt() -> Option<f64> {
+    None
+}
+fn default_wd() -> f64 {
+    0.01
+}
+fn default_eps() -> f64 {
+    1e-8
+}
+fn default_b1() -> f64 {
+    0.9
+}
+fn default_b2() -> f64 {
+    0.999
+}
+fn default_clip() -> f64 {
+    1.0
+}
+fn default_ema_decay() -> f64 {
+    0.999
+}
+fn default_rank() -> u64 {
+    16
+}
+fn default_alpha() -> f64 {
+    1.0
+}
+fn default_warmup() -> f64 {
+    200.0
+}
+fn default_epochs() -> u64 {
+    100
+}
+fn default_backup_mins() -> u64 {
+    30
+}
+fn default_save_sample10() -> u64 {
+    10
+}
+fn default_resolution() -> String {
+    "1024".to_string()
+}
+fn default_optimizer() -> String {
+    "adamw".to_string()
+}
+fn default_one_f32() -> f32 {
+    1.0
+}
+fn default_ema_power() -> f32 {
+    0.6667
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainConfig {
@@ -253,7 +313,9 @@ pub struct TrainConfig {
     pub tread_keep_ratio: f32,
 }
 
-fn default_tread_keep_ratio() -> f32 { 1.0 }
+fn default_tread_keep_ratio() -> f32 {
+    1.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPartConfig {
@@ -271,7 +333,13 @@ pub struct ModelPartConfig {
 
 impl Default for ModelPartConfig {
     fn default() -> Self {
-        Self { train: true, model_name: String::new(), learning_rate: None, dropout_probability: 0.0, train_embedding: true }
+        Self {
+            train: true,
+            model_name: String::new(),
+            learning_rate: None,
+            dropout_probability: 0.0,
+            train_embedding: true,
+        }
     }
 }
 
@@ -293,7 +361,14 @@ pub struct TrainOptimizerConfig {
 
 impl Default for TrainOptimizerConfig {
     fn default() -> Self {
-        Self { name: "adamw".into(), learning_rate: None, weight_decay: 0.01, eps: 1e-8, beta1: 0.9, beta2: 0.999 }
+        Self {
+            name: "adamw".into(),
+            learning_rate: None,
+            weight_decay: 0.01,
+            eps: 1e-8,
+            beta1: 0.9,
+            beta2: 0.999,
+        }
     }
 }
 
@@ -395,13 +470,23 @@ impl TrainConfig {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    pub fn is_lora(&self) -> bool { self.training_method == TrainingMethod::Lora }
-    pub fn is_fine_tune(&self) -> bool { self.training_method == TrainingMethod::FineTune }
+    pub fn is_lora(&self) -> bool {
+        self.training_method == TrainingMethod::Lora
+    }
+    pub fn is_fine_tune(&self) -> bool {
+        self.training_method == TrainingMethod::FineTune
+    }
     pub fn is_flow_matching(&self) -> bool {
-        matches!(self.model_type,
-            ModelType::FluxDev1 | ModelType::Flux2 | ModelType::StableDiffusion3 |
-            ModelType::StableDiffusion35 | ModelType::Sana | ModelType::ZImage |
-            ModelType::Qwen | ModelType::HunyuanVideo
+        matches!(
+            self.model_type,
+            ModelType::FluxDev1
+                | ModelType::Flux2
+                | ModelType::StableDiffusion3
+                | ModelType::StableDiffusion35
+                | ModelType::Sana
+                | ModelType::ZImage
+                | ModelType::Qwen
+                | ModelType::HunyuanVideo
         )
     }
 }

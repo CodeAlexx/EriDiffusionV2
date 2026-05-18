@@ -62,7 +62,7 @@ pub const IN_CHANNELS: usize = 4;
 pub const OUT_CHANNELS: usize = 4;
 pub const MODEL_CHANNELS: usize = 320;
 pub const TIME_EMBED_DIM: usize = 1280;
-pub const CONTEXT_DIM: usize = 2048;     // CLIP-L 768 + CLIP-G 1280
+pub const CONTEXT_DIM: usize = 2048; // CLIP-L 768 + CLIP-G 1280
 pub const ADM_IN_CHANNELS: usize = 2816; // CLIP-G pool 1280 + size_ids 1536
 pub const HEAD_DIM: usize = 64;
 pub const GN_GROUPS: usize = 32;
@@ -105,25 +105,29 @@ fn enumerate_lora_targets() -> Vec<(String, usize, usize)> {
     // Each SpatialTransformer (proj_in, td×BasicTransformerBlock, proj_out).
     let mut push_block = |block_prefix: &str, td: usize, ch: usize| {
         // proj_in / proj_out (Linear because SDXL uses use_linear_in_transformer=True).
-        out.push((format!("{block_prefix}.proj_in"),  ch, ch));
+        out.push((format!("{block_prefix}.proj_in"), ch, ch));
 
         for j in 0..td {
             for attn_idx in [1usize, 2] {
                 // attn1 is self-attn → all from x (ch → ch).
                 // attn2 is cross-attn → q from x (ch→ch), k/v from context (CONTEXT_DIM→ch).
-                let (k_in, v_in) = if attn_idx == 1 { (ch, ch) } else { (CONTEXT_DIM, CONTEXT_DIM) };
+                let (k_in, v_in) = if attn_idx == 1 {
+                    (ch, ch)
+                } else {
+                    (CONTEXT_DIM, CONTEXT_DIM)
+                };
                 let pre = format!("{block_prefix}.transformer_blocks.{j}.attn{attn_idx}");
-                out.push((format!("{pre}.to_q"),     ch,   ch));
-                out.push((format!("{pre}.to_k"),     k_in, ch));
-                out.push((format!("{pre}.to_v"),     v_in, ch));
-                out.push((format!("{pre}.to_out.0"), ch,   ch));
+                out.push((format!("{pre}.to_q"), ch, ch));
+                out.push((format!("{pre}.to_k"), k_in, ch));
+                out.push((format!("{pre}.to_v"), v_in, ch));
+                out.push((format!("{pre}.to_out.0"), ch, ch));
             }
             // FeedForward (GeGLU). net.0.proj projects ch → 2 * (FF_MULT*ch);
             // chunked, gated, then net.2 projects (FF_MULT*ch) → ch.
             let inner = FF_MULT * ch;
             let ff_pre = format!("{block_prefix}.transformer_blocks.{j}.ff");
-            out.push((format!("{ff_pre}.net.0.proj"), ch,    inner * 2));
-            out.push((format!("{ff_pre}.net.2"),       inner, ch));
+            out.push((format!("{ff_pre}.net.0.proj"), ch, inner * 2));
+            out.push((format!("{ff_pre}.net.2"), inner, ch));
         }
 
         out.push((format!("{block_prefix}.proj_out"), ch, ch));
@@ -132,14 +136,20 @@ fn enumerate_lora_targets() -> Vec<(String, usize, usize)> {
     // Input blocks 1-8 (block 0 is conv_in). Channels follow [320,320,320,640,640,640,1280,1280].
     let in_ch = [320usize, 320, 320, 640, 640, 640, 1280, 1280];
     for (i, &td) in TD_INPUT.iter().enumerate().skip(1) {
-        if td > 0 { push_block(&format!("input_blocks.{i}.1"), td, in_ch[i - 1]); }
+        if td > 0 {
+            push_block(&format!("input_blocks.{i}.1"), td, in_ch[i - 1]);
+        }
     }
     // Middle block — ST at sub-index 1.
     push_block("middle_block.1", TD_MIDDLE, 1280);
     // Output blocks 0-8.
     for (i, &td) in TD_OUTPUT.iter().enumerate() {
         if td > 0 {
-            let ch = match i { 0..=2 => 1280, 3..=5 => 640, _ => 320 };
+            let ch = match i {
+                0..=2 => 1280,
+                3..=5 => 640,
+                _ => 320,
+            };
             push_block(&format!("output_blocks.{i}.1"), td, ch);
         }
     }
@@ -180,16 +190,28 @@ pub struct SDXLModel {
 }
 
 impl SDXLModel {
-    pub fn load(paths: &[std::path::PathBuf], config: &TrainConfig, device: Arc<CudaDevice>) -> Result<Self> {
+    pub fn load(
+        paths: &[std::path::PathBuf],
+        config: &TrainConfig,
+        device: Arc<CudaDevice>,
+    ) -> Result<Self> {
         // Load (one or many) safetensors files — SDXL ships as a single file
         // typically, but support shards for parity with other trainers.
         let mut weights: HashMap<String, Tensor> = HashMap::new();
         for p in paths {
-            let part = flame_core::serialization::load_file(p, &device)
-                .map_err(|e| crate::EriDiffusionError::Safetensors(format!("load {}: {e}", p.display())))?;
+            let part = flame_core::serialization::load_file(p, &device).map_err(|e| {
+                crate::EriDiffusionError::Safetensors(format!("load {}: {e}", p.display()))
+            })?;
             for (k, v) in part {
-                let k = k.strip_prefix("model.diffusion_model.").unwrap_or(&k).to_string();
-                let v = if v.dtype() == DType::BF16 { v } else { v.to_dtype(DType::BF16)? };
+                let k = k
+                    .strip_prefix("model.diffusion_model.")
+                    .unwrap_or(&k)
+                    .to_string();
+                let v = if v.dtype() == DType::BF16 {
+                    v
+                } else {
+                    v.to_dtype(DType::BF16)?
+                };
                 weights.insert(k, v);
             }
         }
@@ -205,16 +227,30 @@ impl SDXLModel {
             let rank = config.lora_rank as usize;
             let alpha = config.lora_alpha as f32;
             let targets = enumerate_lora_targets();
-            log::info!("SDXL LoRA: rank={} alpha={} targets={}", rank, alpha, targets.len());
+            log::info!(
+                "SDXL LoRA: rank={} alpha={} targets={}",
+                rank,
+                alpha,
+                targets.len()
+            );
             let seed_base = 42u64;
             for (idx, (prefix, in_f, out_f)) in targets.into_iter().enumerate() {
-                let lora = LoRALinear::new(in_f, out_f, rank, alpha, device.clone(), seed_base + idx as u64)
-                    .map_err(|e| crate::EriDiffusionError::Lora(format!("LoRA new {prefix}: {e}")))?;
+                let lora = LoRALinear::new(
+                    in_f,
+                    out_f,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base + idx as u64,
+                )
+                .map_err(|e| crate::EriDiffusionError::Lora(format!("LoRA new {prefix}: {e}")))?;
                 lora_index_by_prefix.insert(prefix.clone(), idx);
                 lora_adapters.push(lora);
                 lora_target_prefixes.push(prefix);
             }
-            for l in &lora_adapters { parameters.extend(l.parameters()); }
+            for l in &lora_adapters {
+                parameters.extend(l.parameters());
+            }
         } else {
             // Full fine-tune mode (uncommon but supported by preset
             // `#sdxl 1.0.json`). Promote every tensor to F32 trainable.
@@ -276,12 +312,13 @@ impl SDXLModel {
         let targets = enumerate_lora_targets();
         let mut lycoris_adapters: HashMap<String, Arc<LycorisLinear>> = HashMap::new();
         for (prefix, in_f, out_f) in &targets {
-            let wrapper = crate::models::chroma::build_lycoris_linear(
-                config, *in_f, *out_f, device.clone(),
-            )
-            .map_err(|e| crate::EriDiffusionError::Lora(format!(
-                "build_lycoris_linear {prefix}: {e}"
-            )))?;
+            let wrapper =
+                crate::models::chroma::build_lycoris_linear(config, *in_f, *out_f, device.clone())
+                    .map_err(|e| {
+                        crate::EriDiffusionError::Lora(format!(
+                            "build_lycoris_linear {prefix}: {e}"
+                        ))
+                    })?;
             lycoris_adapters.insert(prefix.clone(), Arc::new(wrapper));
         }
 
@@ -351,9 +388,11 @@ impl SDXLModel {
             };
             let applied = adapter
                 .init_perturbed_normal_lokr(base, scale)
-                .map_err(|e| crate::EriDiffusionError::Model(format!(
-                    "init_perturbed_normal_lokr({prefix}): {e}"
-                )))?;
+                .map_err(|e| {
+                    crate::EriDiffusionError::Model(format!(
+                        "init_perturbed_normal_lokr({prefix}): {e}"
+                    ))
+                })?;
             if applied {
                 applied_count += 1;
             } else {
@@ -367,7 +406,8 @@ impl SDXLModel {
     }
 
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.weights.get(key)
+        self.weights
+            .get(key)
             .ok_or_else(|| crate::EriDiffusionError::Model(format!("missing weight: {key}")))
     }
 
@@ -382,7 +422,7 @@ impl SDXLModel {
     fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let in_feat = *dims.last().unwrap();
-        let batch: usize = dims[..dims.len()-1].iter().product();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
         let out_feat = weight.shape().dims()[0];
         let x_2d = x.reshape(&[batch, in_feat])?;
         let wt = weight.transpose()?;
@@ -390,7 +430,7 @@ impl SDXLModel {
         if let Some(b) = bias {
             out = out.add(b)?;
         }
-        let mut shape = dims[..dims.len()-1].to_vec();
+        let mut shape = dims[..dims.len() - 1].to_vec();
         shape.push(out_feat);
         out.reshape(&shape).map_err(Into::into)
     }
@@ -412,8 +452,9 @@ impl SDXLModel {
         if self.is_lora {
             if let Some(adapter) = self.adapter_for(prefix) {
                 let x_3d = ensure_3d(x)?;
-                let delta = adapter.forward_delta(&x_3d)
-                    .map_err(|e| crate::EriDiffusionError::Lora(format!("LoRA delta {prefix}: {e}")))?;
+                let delta = adapter.forward_delta(&x_3d).map_err(|e| {
+                    crate::EriDiffusionError::Lora(format!("LoRA delta {prefix}: {e}"))
+                })?;
                 // The base may be 2D or 3D depending on the call site; the
                 // delta comes back 3D. Reshape it to match `base` before add.
                 let base_dims = base.shape().dims().to_vec();
@@ -425,7 +466,14 @@ impl SDXLModel {
     }
 
     /// Conv2d (frozen, no LoRA).
-    fn conv2d(&self, x: &Tensor, weight_key: &str, bias_key: &str, stride: usize, padding: usize) -> Result<Tensor> {
+    fn conv2d(
+        &self,
+        x: &Tensor,
+        weight_key: &str,
+        bias_key: &str,
+        stride: usize,
+        padding: usize,
+    ) -> Result<Tensor> {
         let weight = self.w(weight_key)?;
         let bias = self.weights.get(bias_key);
         flame_core::cuda_conv2d::conv2d(x, weight, bias, stride, padding).map_err(Into::into)
@@ -436,7 +484,8 @@ impl SDXLModel {
         let weight = self.w(weight_key)?;
         let bias = self.w(bias_key)?;
         let nhwc = GpuOps::permute_nchw_to_nhwc(x)?;
-        let out_nhwc = flame_core::group_norm::group_norm(&nhwc, GN_GROUPS, Some(weight), Some(bias), GN_EPS)?;
+        let out_nhwc =
+            flame_core::group_norm::group_norm(&nhwc, GN_GROUPS, Some(weight), Some(bias), GN_EPS)?;
         GpuOps::permute_nhwc_to_nchw(&out_nhwc).map_err(Into::into)
     }
 
@@ -460,7 +509,8 @@ impl SDXLModel {
         }
         let device = t.device().clone();
         Tensor::from_vec(data, Shape::from_dims(&[b, dim]), device)?
-            .to_dtype(DType::BF16).map_err(Into::into)
+            .to_dtype(DType::BF16)
+            .map_err(Into::into)
     }
 
     // -----------------------------------------------------------------------
@@ -468,24 +518,57 @@ impl SDXLModel {
     // -----------------------------------------------------------------------
 
     fn resblock(&self, x: &Tensor, emb: &Tensor, prefix: &str) -> Result<Tensor> {
-        let h = self.group_norm(x, &format!("{prefix}.in_layers.0.weight"), &format!("{prefix}.in_layers.0.bias"))?;
+        let h = self.group_norm(
+            x,
+            &format!("{prefix}.in_layers.0.weight"),
+            &format!("{prefix}.in_layers.0.bias"),
+        )?;
         let h = h.silu()?;
-        let h = self.conv2d(&h, &format!("{prefix}.in_layers.2.weight"), &format!("{prefix}.in_layers.2.bias"), 1, 1)?;
+        let h = self.conv2d(
+            &h,
+            &format!("{prefix}.in_layers.2.weight"),
+            &format!("{prefix}.in_layers.2.bias"),
+            1,
+            1,
+        )?;
 
         let emb_h = emb.silu()?;
-        let emb_out = Self::linear(&emb_h,
+        let emb_out = Self::linear(
+            &emb_h,
             self.w(&format!("{prefix}.emb_layers.1.weight"))?,
-            Some(self.w(&format!("{prefix}.emb_layers.1.bias"))?))?;
+            Some(self.w(&format!("{prefix}.emb_layers.1.bias"))?),
+        )?;
         let c = h.shape().dims()[1];
-        let emb_bc = emb_out.narrow(1, 0, c)?.reshape(&[emb_out.shape().dims()[0], c, 1, 1])?;
+        let emb_bc = emb_out
+            .narrow(1, 0, c)?
+            .reshape(&[emb_out.shape().dims()[0], c, 1, 1])?;
         let h = h.add(&emb_bc)?;
 
-        let h = self.group_norm(&h, &format!("{prefix}.out_layers.0.weight"), &format!("{prefix}.out_layers.0.bias"))?;
+        let h = self.group_norm(
+            &h,
+            &format!("{prefix}.out_layers.0.weight"),
+            &format!("{prefix}.out_layers.0.bias"),
+        )?;
         let h = h.silu()?;
-        let h = self.conv2d(&h, &format!("{prefix}.out_layers.3.weight"), &format!("{prefix}.out_layers.3.bias"), 1, 1)?;
+        let h = self.conv2d(
+            &h,
+            &format!("{prefix}.out_layers.3.weight"),
+            &format!("{prefix}.out_layers.3.bias"),
+            1,
+            1,
+        )?;
 
-        let residual = if self.weights.contains_key(&format!("{prefix}.skip_connection.weight")) {
-            self.conv2d(x, &format!("{prefix}.skip_connection.weight"), &format!("{prefix}.skip_connection.bias"), 1, 0)?
+        let residual = if self
+            .weights
+            .contains_key(&format!("{prefix}.skip_connection.weight"))
+        {
+            self.conv2d(
+                x,
+                &format!("{prefix}.skip_connection.weight"),
+                &format!("{prefix}.skip_connection.bias"),
+                1,
+                0,
+            )?
         } else {
             x.clone()
         };
@@ -493,19 +576,32 @@ impl SDXLModel {
         // F32 residual accumulation — same pattern as the inference-flame
         // SDXL UNet; keeps BF16 truncation error from compounding through
         // 30+ skip connections.
-        residual.to_dtype(DType::F32)?.add(&h.to_dtype(DType::F32)?)?
-            .to_dtype(DType::BF16).map_err(Into::into)
+        residual
+            .to_dtype(DType::F32)?
+            .add(&h.to_dtype(DType::F32)?)?
+            .to_dtype(DType::BF16)
+            .map_err(Into::into)
     }
 
     // -----------------------------------------------------------------------
     // SpatialTransformer + BasicTransformerBlock + attention + GEGLU
     // -----------------------------------------------------------------------
 
-    fn spatial_transformer(&self, x: &Tensor, context: &Tensor, prefix: &str, td: usize) -> Result<Tensor> {
+    fn spatial_transformer(
+        &self,
+        x: &Tensor,
+        context: &Tensor,
+        prefix: &str,
+        td: usize,
+    ) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
 
-        let x_norm = self.group_norm(x, &format!("{prefix}.norm.weight"), &format!("{prefix}.norm.bias"))?;
+        let x_norm = self.group_norm(
+            x,
+            &format!("{prefix}.norm.weight"),
+            &format!("{prefix}.norm.bias"),
+        )?;
         // SDXL uses use_linear_in_transformer=true (proj_in/proj_out are
         // Linear, not Conv2d 1x1). NCHW → [B, H*W, C].
         let x_flat = x_norm.permute(&[0, 2, 3, 1])?.reshape(&[b, h * w, c])?;
@@ -514,34 +610,57 @@ impl SDXLModel {
         let mut h_state = self.attn_proj(&x_flat, &format!("{prefix}.proj_in"))?;
 
         for j in 0..td {
-            h_state = self.basic_transformer_block(&h_state, context,
-                &format!("{prefix}.transformer_blocks.{j}"))?;
+            h_state = self.basic_transformer_block(
+                &h_state,
+                context,
+                &format!("{prefix}.transformer_blocks.{j}"),
+            )?;
         }
 
         let out = self.attn_proj(&h_state, &format!("{prefix}.proj_out"))?;
 
-        let out = out.reshape(&[b, h, w, c])?.permute(&[0, 3, 1, 2])?.contiguous()?;
+        let out = out
+            .reshape(&[b, h, w, c])?
+            .permute(&[0, 3, 1, 2])?
+            .contiguous()?;
         x.add(&out).map_err(Into::into)
     }
 
-    fn basic_transformer_block(&self, x: &Tensor, context: &Tensor, prefix: &str) -> Result<Tensor> {
+    fn basic_transformer_block(
+        &self,
+        x: &Tensor,
+        context: &Tensor,
+        prefix: &str,
+    ) -> Result<Tensor> {
         let c = *x.shape().dims().last().unwrap();
 
-        let x_norm1 = flame_core::layer_norm::layer_norm(x, &[c],
+        let x_norm1 = flame_core::layer_norm::layer_norm(
+            x,
+            &[c],
             Some(self.w(&format!("{prefix}.norm1.weight"))?),
-            Some(self.w(&format!("{prefix}.norm1.bias"))?), NORM_EPS)?;
+            Some(self.w(&format!("{prefix}.norm1.bias"))?),
+            NORM_EPS,
+        )?;
         let attn1_out = self.attention(&x_norm1, &x_norm1, &format!("{prefix}.attn1"))?;
         let x = x.add(&attn1_out)?;
 
-        let x_norm2 = flame_core::layer_norm::layer_norm(&x, &[c],
+        let x_norm2 = flame_core::layer_norm::layer_norm(
+            &x,
+            &[c],
             Some(self.w(&format!("{prefix}.norm2.weight"))?),
-            Some(self.w(&format!("{prefix}.norm2.bias"))?), NORM_EPS)?;
+            Some(self.w(&format!("{prefix}.norm2.bias"))?),
+            NORM_EPS,
+        )?;
         let attn2_out = self.attention(&x_norm2, context, &format!("{prefix}.attn2"))?;
         let x = x.add(&attn2_out)?;
 
-        let x_norm3 = flame_core::layer_norm::layer_norm(&x, &[c],
+        let x_norm3 = flame_core::layer_norm::layer_norm(
+            &x,
+            &[c],
             Some(self.w(&format!("{prefix}.norm3.weight"))?),
-            Some(self.w(&format!("{prefix}.norm3.bias"))?), NORM_EPS)?;
+            Some(self.w(&format!("{prefix}.norm3.bias"))?),
+            NORM_EPS,
+        )?;
         let ff_out = self.feed_forward(&x_norm3, &format!("{prefix}.ff"))?;
         x.add(&ff_out).map_err(Into::into)
     }
@@ -553,16 +672,24 @@ impl SDXLModel {
         let num_heads = inner_dim / HEAD_DIM;
         let seq_kv = context.shape().dims()[1];
 
-        let q = self.attn_proj(x,       &format!("{prefix}.to_q"))?;
+        let q = self.attn_proj(x, &format!("{prefix}.to_q"))?;
         let k = self.attn_proj(context, &format!("{prefix}.to_k"))?;
         let v = self.attn_proj(context, &format!("{prefix}.to_v"))?;
 
-        let q = q.reshape(&[b, seq_q,  num_heads, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[b, seq_kv, num_heads, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[b, seq_kv, num_heads, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+        let q = q
+            .reshape(&[b, seq_q, num_heads, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let k = k
+            .reshape(&[b, seq_kv, num_heads, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let v = v
+            .reshape(&[b, seq_kv, num_heads, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
 
         let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-        let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq_q, inner_dim])?;
+        let out = out
+            .permute(&[0, 2, 1, 3])?
+            .reshape(&[b, seq_q, inner_dim])?;
         self.attn_proj(&out, &format!("{prefix}.to_out.0"))
     }
 
@@ -583,14 +710,26 @@ impl SDXLModel {
     // -----------------------------------------------------------------------
 
     fn downsample(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
-        self.conv2d(x, &format!("{prefix}.op.weight"), &format!("{prefix}.op.bias"), 2, 1)
+        self.conv2d(
+            x,
+            &format!("{prefix}.op.weight"),
+            &format!("{prefix}.op.bias"),
+            2,
+            1,
+        )
     }
 
     fn upsample(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (_b, _c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
         let up = x.upsample_nearest2d(h * 2, w * 2)?;
-        self.conv2d(&up, &format!("{prefix}.conv.weight"), &format!("{prefix}.conv.bias"), 1, 1)
+        self.conv2d(
+            &up,
+            &format!("{prefix}.conv.weight"),
+            &format!("{prefix}.conv.bias"),
+            1,
+            1,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -611,17 +750,29 @@ impl SDXLModel {
     ) -> Result<Tensor> {
         // Time + label embed
         let t_emb = Self::timestep_embedding(timesteps, MODEL_CHANNELS)?;
-        let emb = Self::linear(&t_emb,
-            self.w("time_embed.0.weight")?, Some(self.w("time_embed.0.bias")?))?;
+        let emb = Self::linear(
+            &t_emb,
+            self.w("time_embed.0.weight")?,
+            Some(self.w("time_embed.0.bias")?),
+        )?;
         let emb = emb.silu()?;
-        let emb = Self::linear(&emb,
-            self.w("time_embed.2.weight")?, Some(self.w("time_embed.2.bias")?))?;
+        let emb = Self::linear(
+            &emb,
+            self.w("time_embed.2.weight")?,
+            Some(self.w("time_embed.2.bias")?),
+        )?;
 
-        let label = Self::linear(y,
-            self.w("label_emb.0.0.weight")?, Some(self.w("label_emb.0.0.bias")?))?;
+        let label = Self::linear(
+            y,
+            self.w("label_emb.0.0.weight")?,
+            Some(self.w("label_emb.0.0.bias")?),
+        )?;
         let label = label.silu()?;
-        let label = Self::linear(&label,
-            self.w("label_emb.0.2.weight")?, Some(self.w("label_emb.0.2.bias")?))?;
+        let label = Self::linear(
+            &label,
+            self.w("label_emb.0.2.weight")?,
+            Some(self.w("label_emb.0.2.bias")?),
+        )?;
 
         let emb = emb.add(&label)?;
 
@@ -659,8 +810,9 @@ impl SDXLModel {
             let prefix = format!("output_blocks.{n}");
             let td = TD_OUTPUT[n];
 
-            let skip = hs.pop().ok_or_else(||
-                crate::EriDiffusionError::Model("ran out of skip connections".into()))?;
+            let skip = hs.pop().ok_or_else(|| {
+                crate::EriDiffusionError::Model("ran out of skip connections".into())
+            })?;
             h = Tensor::cat(&[&h, &skip], 1)?;
 
             h = self.resblock(&h, &emb, &format!("{prefix}.0"))?;
@@ -687,7 +839,10 @@ fn ensure_3d(t: &Tensor) -> Result<Tensor> {
     match dims.len() {
         2 => t.unsqueeze(0).map_err(Into::into),
         3 => Ok(t.clone()),
-        _ => Err(crate::EriDiffusionError::Model(format!("expected 2D or 3D, got {}D", dims.len()))),
+        _ => Err(crate::EriDiffusionError::Model(format!(
+            "expected 2D or 3D, got {}D",
+            dims.len()
+        ))),
     }
 }
 
@@ -703,10 +858,14 @@ impl TrainableModel for SDXLModel {
         context: &[Tensor],
         pooled: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let ctx = context.first().ok_or_else(||
-            crate::EriDiffusionError::Model("SDXL needs concat(CLIP-L, CLIP-G) context".into()))?;
-        let y = pooled.ok_or_else(||
-            crate::EriDiffusionError::Model("SDXL needs pooled `y` (concat(CLIP-G pool, size_ids))".into()))?;
+        let ctx = context.first().ok_or_else(|| {
+            crate::EriDiffusionError::Model("SDXL needs concat(CLIP-L, CLIP-G) context".into())
+        })?;
+        let y = pooled.ok_or_else(|| {
+            crate::EriDiffusionError::Model(
+                "SDXL needs pooled `y` (concat(CLIP-G pool, size_ids))".into(),
+            )
+        })?;
         SDXLModel::forward(self, noisy, timestep, ctx, y)
     }
 
@@ -716,7 +875,9 @@ impl TrainableModel for SDXLModel {
 
     fn post_optimizer_step(&mut self) {
         // LoRALinear caches nothing today, but mirror the contract:
-        for l in &self.lora_adapters { l.refresh_cache(); }
+        for l in &self.lora_adapters {
+            l.refresh_cache();
+        }
         // LyCORIS adapters don't carry a transposed-BF16 cache — `forward_delta`
         // reads leaves live each call. No-op here, kept for source-level
         // uniformity with the legacy path.
@@ -764,11 +925,13 @@ impl TrainableModel for SDXLModel {
                     self.device.clone(),
                 )
                 .and_then(|t| t.to_dtype(DType::BF16))
-                .map_err(|e| crate::EriDiffusionError::Lora(format!(
-                    "alpha tensor for {prefix}: {e}")))?;
+                .map_err(|e| {
+                    crate::EriDiffusionError::Lora(format!("alpha tensor for {prefix}: {e}"))
+                })?;
                 out.insert(format!("{prefix}.alpha"), alpha_t);
             } else if let Some(adapter) = self.lora_adapters.get(i) {
-                adapter.save_tensors(prefix, &mut out)
+                adapter
+                    .save_tensors(prefix, &mut out)
                     .map_err(|e| crate::EriDiffusionError::Lora(format!("save {prefix}: {e}")))?;
                 // SDXL audit H6: companion `.alpha` scalar (BF16 to match
                 // the rest of the LoRA tensors). 0-dim; loaders that expect
@@ -780,8 +943,9 @@ impl TrainableModel for SDXLModel {
                     self.device.clone(),
                 )
                 .and_then(|t| t.to_dtype(DType::BF16))
-                .map_err(|e| crate::EriDiffusionError::Lora(format!(
-                    "alpha tensor for {prefix}: {e}")))?;
+                .map_err(|e| {
+                    crate::EriDiffusionError::Lora(format!("alpha tensor for {prefix}: {e}"))
+                })?;
                 out.insert(format!("{prefix}.alpha"), alpha_t);
             }
         }
@@ -808,12 +972,12 @@ impl TrainableModel for SDXLModel {
                 self.algo
             )));
         }
-        let source = flame_core::serialization::load_file(
-            std::path::Path::new(path), &self.device,
-        ).map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
+        let source = flame_core::serialization::load_file(std::path::Path::new(path), &self.device)
+            .map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
         for (i, adapter) in self.lora_adapters.iter().enumerate() {
             let prefix = &self.lora_target_prefixes[i];
-            adapter.load_tensors(prefix, &source)
+            adapter
+                .load_tensors(prefix, &source)
                 .map_err(|e| crate::EriDiffusionError::Lora(format!("load {prefix}: {e}")))?;
         }
         Ok(())
@@ -887,14 +1051,21 @@ mod tests {
         //   ST counts: input STs=4, middle=1, output STs=6 ⇒ 11 STs total
         //   Total adapters = 70 * 10 + 11 * 2 = 722
         let targets = enumerate_lora_targets();
-        let total_td: usize = TD_INPUT.iter().sum::<usize>() + TD_MIDDLE + TD_OUTPUT.iter().sum::<usize>();
-        let st_slots = TD_INPUT.iter().filter(|&&t| t > 0).count() + 1
+        let total_td: usize =
+            TD_INPUT.iter().sum::<usize>() + TD_MIDDLE + TD_OUTPUT.iter().sum::<usize>();
+        let st_slots = TD_INPUT.iter().filter(|&&t| t > 0).count()
+            + 1
             + TD_OUTPUT.iter().filter(|&&t| t > 0).count();
-        assert_eq!(total_td, 70, "td slot sum (was 80 in prior comment, actual 70)");
+        assert_eq!(
+            total_td, 70,
+            "td slot sum (was 80 in prior comment, actual 70)"
+        );
         assert_eq!(st_slots, 11);
         assert_eq!(targets.len(), total_td * 10 + st_slots * 2);
         // Sanity: ensure FF and proj_in/out targets are present.
-        assert!(targets.iter().any(|(p, _, _)| p.ends_with(".ff.net.0.proj")));
+        assert!(targets
+            .iter()
+            .any(|(p, _, _)| p.ends_with(".ff.net.0.proj")));
         assert!(targets.iter().any(|(p, _, _)| p.ends_with(".ff.net.2")));
         assert!(targets.iter().any(|(p, _, _)| p.ends_with(".proj_in")));
         assert!(targets.iter().any(|(p, _, _)| p.ends_with(".proj_out")));

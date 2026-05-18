@@ -32,16 +32,23 @@ use flame_core::{serialization::save_file, DType, Shape, Tensor};
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] input_dir: PathBuf,
-    #[arg(long)] output_dir: PathBuf,
+    #[arg(long)]
+    input_dir: PathBuf,
+    #[arg(long)]
+    output_dir: PathBuf,
     /// LTX-2 video VAE checkpoint (single safetensors). Stub if missing.
-    #[arg(long)] vae_ckpt: PathBuf,
+    #[arg(long)]
+    vae_ckpt: PathBuf,
     /// Gemma-3 text encoder directory. Stub if Gemma3Encoder isn't ported yet.
-    #[arg(long)] text_ckpt_dir: PathBuf,
+    #[arg(long)]
+    text_ckpt_dir: PathBuf,
     /// Tokenizer.json path for Gemma-3.
-    #[arg(long)] tokenizer_path: PathBuf,
-    #[arg(long, default_value = "256")] size: usize,
-    #[arg(long)] skip_existing: bool,
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    #[arg(long, default_value = "256")]
+    size: usize,
+    #[arg(long)]
+    skip_existing: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -50,7 +57,9 @@ fn main() -> anyhow::Result<()> {
     // the pool grows host RSS under text-encoder forward.
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at this point.
-        unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
+        unsafe {
+            std::env::set_var("FLAME_ALLOC_POOL", "0");
+        }
     }
     env_logger::init();
     let args = Args::parse();
@@ -59,7 +68,8 @@ fn main() -> anyhow::Result<()> {
     if args.size % LTX2_BUCKET_DIVISIBILITY != 0 {
         anyhow::bail!(
             "--size {} must be divisible by {} (LTX-2 bucket divisibility)",
-            args.size, LTX2_BUCKET_DIVISIBILITY
+            args.size,
+            LTX2_BUCKET_DIVISIBILITY
         );
     }
 
@@ -89,7 +99,10 @@ fn main() -> anyhow::Result<()> {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp") {
                 let stem = path.file_stem().unwrap().to_str().unwrap();
-                pairs.push((path.to_path_buf(), args.input_dir.join(format!("{stem}.txt"))));
+                pairs.push((
+                    path.to_path_buf(),
+                    args.input_dir.join(format!("{stem}.txt")),
+                ));
             }
         }
     }
@@ -99,11 +112,17 @@ fn main() -> anyhow::Result<()> {
     for (img_path, txt_path) in &pairs {
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
-        if args.skip_existing && out_path.exists() { continue; }
+        if args.skip_existing && out_path.exists() {
+            continue;
+        }
 
         // Load + center-crop to square + resize.
         let img = image::open(img_path)?
-            .resize_exact(args.size as u32, args.size as u32, image::imageops::FilterType::Lanczos3)
+            .resize_exact(
+                args.size as u32,
+                args.size as u32,
+                image::imageops::FilterType::Lanczos3,
+            )
             .to_rgb32f();
         let (w, h) = img.dimensions();
         let (wu, hu) = (w as usize, h as usize);
@@ -127,23 +146,30 @@ fn main() -> anyhow::Result<()> {
         // Caption → text tokens. Gemma-3 requires fixed 1024-token left-padded
         // input (see encoders/gemma3.rs).
         let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
-        let encoding = tokenizer.encode(caption.trim(), true)
+        let encoding = tokenizer
+            .encode(caption.trim(), true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
         let mut ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
         let real_len = ids.len().min(GEMMA3_PROMPT_LEN);
-        if ids.len() > GEMMA3_PROMPT_LEN { ids.truncate(GEMMA3_PROMPT_LEN); }
+        if ids.len() > GEMMA3_PROMPT_LEN {
+            ids.truncate(GEMMA3_PROMPT_LEN);
+        }
         // Left-pad with 0 (Gemma3 pad id). The caller (Gemma3Encoder::encode)
         // is responsible for converting this to the correct hidden states.
         let pad_n = GEMMA3_PROMPT_LEN - ids.len();
         let mut padded_ids = vec![0i32; pad_n];
         padded_ids.extend_from_slice(&ids);
 
-        let text_emb = te.encode(&padded_ids)
+        let text_emb = te
+            .encode(&padded_ids)
             .map_err(|e| anyhow::anyhow!("Gemma3 encode: {e}"))?;
 
         let mut tensors = std::collections::HashMap::new();
         tensors.insert("latent".to_string(), latent.to_dtype(DType::BF16)?);
-        tensors.insert("text_embedding".to_string(), text_emb.to_dtype(DType::BF16)?);
+        tensors.insert(
+            "text_embedding".to_string(),
+            text_emb.to_dtype(DType::BF16)?,
+        );
         let real_len_t = Tensor::from_vec(
             vec![real_len as f32],
             Shape::from_dims(&[1]),

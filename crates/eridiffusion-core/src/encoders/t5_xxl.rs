@@ -83,16 +83,10 @@ pub struct T5Encoder {
 impl T5Encoder {
     /// Load T5-XXL from safetensors. Casts every tensor to BF16 (loader
     /// upcasts F16 → F32; BF16 kernels need BF16).
-    pub fn load(
-        safetensors_path: &str,
-        device: &Arc<CudaDevice>,
-    ) -> Result<Self> {
+    pub fn load(safetensors_path: &str, device: &Arc<CudaDevice>) -> Result<Self> {
         let config = T5Config::default();
 
-        let raw = flame_core::serialization::load_file(
-            Path::new(safetensors_path),
-            device,
-        )?;
+        let raw = flame_core::serialization::load_file(Path::new(safetensors_path), device)?;
 
         let mut weights: HashMap<String, Tensor> = HashMap::with_capacity(raw.len());
         for (k, v) in raw {
@@ -113,7 +107,11 @@ impl T5Encoder {
 
         log::info!("[T5] Loaded: {} resident weights (BF16)", weights.len());
 
-        Ok(Self { weights, config, device: device.clone() })
+        Ok(Self {
+            weights,
+            config,
+            device: device.clone(),
+        })
     }
 
     /// T5 LayerNorm (RMSNorm variant): norm(x) * weight
@@ -132,20 +130,28 @@ impl T5Encoder {
         let prof = std::env::var("FLUX1_LIN_PROF").ok().as_deref() == Some("1");
         let dev = x.device();
 
-        if prof { let _ = dev.synchronize(); }
+        if prof {
+            let _ = dev.synchronize();
+        }
         let t0 = std::time::Instant::now();
         let wt = flame_core::bf16_elementwise::transpose2d_bf16(weight)?;
-        if prof { let _ = dev.synchronize(); }
+        if prof {
+            let _ = dev.synchronize();
+        }
         let trans_us = t0.elapsed().as_micros();
 
         let shape = x.shape().dims().to_vec();
         let (b, n, c) = (shape[0], shape[1], shape[2]);
         let x_2d = x.reshape(&[b * n, c])?;
 
-        if prof { let _ = dev.synchronize(); }
+        if prof {
+            let _ = dev.synchronize();
+        }
         let t1 = std::time::Instant::now();
         let out = x_2d.matmul(&wt)?;
-        if prof { let _ = dev.synchronize(); }
+        if prof {
+            let _ = dev.synchronize();
+        }
         let mm_us = t1.elapsed().as_micros();
 
         if prof {
@@ -154,8 +160,11 @@ impl T5Encoder {
                 if COUNT < 8 {
                     eprintln!(
                         "[LIN] x={:?} w={:?} wt_storage={:?}: transpose={}us matmul={}us",
-                        x.shape().dims(), weight.shape().dims(), wt.dtype(),
-                        trans_us, mm_us
+                        x.shape().dims(),
+                        weight.shape().dims(),
+                        wt.dtype(),
+                        trans_us,
+                        mm_us
                     );
                     COUNT += 1;
                 }
@@ -219,7 +228,8 @@ impl T5Encoder {
             bias_data.iter().map(|&i| i as f32).collect(),
             Shape::from_dims(&[seq_len * seq_len]),
             device.clone(),
-        )?.to_dtype(DType::I32)?;
+        )?
+        .to_dtype(DType::I32)?;
 
         // bias_weight: [32, 64] → gather rows → [seq*seq, 64]
         let gathered = bias_weight.index_select0(&indices)?; // [seq*seq, num_heads]
@@ -262,13 +272,14 @@ impl T5Encoder {
 
         let w = |suffix: &str| -> Result<&Tensor> {
             let key = format!("{prefix}.{suffix}");
-            weights.get(&key).ok_or_else(|| {
-                flame_core::Error::InvalidInput(format!("Missing T5 weight: {key}"))
-            })
+            weights
+                .get(&key)
+                .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing T5 weight: {key}")))
         };
 
         // --- Self-attention ---
-        let normed = Self::t5_layer_norm(hidden, w("layer.0.layer_norm.weight")?, cfg.layer_norm_eps)?;
+        let normed =
+            Self::t5_layer_norm(hidden, w("layer.0.layer_norm.weight")?, cfg.layer_norm_eps)?;
 
         let q = Self::linear(&normed, w("layer.0.SelfAttention.q.weight")?)?;
         let k = Self::linear(&normed, w("layer.0.SelfAttention.k.weight")?)?;
@@ -297,7 +308,8 @@ impl T5Encoder {
         let hidden = hidden.add(&attn_out)?;
 
         // --- Gated-GELU FFN ---
-        let normed2 = Self::t5_layer_norm(&hidden, w("layer.1.layer_norm.weight")?, cfg.layer_norm_eps)?;
+        let normed2 =
+            Self::t5_layer_norm(&hidden, w("layer.1.layer_norm.weight")?, cfg.layer_norm_eps)?;
 
         let gate = Self::linear(&normed2, w("layer.1.DenseReluDense.wi_0.weight")?)?;
         let up = Self::linear(&normed2, w("layer.1.DenseReluDense.wi_1.weight")?)?;
@@ -332,21 +344,30 @@ impl T5Encoder {
         }
         let seq_len = max_len;
 
-        log::info!("[T5] Encoding: seq_len={} (padded from {})", seq_len, token_ids.len());
+        log::info!(
+            "[T5] Encoding: seq_len={} (padded from {})",
+            seq_len,
+            token_ids.len()
+        );
 
         // 1. Token embeddings (no position embeddings — T5 uses relative bias)
-        let embed_w = self.weights.get("encoder.embed_tokens.weight")
+        let embed_w = self
+            .weights
+            .get("encoder.embed_tokens.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing embed_tokens".into()))?;
         let ids = Tensor::from_vec(
             padded.iter().map(|&id| id as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
-        )?.to_dtype(DType::I32)?;
+        )?
+        .to_dtype(DType::I32)?;
         let mut hidden = embed_w.index_select0(&ids)?.unsqueeze(0)?; // [1, seq, 4096]
 
         // 2. Compute relative position bias from layer 0 weight (shared across layers)
         let bias_key = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight";
-        let bias_weight = self.weights.get(bias_key)
+        let bias_weight = self
+            .weights
+            .get(bias_key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing {bias_key}")))?;
 
         let position_bias = Self::compute_relative_bias(
@@ -366,7 +387,9 @@ impl T5Encoder {
         }
 
         // 4. Final layer norm
-        let final_norm_w = self.weights.get("encoder.final_layer_norm.weight")
+        let final_norm_w = self
+            .weights
+            .get("encoder.final_layer_norm.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing final_layer_norm".into()))?;
         hidden = Self::t5_layer_norm(&hidden, final_norm_w, cfg.layer_norm_eps)?;
 
@@ -438,8 +461,7 @@ fn t5_relative_position_bucket(
         rp
     } else {
         let val = max_exact as f64
-            + ((rp as f64 / max_exact as f64).ln()
-                / (max_distance as f64 / max_exact as f64).ln())
+            + ((rp as f64 / max_exact as f64).ln() / (max_distance as f64 / max_exact as f64).ln())
                 * ((nb - max_exact) as f64);
         (val as usize).min(nb - 1)
     };

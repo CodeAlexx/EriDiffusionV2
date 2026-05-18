@@ -25,12 +25,12 @@
 //! `anima_train_network.py` not yet validated.
 
 use clap::Parser;
-use std::path::PathBuf;
-use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::debug as dbg;
 use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
-use eridiffusion_core::models::{anima as anima_mod, anima::AnimaLoraBundle, AnimaModel, TrainableModel};
+use eridiffusion_core::models::{
+    anima as anima_mod, anima::AnimaLoraBundle, AnimaModel, TrainableModel,
+};
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
@@ -38,19 +38,33 @@ use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{
     loss_weight as feat_loss_weight, lr_schedule, noise_modifiers, timestep_bias,
 };
+use eridiffusion_core::training::training_features::timestep_dist::{
+    TimestepConfig, TimestepDistribution,
+};
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
-use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
+use std::path::PathBuf;
 use std::str::FromStr as _;
 
 /// Slot class names for the 16 LoRA modules per Anima block. Used by debug
 /// gradient summaries. MUST match `anima::LORA_SLOT_KEYS` order.
 const ANIMA_LORA_CLASSES: [&str; anima_mod::LORA_SLOTS_PER_BLOCK] = [
-    "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.out",
-    "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.out",
-    "mlp.layer1", "mlp.layer2",
-    "adaln_sa.1", "adaln_sa.2",
-    "adaln_ca.1", "adaln_ca.2",
-    "adaln_mlp.1", "adaln_mlp.2",
+    "self_attn.q",
+    "self_attn.k",
+    "self_attn.v",
+    "self_attn.out",
+    "cross_attn.q",
+    "cross_attn.k",
+    "cross_attn.v",
+    "cross_attn.out",
+    "mlp.layer1",
+    "mlp.layer2",
+    "adaln_sa.1",
+    "adaln_sa.2",
+    "adaln_ca.1",
+    "adaln_ca.2",
+    "adaln_mlp.1",
+    "adaln_mlp.2",
 ];
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
@@ -58,115 +72,169 @@ const SEED: u64 = 42;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] config: PathBuf,
-    #[arg(long)] cache_dir: PathBuf,
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    cache_dir: PathBuf,
     /// Single safetensors file (e.g. `anima-preview.safetensors` or
     /// `anima-preview3-base.safetensors`).
-    #[arg(long)] dit_path: PathBuf,
-    #[arg(long, default_value = "100")] steps: usize,
-    #[arg(long, default_value = "16")] rank: usize,
-    #[arg(long, default_value = "1.0")] lora_alpha: f64,
+    #[arg(long)]
+    dit_path: PathBuf,
+    #[arg(long, default_value = "100")]
+    steps: usize,
+    #[arg(long, default_value = "16")]
+    rank: usize,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f64,
     /// Learning rate. Default `5e-5` matches `Anima_lora_configs.toml:23`
     /// (canonical recipe). The previous default of 3e-4 was 6× higher and
     /// in the "blow up early, stabilize ugly" regime for 28-block DiTs.
-    #[arg(long, default_value = "5e-5")] lr: f32,
+    #[arg(long, default_value = "5e-5")]
+    lr: f32,
 
     /// Timestep sampling: "sigmoid" (kohya default), "uniform", "shift".
-    #[arg(long, default_value = "sigmoid")] timestep_sampling: String,
+    #[arg(long, default_value = "sigmoid")]
+    timestep_sampling: String,
     /// Sigmoid scale used by `sigmoid` sampling (kohya default 1.0).
-    #[arg(long, default_value = "1.0")] sigmoid_scale: f32,
+    #[arg(long, default_value = "1.0")]
+    sigmoid_scale: f32,
     /// Rectified-flow timestep shift (kohya `--discrete_flow_shift`).
     /// Default 3.0 matches `Anima_lora_configs.toml:37` (canonical Anima
     /// recipe; reference Python's CLI default is 1.0 but the shipped TOML
     /// always overrides it). Mid-sigma loss mass is the principal hyper-
     /// parameter for Anima rect-flow training; shift=1.0 trains a
     /// fundamentally different distribution from reference checkpoints.
-    #[arg(long, default_value = "3.0")] discrete_flow_shift: f32,
+    #[arg(long, default_value = "3.0")]
+    discrete_flow_shift: f32,
     /// Loss weighting scheme: "none" (default), "sigma_sqrt", "cosmap".
-    #[arg(long, default_value = "none")] weighting_scheme: String,
+    #[arg(long, default_value = "none")]
+    weighting_scheme: String,
 
     /// Resume LoRA weights only (no optimizer state).
-    #[arg(long, conflicts_with = "resume_full")] resume_lora: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_full")]
+    resume_lora: Option<PathBuf>,
     /// Full resume: LoRA weights + AdamW (m, v, t) + step counter.
-    #[arg(long, conflicts_with = "resume_lora")] resume_full: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_lora")]
+    resume_full: Option<PathBuf>,
     /// Periodic + final save mode. Default `full` (LoRA + AdamW + step) for
     /// resumable runs. `weights` writes legacy weights-only files.
-    #[arg(long, default_value = "full")] save_mode: String,
-    #[arg(long, default_value = "output")] output_dir: PathBuf,
+    #[arg(long, default_value = "full")]
+    save_mode: String,
+    #[arg(long, default_value = "output")]
+    output_dir: PathBuf,
 
     // ── Periodic save (in-trainer sample rendering not yet wired; use sample_anima.rs) ──
-    #[arg(long, default_value = "0")] save_every: usize,
+    #[arg(long, default_value = "0")]
+    save_every: usize,
 
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
-    #[arg(long)] min_snr_gamma: Option<f32>,
-    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    #[arg(long)]
+    min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    caption_dropout_probability: f32,
     /// Path to a single cache file produced by `prepare_anima` from an empty-
     /// caption sample. When `--caption-dropout-probability > 0`, the trainer
     /// loads `text_embedding` from this file and swaps it in (along with the
     /// optional `text_mask`) with probability `p` per step.
-    #[arg(long)] null_text_cache: Option<PathBuf>,
-    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
-    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
-    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
-    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
-    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
-    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    #[arg(long)]
+    null_text_cache: Option<PathBuf>,
+    #[arg(long, default_value_t = 1.0)]
+    noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)]
+    gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)]
+    huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lr_min_factor: f32,
+    #[arg(long)]
+    validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    validation_every_steps: u64,
+    #[arg(long, num_args = 0..)]
+    multi_backend_weights: Vec<f32>,
     /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
     /// trainers accept-and-warn until per-model wiring lands.
-    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    #[arg(long, num_args = 0..)]
+    multi_backend_cache_dirs: Vec<std::path::PathBuf>,
     /// Phase 2: validation prompt library JSON (Klein-only wiring; other
     /// trainers accept-and-warn).
-    #[arg(long)] validation_prompts_file: Option<std::path::PathBuf>,
-    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    #[arg(long)]
+    validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)]
+    masked_loss_weight: f32,
     /// Master switch for EMA shadow. See train_klein.rs for full doc.
-    #[arg(long, default_value_t = false)] ema: bool,
-    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
-    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
-    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
-    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
-    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
+    #[arg(long, default_value_t = false)]
+    ema: bool,
+    #[arg(long, default_value_t = 1.0)]
+    ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)]
+    ema_power: f32,
+    #[arg(long, default_value_t = 0)]
+    ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)]
+    ema_min_decay: f32,
+    #[arg(long, default_value_t = 0.9999)]
+    ema_max_decay: f32,
     /// When true (with --ema), periodic save + final save observe EMA-averaged weights.
-    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+    #[arg(long, default_value_t = false)]
+    ema_validation_swap: bool,
     /// Multi-resolution / pyramid noise iterations. 0 (default) = no-op,
     /// byte-identical to no-multires.
-    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
+    #[arg(long, default_value_t = 0)]
+    multires_noise_iterations: usize,
     /// Per-level discount factor for `--multires-noise-iterations`.
-    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+    #[arg(long, default_value_t = 0.3)]
+    multires_noise_discount: f32,
     /// Timestep biasing strategy: "none" (default), "later", "earlier", "range".
-    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
-    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    #[arg(long, default_value = "none")]
+    timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)]
+    timestep_bias_range_max: f32,
 
     /// Unified OneTrainer timestep distribution. When set to a value other
     /// than `auto` (default) this overrides `--timestep-sampling`, allowing
     /// any of the 6 OT distributions (uniform / sigmoid / logit_normal /
     /// heavy_tail / cos_map / inverted_parabola). `auto` preserves the
     /// existing `--timestep-sampling` byte-equivalent path (sigmoid default).
-    #[arg(long, default_value = "auto")] timestep_distribution: String,
+    #[arg(long, default_value = "auto")]
+    timestep_distribution: String,
     /// Distribution-specific weight knob (default 0.0).
-    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    #[arg(long, default_value_t = 0.0)]
+    noising_weight: f32,
     /// Distribution-specific bias knob (default 0.0).
-    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
+    #[arg(long, default_value_t = 0.0)]
+    noising_bias: f32,
 
-    #[arg(long)] tread_route_pattern: Option<String>,
+    #[arg(long)]
+    tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
-    #[arg(long, default_value = "adamw")] optimizer: String,
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
 
     // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
-    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
-    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
-    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
-    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    #[arg(long, num_args = 0..)]
+    multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
     /// Phase 5: LR scheduler family. Default `cosine` matches
     /// `Anima_lora_configs.toml:lr_scheduler = "cosine"` (canonical recipe).
-    #[arg(long, default_value = "cosine")] lr_scheduler: String,
+    #[arg(long, default_value = "cosine")]
+    lr_scheduler: String,
     /// Phase 5: linear LR warmup steps. Default 100 matches
     /// `Anima_lora_configs.toml:lr_warmup_steps = 100`.
-    #[arg(long, default_value_t = 100)] warmup_steps: usize,
+    #[arg(long, default_value_t = 100)]
+    warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
-    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+    #[arg(long, default_value_t = 1.0)]
+    lr_cycles: f32,
 
     // ── LyCORIS algo selection (Phase 2b) ──
     //
@@ -178,56 +246,75 @@ struct Args {
     /// | `full` | `oft`. Same `base + delta_on_input` caveat as chroma — Full
     /// and OFT bundle-construct successfully but error inside forward_delta;
     /// Phase 2c will hoist merge-into-base.
-    #[arg(long, default_value = "lora")] algo: String,
+    #[arg(long, default_value = "lora")]
+    algo: String,
     /// LoKr Kronecker split factor (ignored for non-LoKr).
-    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    #[arg(long, default_value_t = 16)]
+    lokr_factor: i32,
     /// OFT/BOFT block size (ignored for non-OFT/BOFT).
-    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    #[arg(long, default_value_t = 32)]
+    oft_block_size: usize,
     /// OFT Cayley-Neumann series term count.
-    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    #[arg(long, default_value_t = 5)]
+    oft_neumann_terms: usize,
     /// Tucker decomposition for non-1×1 conv kernels (anima is linear-only).
-    #[arg(long, default_value_t = false)] use_tucker: bool,
+    #[arg(long, default_value_t = false)]
+    use_tucker: bool,
     /// LoKr only: factorize both W1 and W2 (default false: only W2).
-    #[arg(long, default_value_t = false)] decompose_both: bool,
+    #[arg(long, default_value_t = false)]
+    decompose_both: bool,
     /// Enable DoRA (weight-decomposed LoRA).
-    #[arg(long, default_value_t = false)] dora: bool,
+    #[arg(long, default_value_t = false)]
+    dora: bool,
     /// DoRA magnitude axis (`true` = lycoris-upstream).
-    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
-    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    #[arg(long, default_value_t = true)]
+    dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)]
+    dora_eps: f32,
     /// PEFT/SimpleTuner `--lora_init_type`. Applies to LoCon (the LoRA path)
     /// only. Choices: `default | gaussian | pissa | olora | loftq`. The
     /// PISSA/OLoRA/LoftQ variants parse but error at adapter construction
     /// because flame-core does not yet expose SVD/QR.
-    #[arg(long, default_value = "default")] lora_init_type: String,
+    #[arg(long, default_value = "default")]
+    lora_init_type: String,
     /// SimpleTuner-style `lycoris_config preset.json`. Optional; per-target
     /// `module_algo_map` overrides apply during adapter construction.
-    #[arg(long)] lycoris_config: Option<PathBuf>,
+    #[arg(long)]
+    lycoris_config: Option<PathBuf>,
     /// SimpleTuner-parity: perturbed-normal LoKr init. Scale `>0` triggers
     /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`. No-op when algo != lokr or
     /// value is 0.0.
-    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    #[arg(long, default_value_t = 0.0)]
+    init_lokr_norm: f32,
     /// SimpleTuner / ai-toolkit `network.conv` — per-LyCORIS rank for
     /// CONV-layer targets (separate from linear `--rank`). `0` (default)
     /// = fall back to linear rank. Inert when no conv targets are wired
     /// in the model bundle (current state on all EDv2 trainers).
-    #[arg(long, default_value_t = 0)] conv_rank: usize,
+    #[arg(long, default_value_t = 0)]
+    conv_rank: usize,
     /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
     /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
-    #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
+    #[arg(long, default_value_t = 0.0)]
+    conv_alpha: f32,
     /// Per-element dropout on the adapter delta (training only).
-    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lora_dropout: f32,
     /// Per-rank Bernoulli on the down-projection intermediate.
-    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    rank_dropout: f32,
     /// Per-step Bernoulli on the entire adapter.
-    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    module_dropout: f32,
     /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
-    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
+    #[arg(long, default_value_t = false)]
+    rank_dropout_scale: bool,
 
     // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
     /// Route the backward pass through `AutogradContext::backward_v2`
     /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
-    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
 }
 
 /// SIGMOID timestep sampling: t = sigmoid(scale * z), z ~ N(0,1).
@@ -324,8 +411,12 @@ fn main() -> anyhow::Result<()> {
     config.ema_min_decay = args.ema_min_decay;
     config.tread_route_pattern = args.tread_route_pattern.clone();
 
-    log::info!("Loading Anima DiT (rank={} alpha={}) from {}...",
-        args.rank, args.lora_alpha, args.dit_path.display());
+    log::info!(
+        "Loading Anima DiT (rank={} alpha={}) from {}...",
+        args.rank,
+        args.lora_alpha,
+        args.dit_path.display()
+    );
     let mut model = AnimaModel::load(&args.dit_path, &config, device.clone())?;
 
     // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
@@ -361,15 +452,18 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("--lora_init_type: {e}"))?,
         ..LycorisBundleConfig::default()
     };
-    let lyc_config = lyc_config
-        .with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
+    let lyc_config =
+        lyc_config.with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
 
     if algo != LycorisAlgo::None {
         log::info!(
             "[Anima] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
             algo.as_str(),
-            lyc_config.rank, lyc_config.alpha,
-            lyc_config.factor, lyc_config.block_size, lyc_config.dora,
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
         );
         if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
             log::warn!(
@@ -385,9 +479,13 @@ fn main() -> anyhow::Result<()> {
 
         // Optional: SimpleTuner-style perturbed-normal init for LoKr.
         if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
-            match model.bundle.apply_init_perturbed_normal(&model.weights, args.init_lokr_norm) {
+            match model
+                .bundle
+                .apply_init_perturbed_normal(&model.weights, args.init_lokr_norm)
+            {
                 Ok(skipped) if skipped > 0 => log::warn!(
-                    "[init_lokr_norm] {} slot(s) skipped (see warnings above)", skipped,
+                    "[init_lokr_norm] {} slot(s) skipped (see warnings above)",
+                    skipped,
                 ),
                 Ok(_) => log::info!("[init_lokr_norm] applied scale={}", args.init_lokr_norm),
                 Err(e) => log::warn!("[init_lokr_norm] failed: {e}"),
@@ -404,14 +502,18 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|v| v.len())
         .unwrap_or(model.bundle.adapters.len());
-    log::info!("Loaded {} trainable LoRA tensors ({} adapters across {} blocks)",
-        params.len(), adapter_count, anima_mod::NUM_BLOCKS);
+    log::info!(
+        "Loaded {} trainable LoRA tensors ({} adapters across {} blocks)",
+        params.len(),
+        adapter_count,
+        anima_mod::NUM_BLOCKS
+    );
     if params.is_empty() {
         anyhow::bail!("No trainable parameters — TrainingMethod::Lora produced empty param list");
     }
 
-    let opt_kind = OptimizerKind::parse(&args.optimizer)
-        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    let opt_kind =
+        OptimizerKind::parse(&args.optimizer).map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
     if matches!(opt_kind, OptimizerKind::AdamW8bit) {
         anyhow::bail!(
             "AdamW8bit is forbidden in EDv2 (no-quantization rule per CLAUDE.md \
@@ -429,16 +531,19 @@ fn main() -> anyhow::Result<()> {
     // unconditional path leaks the conditional T5 token sequence.
     let null_text: Option<(Tensor, Option<Tensor>, Option<Tensor>, Option<Tensor>)> =
         if effective_caption_dropout_prob > 0.0 {
-        match args.null_text_cache.as_ref() {
-            Some(p) => match flame_core::serialization::load_file(p, &device) {
-                Ok(s) => {
-                    let nt = s.get("text_embedding")
-                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
-                        .to_dtype(DType::BF16)?;
-                    let nm = s.get("text_mask").cloned();
-                    let nt5_ids = s.get("t5_input_ids").cloned();
-                    let nt5_mask = s.get("t5_attn_mask").cloned();
-                    log::info!(
+            match args.null_text_cache.as_ref() {
+                Some(p) => match flame_core::serialization::load_file(p, &device) {
+                    Ok(s) => {
+                        let nt = s
+                            .get("text_embedding")
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("--null-text-cache missing 'text_embedding'")
+                            })?
+                            .to_dtype(DType::BF16)?;
+                        let nm = s.get("text_mask").cloned();
+                        let nt5_ids = s.get("t5_input_ids").cloned();
+                        let nt5_mask = s.get("t5_attn_mask").cloned();
+                        log::info!(
                         "[caption-dropout] WIRED — prob={:.3} (null text={:?}, mask={}, t5_ids={}, t5_mask={})",
                         effective_caption_dropout_prob,
                         nt.shape().dims(),
@@ -446,26 +551,26 @@ fn main() -> anyhow::Result<()> {
                         nt5_ids.is_some(),
                         nt5_mask.is_some(),
                     );
-                    Some((nt, nm, nt5_ids, nt5_mask))
-                }
-                Err(e) => anyhow::bail!(
-                    "[caption-dropout] failed to load --null-text-cache {}: {e}. \
+                        Some((nt, nm, nt5_ids, nt5_mask))
+                    }
+                    Err(e) => anyhow::bail!(
+                        "[caption-dropout] failed to load --null-text-cache {}: {e}. \
                      Either provide a valid null-text cache or set \
                      --caption-dropout-probability 0 to disable.",
-                    p.display()
-                ),
-            },
-            None => anyhow::bail!(
-                "--caption-dropout-probability={:.3} requires --null-text-cache. \
+                        p.display()
+                    ),
+                },
+                None => anyhow::bail!(
+                    "--caption-dropout-probability={:.3} requires --null-text-cache. \
                  Run prepare_anima on an empty caption first, then pass that \
                  cache path. Failing loud rather than silently disabling CFG \
                  conditioning training.",
-                effective_caption_dropout_prob
-            ),
-        }
-    } else {
-        None
-    };
+                    effective_caption_dropout_prob
+                ),
+            }
+        } else {
+            None
+        };
     let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3). See train_klein.rs for the same pattern.
@@ -516,22 +621,26 @@ fn main() -> anyhow::Result<()> {
     // When `--timestep-distribution` is `auto`, the legacy `--timestep-sampling`
     // path is used unchanged (default-off byte invariance). Otherwise we build
     // a `TimestepConfig` and let it drive the sampler.
-    let unified_timestep_cfg: Option<TimestepConfig> = if args.timestep_distribution.eq_ignore_ascii_case("auto") {
-        None
-    } else {
-        let dist = TimestepDistribution::from_str(&args.timestep_distribution)
-            .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
-        Some(TimestepConfig {
-            distribution: dist,
-            noising_weight: args.noising_weight,
-            noising_bias: args.noising_bias,
-            min_strength: 0.0,
-            max_strength: 1.0,
-        })
-    };
+    let unified_timestep_cfg: Option<TimestepConfig> =
+        if args.timestep_distribution.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            let dist = TimestepDistribution::from_str(&args.timestep_distribution)
+                .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+            Some(TimestepConfig {
+                distribution: dist,
+                noising_weight: args.noising_weight,
+                noising_bias: args.noising_bias,
+                min_strength: 0.0,
+                max_strength: 1.0,
+            })
+        };
 
     if let Some(resume_path) = args.resume_lora.as_ref() {
-        log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
+        log::info!(
+            "Resuming LoRA weights only (no optimizer state) from {}",
+            resume_path.display()
+        );
         model.load_weights(&resume_path.to_string_lossy())?;
     }
 
@@ -542,7 +651,13 @@ fn main() -> anyhow::Result<()> {
         let named = model.named_parameters();
         checkpoint::apply_lora_weights(&loaded, &named)?;
         if let Optimizer::AdamW(ref mut adam) = opt {
-            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha as f32)?;
+            checkpoint::apply_to_optimizer(
+                &loaded,
+                adam,
+                &named,
+                args.rank,
+                args.lora_alpha as f32,
+            )?;
         } else {
             log::warn!(
                 "[resume-full] non-AdamW resume not yet implemented for {:?}; LoRA weights restored, optimizer state reset",
@@ -551,7 +666,10 @@ fn main() -> anyhow::Result<()> {
         }
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
-            log::warn!("Resumed step ({start_step}) >= --steps ({}) — nothing to do.", args.steps);
+            log::warn!(
+                "Resumed step ({start_step}) >= --steps ({}) — nothing to do.",
+                args.steps
+            );
             return Ok(());
         }
         log::info!("Continuing from step {start_step}/{}", args.steps);
@@ -601,14 +719,22 @@ fn main() -> anyhow::Result<()> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
     let debug_grads_enabled = dbg::enabled("ANIMA_DEBUG_GRADS");
     if debug_grads_enabled {
-        log::info!("ANIMA_DEBUG_GRADS=1 — per-step LoRA grad summaries enabled at steps 0/1/2/100/200/...");
+        log::info!(
+            "ANIMA_DEBUG_GRADS=1 — per-step LoRA grad summaries enabled at steps 0/1/2/100/200/..."
+        );
     }
 
     let board = BoardWriter::open(
         &args.output_dir,
         BoardWriter::new_session_id(),
-        if start_step > 0 { Some(start_step as u64) } else { None },
-    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+        if start_step > 0 {
+            Some(start_step as u64)
+        } else {
+            None
+        },
+    )
+    .map_err(|e| log::warn!("board.db open failed: {e}"))
+    .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
     }
@@ -620,10 +746,12 @@ fn main() -> anyhow::Result<()> {
         let cache_idx = step % cache_files.len();
         let sample = flame_core::serialization::load_file(&cache_files[cache_idx], &device)?;
 
-        let latent = sample.get("latent")
+        let latent = sample
+            .get("latent")
             .ok_or_else(|| anyhow::anyhow!("cached sample missing 'latent'"))?
             .to_dtype(DType::BF16)?;
-        let cap_feats = sample.get("text_embedding")
+        let cap_feats = sample
+            .get("text_embedding")
             .ok_or_else(|| anyhow::anyhow!("cached sample missing 'text_embedding'"))?
             .to_dtype(DType::BF16)?;
         let cap_mask = sample.get("text_mask").cloned();
@@ -637,20 +765,15 @@ fn main() -> anyhow::Result<()> {
         // Default-off (prob == 0.0 OR null_text == None) draws no rng.
         let (cap_feats, cap_mask, t5_ids, t5_mask) =
             if let Some((ref nt, ref nm, ref nt5_ids, ref nt5_mask)) = null_text {
-            use rand::Rng;
-            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
-                (
-                    nt.clone(),
-                    nm.clone(),
-                    nt5_ids.clone(),
-                    nt5_mask.clone(),
-                )
+                use rand::Rng;
+                if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                    (nt.clone(), nm.clone(), nt5_ids.clone(), nt5_mask.clone())
+                } else {
+                    (cap_feats, cap_mask, t5_ids, t5_mask)
+                }
             } else {
                 (cap_feats, cap_mask, t5_ids, t5_mask)
-            }
-        } else {
-            (cap_feats, cap_mask, t5_ids, t5_mask)
-        };
+            };
 
         // Timestep sampling.
         let raw_t = if let Some(ref tcfg) = unified_timestep_cfg {
@@ -670,11 +793,8 @@ fn main() -> anyhow::Result<()> {
             }
         };
         // Default-off: Strategy::None → returns raw_t unchanged.
-        let t_continuous = timestep_bias::apply_bias(
-            raw_t,
-            NUM_TRAIN_TIMESTEPS as f32,
-            &timestep_bias_cfg,
-        );
+        let t_continuous =
+            timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
         let sigma_continuous = (t_continuous / NUM_TRAIN_TIMESTEPS as f32).clamp(0.0, 1.0);
         // Apply discrete_flow_shift to the sigma used for noising (matches
         // kohya `flux_train_utils.get_noisy_model_input_and_timesteps` shift path).
@@ -707,34 +827,44 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let noisy = perturbed_noise.mul_scalar(sigma)?
+        let noisy = perturbed_noise
+            .mul_scalar(sigma)?
             .add(&latent.mul_scalar(1.0 - sigma)?)?;
         let target = clean_noise.sub(&latent)?;
         // Anima's DiT receives timestep in [0, 1] (kohya divides by 1000 in
         // anima_train_network.py:279 BEFORE feeding into model_pred).
-        let timestep = Tensor::from_vec(
-            vec![sigma],
-            Shape::from_dims(&[1]),
-            device.clone(),
-        )?;
+        let timestep = Tensor::from_vec(vec![sigma], Shape::from_dims(&[1]), device.clone())?;
 
         if step == 0 {
-            log::info!("step 0 | latent={:?} cap={:?} sigma={:.4} (t={:.2})",
-                latent.shape().dims(), cap_feats.shape().dims(), sigma, t_continuous);
+            log::info!(
+                "step 0 | latent={:?} cap={:?} sigma={:.4} (t={:.2})",
+                latent.shape().dims(),
+                cap_feats.shape().dims(),
+                sigma,
+                t_continuous
+            );
         }
 
         // Build context vector for TrainableModel::forward.
         let mut context: Vec<Tensor> = vec![cap_feats];
-        if let Some(m) = cap_mask { context.push(m); }
-        if let Some(ids) = t5_ids { context.push(ids); }
-        if let Some(m) = t5_mask { context.push(m); }
+        if let Some(m) = cap_mask {
+            context.push(m);
+        }
+        if let Some(ids) = t5_ids {
+            context.push(ids);
+        }
+        if let Some(m) = t5_mask {
+            context.push(m);
+        }
 
-        let pred = <AnimaModel as TrainableModel>::forward(&mut model, &noisy, &timestep, &context, None)?;
+        let pred =
+            <AnimaModel as TrainableModel>::forward(&mut model, &noisy, &timestep, &context, None)?;
 
         if pred.shape().dims() != target.shape().dims() {
             anyhow::bail!(
                 "predicted shape {:?} != target {:?} — model.forward output mismatch",
-                pred.shape().dims(), target.shape().dims()
+                pred.shape().dims(),
+                target.shape().dims()
             );
         }
 
@@ -794,10 +924,8 @@ fn main() -> anyhow::Result<()> {
         // pattern".  See flame-core/docs/TRAINER_DIAGNOSTICS.md.
         if step == 1 {
             let named = model.named_parameters();
-            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = named
-                .iter()
-                .map(|(n, p)| (n.as_str(), p))
-                .collect();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
             let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
             if report.is_clean() {
                 log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
@@ -812,7 +940,12 @@ fn main() -> anyhow::Result<()> {
             // adapters report through `params`/`grads` already; per-class
             // breakdown for non-LoRA algos is a Phase 2c task.
             if model.bundle.lyc_adapters.is_none() {
-                dbg::print_lora_grad_summary(step, &model.bundle.adapters, &ANIMA_LORA_CLASSES, &grads);
+                dbg::print_lora_grad_summary(
+                    step,
+                    &model.bundle.adapters,
+                    &ANIMA_LORA_CLASSES,
+                    &grads,
+                );
             } else if step == 0 {
                 log::info!(
                     "ANIMA_DEBUG_GRADS: per-class summary disabled for LyCORIS algo `{}` (Phase 2c)",
@@ -825,16 +958,21 @@ fn main() -> anyhow::Result<()> {
         const CLIP_GRAD_NORM: f32 = 1.0;
         // Fusion Sprint Phase 5: device-resident global L2 norm. Replaces a
         // per-tensor `.to_vec()?[0]` loop (N D2H syncs/step) with one D2H.
-        let grad_refs: Vec<&flame_core::Tensor> = params
-            .iter()
-            .filter_map(|p| grads.get(p.id()))
-            .collect();
-        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
-            .item()? as f32;
-        let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
+        let grad_refs: Vec<&flame_core::Tensor> =
+            params.iter().filter_map(|p| grads.get(p.id())).collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
+        let scale = if total_norm > CLIP_GRAD_NORM {
+            CLIP_GRAD_NORM / total_norm
+        } else {
+            1.0
+        };
         for param in &params {
             if let Some(g) = grads.get(param.id()) {
-                let g_scaled = if scale < 1.0 { g.mul_scalar(scale)? } else { g.clone() };
+                let g_scaled = if scale < 1.0 {
+                    g.mul_scalar(scale)?
+                } else {
+                    g.clone()
+                };
                 param.set_grad(g_scaled)?;
             }
         }
@@ -857,7 +995,9 @@ fn main() -> anyhow::Result<()> {
             opt.zero_grad(&params);
             if let Some(ref mut e) = ema {
                 e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
-                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
+                    .map_err(|err| {
+                        anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1)
+                    })?;
             }
         }
         AutogradContext::clear();
@@ -865,8 +1005,15 @@ fn main() -> anyhow::Result<()> {
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
             "anima-lora",
-            step, args.steps, cache_files.len(), 1,
-            loss_val, total_norm, cur_lr, t_start, board.as_ref(),
+            step,
+            args.steps,
+            cache_files.len(),
+            1,
+            loss_val,
+            total_norm,
+            cur_lr,
+            t_start,
+            board.as_ref(),
         );
 
         // Periodic save (in-trainer sample rendering not yet wired).
@@ -878,8 +1025,10 @@ fn main() -> anyhow::Result<()> {
         let ema_backup = if do_periodic_save && args.ema_validation_swap {
             if let Some(ref e) = ema {
                 let _g = AutogradContext::no_grad();
-                Some(e.swap_with_live(&params)
-                    .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
+                Some(
+                    e.swap_with_live(&params)
+                        .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?,
+                )
             } else {
                 None
             }
@@ -887,12 +1036,19 @@ fn main() -> anyhow::Result<()> {
             None
         };
         if do_periodic_save {
-            let mid_ckpt = args.output_dir.join(format!("anima_lora_step{step_num}.safetensors"));
+            let mid_ckpt = args
+                .output_dir
+                .join(format!("anima_lora_step{step_num}.safetensors"));
             if save_mode_full {
                 if let Optimizer::AdamW(ref adam) = opt {
                     let header = CkptHeader::from_adamw(
-                        "train_anima", step_num as u64, adam,
-                        args.rank, args.lora_alpha as f32, SEED, String::new(),
+                        "train_anima",
+                        step_num as u64,
+                        adam,
+                        args.rank,
+                        args.lora_alpha as f32,
+                        SEED,
+                        String::new(),
                     );
                     let named = model.named_parameters();
                     if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, adam, &header) {
@@ -924,23 +1080,41 @@ fn main() -> anyhow::Result<()> {
     if args.ema_validation_swap {
         if let Some(ref e) = ema {
             let _g = AutogradContext::no_grad();
-            let _ = e.swap_with_live(&params)
+            let _ = e
+                .swap_with_live(&params)
                 .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
             log::info!("[ema] swapped EMA shadow into live params for final save");
         }
     }
 
     let trained = args.steps - start_step;
-    let avg_loss = if trained > 0 { total_loss / trained as f32 } else { 0.0 };
-    log::info!("Training complete: {trained} new steps (total={}), avg loss={:.4}", args.steps, avg_loss);
-    if let Some(b) = &board { b.set_status("completed"); }
+    let avg_loss = if trained > 0 {
+        total_loss / trained as f32
+    } else {
+        0.0
+    };
+    log::info!(
+        "Training complete: {trained} new steps (total={}), avg loss={:.4}",
+        args.steps,
+        avg_loss
+    );
+    if let Some(b) = &board {
+        b.set_status("completed");
+    }
 
-    let ckpt = args.output_dir.join(format!("anima_lora_{}steps.safetensors", args.steps));
+    let ckpt = args
+        .output_dir
+        .join(format!("anima_lora_{}steps.safetensors", args.steps));
     if save_mode_full {
         if let Optimizer::AdamW(ref adam) = opt {
             let header = CkptHeader::from_adamw(
-                "train_anima", args.steps as u64, adam,
-                args.rank, args.lora_alpha as f32, SEED, String::new(),
+                "train_anima",
+                args.steps as u64,
+                adam,
+                args.rank,
+                args.lora_alpha as f32,
+                SEED,
+                String::new(),
             );
             let named = model.named_parameters();
             if let Err(e) = checkpoint::save_full(&ckpt, &named, adam, &header) {

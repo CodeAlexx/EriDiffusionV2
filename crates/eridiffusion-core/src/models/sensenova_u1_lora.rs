@@ -124,21 +124,15 @@ fn parse_body(body: &str) -> Result<(usize, f32)> {
         // Find optional 'a' separator
         if let Some(a_pos) = rest.find('a') {
             let r: usize = rest[..a_pos].parse().map_err(|e| {
-                Error::InvalidInput(format!(
-                    "LoRA spec body {body:?}: bad rank: {e}"
-                ))
+                Error::InvalidInput(format!("LoRA spec body {body:?}: bad rank: {e}"))
             })?;
             let alpha: f32 = rest[a_pos + 1..].parse().map_err(|e| {
-                Error::InvalidInput(format!(
-                    "LoRA spec body {body:?}: bad alpha: {e}"
-                ))
+                Error::InvalidInput(format!("LoRA spec body {body:?}: bad alpha: {e}"))
             })?;
             return Ok((r, alpha));
         } else {
             let r: usize = rest.parse().map_err(|e| {
-                Error::InvalidInput(format!(
-                    "LoRA spec body {body:?}: bad rank: {e}"
-                ))
+                Error::InvalidInput(format!("LoRA spec body {body:?}: bad rank: {e}"))
             })?;
             return Ok((r, r as f32));
         }
@@ -175,20 +169,41 @@ pub fn parse_lora_spec_str(s: &str) -> Result<Vec<LoraSpec>> {
         for t in targets {
             match body {
                 "" | "on" | "enable" => {
-                    specs.insert(t, LoraSpec {
-                        target: t, r: 64, alpha: 64.0, dropout: 0.0, enabled: true,
-                    });
+                    specs.insert(
+                        t,
+                        LoraSpec {
+                            target: t,
+                            r: 64,
+                            alpha: 64.0,
+                            dropout: 0.0,
+                            enabled: true,
+                        },
+                    );
                 }
                 "off" | "disable" => {
-                    specs.insert(t, LoraSpec {
-                        target: t, r: 1, alpha: 1.0, dropout: 0.0, enabled: false,
-                    });
+                    specs.insert(
+                        t,
+                        LoraSpec {
+                            target: t,
+                            r: 1,
+                            alpha: 1.0,
+                            dropout: 0.0,
+                            enabled: false,
+                        },
+                    );
                 }
                 _ => {
                     let (r, alpha) = parse_body(body)?;
-                    specs.insert(t, LoraSpec {
-                        target: t, r, alpha, dropout: 0.0, enabled: true,
-                    });
+                    specs.insert(
+                        t,
+                        LoraSpec {
+                            target: t,
+                            r,
+                            alpha,
+                            dropout: 0.0,
+                            enabled: true,
+                        },
+                    );
                 }
             }
         }
@@ -284,7 +299,13 @@ impl U1LoraAdapter {
         let up = Parameter::new(up_t);
 
         let scaling = alpha / r as f32;
-        Ok(Self { r, alpha, scaling, down, up })
+        Ok(Self {
+            r,
+            alpha,
+            scaling,
+            down,
+            up,
+        })
     }
 }
 
@@ -388,7 +409,10 @@ pub fn build_lora_adapters(
         for layer_idx in layers {
             let key = target_to_key(spec.target, layer_idx)?;
             let adapter = U1LoraAdapter::new(
-                in_f, out_f, spec.r, spec.alpha,
+                in_f,
+                out_f,
+                spec.r,
+                spec.alpha,
                 seed_base.wrapping_add(seed_counter),
                 device.clone(),
             )?;
@@ -454,11 +478,7 @@ pub fn save_adapters(
     for (k, a) in adapters.iter() {
         tensors.insert(format!("{k}.lora_down.weight"), a.down.tensor()?);
         tensors.insert(format!("{k}.lora_up.weight"), a.up.tensor()?);
-        let alpha_t = Tensor::from_vec(
-            vec![a.alpha],
-            Shape::from_dims(&[]),
-            device.clone(),
-        )?;
+        let alpha_t = Tensor::from_vec(vec![a.alpha], Shape::from_dims(&[]), device.clone())?;
         tensors.insert(format!("{k}.alpha"), alpha_t);
     }
     flame_core::serialization::save_file(&tensors, path)
@@ -497,9 +517,9 @@ pub fn load_adapters(
             })?
             .to_dtype(DType::F32)?
             .requires_grad_(true);
-        let alpha_t = tensors.get(&format!("{stem}.alpha")).ok_or_else(|| {
-            Error::InvalidInput(format!("load_adapters: missing {stem}.alpha"))
-        })?;
+        let alpha_t = tensors
+            .get(&format!("{stem}.alpha"))
+            .ok_or_else(|| Error::InvalidInput(format!("load_adapters: missing {stem}.alpha")))?;
         let alpha: f32 = alpha_t.to_dtype(DType::F32)?.to_vec()?[0];
         let r = down_t.shape().dims()[0];
         let scaling = alpha / r as f32;
@@ -515,4 +535,115 @@ pub fn load_adapters(
         );
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Promoted-Parameter sidecar (save+load+inject)
+// ---------------------------------------------------------------------------
+//
+// Background: `train_u1 --unfreeze <regex>` (and mvp mode) promote selected
+// keys from `self.shared` (frozen BF16) into `self.trainable_params` (F32
+// master `Parameter`s). The optimizer updates the F32 master in-place each
+// step. `save_adapters` only emits LoRA tensors — the promoted Parameters
+// were silently lost at save time pre-fix, so a v16c run's partial-FT
+// contribution evaporated at inference.
+//
+// Fix: write a sidecar `.params.safetensors` alongside the LoRA file
+// containing each promoted Parameter as a raw BF16 tensor keyed by its
+// full `model.shared` path (e.g. `fm_modules.fm_head.0.weight`). At
+// inference time, `sample_u1` checks for the sidecar and injects each
+// tensor into `model.shared`, overriding the base weights.
+//
+// BF16 dtype matches `model.shared`'s storage, so the inject path is a
+// direct `HashMap::insert` — no dtype conversion at load.
+
+/// Filter `named_parameters` to entries representing PROMOTED Parameters
+/// (i.e. not LoRA `lora_down.weight` / `lora_up.weight` adapters). Returns
+/// `(full_shared_key, &Parameter)` pairs. Keys NOT in `model.trainable_params`
+/// are skipped — `model.named_parameters()` interleaves promoted + LoRA, and
+/// this method picks out the promoted half by checking membership in the
+/// trainable_params map.
+pub fn collect_promoted_named(
+    model: &super::sensenova_u1::SenseNovaU1,
+) -> Vec<(String, Parameter)> {
+    // Access `trainable_params` directly — `pub(crate)` is visible within
+    // `eridiffusion_core`. `named_parameters()` interleaves promoted + LoRA;
+    // we want only the promoted half (i.e. keys present in trainable_params).
+    let mut out = Vec::with_capacity(model.trainable_params.len());
+    let mut keys: Vec<&String> = model.trainable_params.keys().collect();
+    keys.sort();
+    for k in keys {
+        out.push((k.clone(), model.trainable_params[k].clone()));
+    }
+    out
+}
+
+/// Save promoted Parameters as a BF16 safetensors sidecar at `path`. Returns
+/// the count of tensors saved + the on-disk byte size (approximate, before
+/// safetensors header overhead). Keys are written verbatim from
+/// `named` — i.e. the full `model.shared` path like
+/// `fm_modules.fm_head.0.weight`. A no-op (returns `(0, 0)`) if `named` is
+/// empty — caller is expected to skip the file write in that case, but this
+/// fn would just write a 0-tensor safetensors which is harmless.
+///
+/// Cast F32 master → BF16 before save: this matches `model.shared`'s storage
+/// dtype so the load path can drop straight in with no dtype conversion.
+pub fn save_promoted_params(
+    named: &[(String, Parameter)],
+    path: &std::path::Path,
+) -> Result<(usize, usize)> {
+    let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(named.len());
+    let mut total_bytes: usize = 0;
+    for (k, p) in named {
+        let t = p.tensor()?.to_dtype(DType::BF16)?;
+        let numel: usize = t.shape().dims().iter().product();
+        total_bytes += numel * 2; // BF16 = 2 bytes
+        tensors.insert(k.clone(), t);
+    }
+    flame_core::serialization::save_file(&tensors, path)
+        .map_err(|e| Error::Io(format!("save_promoted_params {:?}: {e}", path)))?;
+    Ok((tensors.len(), total_bytes))
+}
+
+/// Load a promoted-Parameter sidecar at `path`. Returns the loaded tensors
+/// AS-IS (no dtype coercion). Inject into `model.shared` via
+/// [`inject_shared_overrides`].
+pub fn load_promoted_params(
+    path: &std::path::Path,
+    device: Arc<CudaDevice>,
+) -> Result<HashMap<String, Tensor>> {
+    flame_core::serialization::load_file(path, &device)
+        .map_err(|e| Error::Io(format!("load_promoted_params {:?}: {e}", path)))
+}
+
+/// Override entries in `model.shared` with `overrides`. Keys present in
+/// `overrides` but absent from `model.shared` are SKIPPED with a warning
+/// (e.g. the sidecar was written for a different model or regex set).
+/// Returns `(injected, skipped)`.
+///
+/// Shapes are NOT verified against the base — if the sidecar was saved with
+/// a different model the forward pass will explode loudly downstream. We
+/// could shape-check here but the warning + skip already covers the wrong-
+/// model case via key-absence; a shape mismatch on a key that IS present
+/// would indicate a corrupted sidecar and should fail loud, not silent.
+pub fn inject_shared_overrides(
+    model: &mut super::sensenova_u1::SenseNovaU1,
+    overrides: HashMap<String, Tensor>,
+) -> (usize, usize) {
+    let mut injected = 0usize;
+    let mut skipped = 0usize;
+    for (k, t) in overrides {
+        if model.shared.contains_key(&k) {
+            model.shared.insert(k, t);
+            injected += 1;
+        } else {
+            log::warn!(
+                "[u1 params sidecar] key {:?} not in model.shared — skipping (sidecar from \
+                 different model checkpoint?)",
+                k,
+            );
+            skipped += 1;
+        }
+    }
+    (injected, skipped)
 }

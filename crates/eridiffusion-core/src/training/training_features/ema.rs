@@ -188,7 +188,10 @@ mod tests {
         let p = make_param(device.clone(), init.clone(), vec![4]);
         let ema = EmaShadow::new(&[p.clone()], 0.999).unwrap();
         let shadow = ema.shadow(0).to_vec().unwrap();
-        assert!(vec_close(&shadow, &init, 1e-6), "shadow should match live at init");
+        assert!(
+            vec_close(&shadow, &init, 1e-6),
+            "shadow should match live at init"
+        );
     }
 
     /// `decay = 0.0` is the disabled-EMA path — `update()` returns early
@@ -262,8 +265,7 @@ mod tests {
         let Some(device) = cuda_or_skip() else { return };
         let p = make_param(device.clone(), vec![1.0], vec![1]);
         let mut ema = EmaShadow::new(&[p.clone()], 0.999).unwrap();
-        let new_val =
-            Tensor::from_vec(vec![2.0], Shape::from_dims(&[1]), device.clone()).unwrap();
+        let new_val = Tensor::from_vec(vec![2.0], Shape::from_dims(&[1]), device.clone()).unwrap();
         p.set_data(new_val).unwrap();
         ema.update(&[p.clone()]).unwrap();
         let shadow = ema.shadow(0).to_vec().unwrap();

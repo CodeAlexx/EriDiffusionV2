@@ -18,6 +18,7 @@
 //!   - ema_advanced         : Phase 3
 //!   - tread                : Phase 4
 
+pub mod asymflow_loss;
 pub mod caption_aug;
 pub mod caption_dropout;
 pub mod disk_check;

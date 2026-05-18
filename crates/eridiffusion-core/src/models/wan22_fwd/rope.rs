@@ -122,12 +122,8 @@ impl WanRope {
             device.clone(),
         )?
         .to_dtype(DType::BF16)?;
-        let sin = Tensor::from_vec(
-            sin_host,
-            Shape::from_dims(&[1, 1, seq, half_dim]),
-            device,
-        )?
-        .to_dtype(DType::BF16)?;
+        let sin = Tensor::from_vec(sin_host, Shape::from_dims(&[1, 1, seq, half_dim]), device)?
+            .to_dtype(DType::BF16)?;
 
         Ok(Self { cos, sin, half_dim })
     }

@@ -50,9 +50,7 @@ impl TreadConfig {
                 continue;
             }
             let (lo_s, hi_s) = part.split_once('-').ok_or_else(|| {
-                EriDiffusionError::Training(format!(
-                    "tread parse: expected `lo-hi`, got `{part}`"
-                ))
+                EriDiffusionError::Training(format!("tread parse: expected `lo-hi`, got `{part}`"))
             })?;
             let lo: usize = lo_s
                 .trim()
@@ -369,7 +367,11 @@ mod tests {
         let xb = x.to_dtype(DType::BF16).unwrap();
         let routed_bf16 = step.gather_routed(&xb).unwrap();
         let restored_bf16 = step.scatter_routed(&routed_bf16, &xb).unwrap();
-        let vb: Vec<f32> = restored_bf16.to_dtype(DType::F32).unwrap().to_vec().unwrap();
+        let vb: Vec<f32> = restored_bf16
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec()
+            .unwrap();
         // Small ints exactly representable in BF16.
         assert_eq!(vb, data);
     }

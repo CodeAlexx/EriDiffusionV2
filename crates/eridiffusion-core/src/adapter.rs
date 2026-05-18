@@ -114,11 +114,7 @@ pub trait AdapterModule: Send + Sync {
     /// per-bundle `apply_init_perturbed_normal` helpers to walk a
     /// generic `&[Arc<dyn AdapterModule>]` list without an `Any`
     /// downcast.
-    fn init_perturbed_normal_lokr(
-        &self,
-        _base_weight: &Tensor,
-        _scale: f32,
-    ) -> FlameResult<bool> {
+    fn init_perturbed_normal_lokr(&self, _base_weight: &Tensor, _scale: f32) -> FlameResult<bool> {
         Ok(false)
     }
 
@@ -264,7 +260,10 @@ impl LycorisLinear {
     /// `1.0` (byte-identical to the pre-T1.7 forward path).
     #[inline]
     pub fn multiplier(&self) -> f32 {
-        f32::from_bits(self.multiplier_bits.load(std::sync::atomic::Ordering::Relaxed))
+        f32::from_bits(
+            self.multiplier_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Set the sample-time strength multiplier.  Sampler binaries call
@@ -387,11 +386,7 @@ impl LycorisLinear {
         // training-path case).  The multiply is in `out`'s native dtype
         // so it composes with the dtype-restore step below.
         let m = self.multiplier();
-        let out = if m != 1.0 {
-            out.mul_scalar(m)?
-        } else {
-            out
-        };
+        let out = if m != 1.0 { out.mul_scalar(m)? } else { out };
         if out.dtype() != input_dt {
             Ok(out.to_dtype(input_dt)?)
         } else {
@@ -464,11 +459,7 @@ impl AdapterModule for LycorisLinear {
     /// inherent method's name is the same as the trait method's; the
     /// disambiguation is in the receiver type at call site (`&dyn
     /// AdapterModule` → trait dispatch; `&LycorisLinear` → inherent).
-    fn init_perturbed_normal_lokr(
-        &self,
-        base_weight: &Tensor,
-        scale: f32,
-    ) -> FlameResult<bool> {
+    fn init_perturbed_normal_lokr(&self, base_weight: &Tensor, scale: f32) -> FlameResult<bool> {
         LycorisLinear::init_perturbed_normal_lokr(self, base_weight, scale)
     }
 
@@ -522,7 +513,8 @@ impl AdapterModule for LycorisLinear {
         // mutex-poisoned case as a panic (the only way it fires is a
         // previously-poisoned trainer state, which is a hard bug anyway).
         fn pt(p: &Parameter) -> Tensor {
-            p.tensor().expect("LycorisLinear::named_tensors: parameter mutex poisoned")
+            p.tensor()
+                .expect("LycorisLinear::named_tensors: parameter mutex poisoned")
         }
         let mut out: Vec<(&'static str, Tensor)> = Vec::new();
         match &self.adapter {

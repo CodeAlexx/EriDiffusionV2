@@ -26,13 +26,13 @@
 //!     scrambles channels (memory: prepare_klein.rs:108-126 fix).
 
 use clap::Parser;
-use flame_core::{serialization::save_file, DType, Shape, Tensor};
 use eridiffusion_core::encoders::{
     clip_g::ClipGEncoder,
     clip_l::{ClipConfig, ClipEncoder},
     ldm_vae::LdmVAEEncoder,
     t5_xxl::T5Encoder,
 };
+use flame_core::{serialization::save_file, DType, Shape, Tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -49,54 +49,73 @@ const CLIP_L_PAD_ID: i32 = 49407;
 const CLIP_G_PAD_ID: i32 = 0;
 
 const VAE_LATENT_CHANNELS: usize = 16;
-const VAE_SCALE: f32 = 1.5305;   // SD3 VAE scaling_factor
-const VAE_SHIFT: f32 = 0.0609;   // SD3 VAE shift_factor
+const VAE_SCALE: f32 = 1.5305; // SD3 VAE scaling_factor
+const VAE_SHIFT: f32 = 0.0609; // SD3 VAE shift_factor
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] input_dir: PathBuf,
-    #[arg(long)] output_dir: PathBuf,
+    #[arg(long)]
+    input_dir: PathBuf,
+    #[arg(long)]
+    output_dir: PathBuf,
 
     /// SD3.5 base safetensors (carries the 16ch VAE under `first_stage_model.`)
     /// or a separate VAE-only safetensors.
-    #[arg(long)] vae_ckpt: PathBuf,
+    #[arg(long)]
+    vae_ckpt: PathBuf,
 
     /// CLIP-L weights (HF `text_encoder/`).
-    #[arg(long)] clip_l_ckpt: PathBuf,
+    #[arg(long)]
+    clip_l_ckpt: PathBuf,
     /// CLIP-G weights (HF `text_encoder_2/`).
-    #[arg(long)] clip_g_ckpt: PathBuf,
+    #[arg(long)]
+    clip_g_ckpt: PathBuf,
     /// T5-XXL weights (HF `text_encoder_3/`).
-    #[arg(long)] t5_ckpt: PathBuf,
+    #[arg(long)]
+    t5_ckpt: PathBuf,
 
-    #[arg(long)] clip_l_tokenizer: PathBuf,
-    #[arg(long)] clip_g_tokenizer: PathBuf,
-    #[arg(long)] t5_tokenizer: PathBuf,
+    #[arg(long)]
+    clip_l_tokenizer: PathBuf,
+    #[arg(long)]
+    clip_g_tokenizer: PathBuf,
+    #[arg(long)]
+    t5_tokenizer: PathBuf,
 
     /// HARD-locked to 1024 — the only supported training resolution per the
     /// SD3 LoRA preset. Any other value hard-fails at startup.
-    #[arg(long, default_value_t = TRAIN_RES)] resolution: u32,
+    #[arg(long, default_value_t = TRAIN_RES)]
+    resolution: u32,
     /// T5 max sequence length. HARD-locked to 77 to match OT
     /// `StableDiffusion3BaseDataLoader.py:33` and the [B, 154, 4096] combined
     /// context shape that SD3/SD3.5 was pre-trained on. Setting any other
     /// value hard-fails at startup.
-    #[arg(long, default_value_t = TXT_PAD_LEN)] t5_max_len: usize,
-    #[arg(long, default_value_t = true)] skip_existing: bool,
-    #[arg(long, default_value_t = 0)] max_samples: usize,
+    #[arg(long, default_value_t = TXT_PAD_LEN)]
+    t5_max_len: usize,
+    #[arg(long, default_value_t = true)]
+    skip_existing: bool,
+    #[arg(long, default_value_t = 0)]
+    max_samples: usize,
     /// Image augmentations at prep time. All default-off → byte-identical
     /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
     /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
     /// seeds the per-sample RNG.
-    #[arg(long, default_value_t = false)] aug_flip: bool,
-    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
-    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
-    #[arg(long, default_value_t = 0)] aug_seed: u64,
+    #[arg(long, default_value_t = false)]
+    aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)]
+    aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)]
+    aug_contrast: f32,
+    #[arg(long, default_value_t = 0)]
+    aug_seed: u64,
 }
 
 fn load_one_or_dir(
     path: &std::path::Path,
     device: &std::sync::Arc<flame_core::CudaDevice>,
 ) -> flame_core::Result<HashMap<String, Tensor>> {
-    if path.is_file() { return flame_core::serialization::load_file(path, device); }
+    if path.is_file() {
+        return flame_core::serialization::load_file(path, device);
+    }
     let mut all = HashMap::new();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
         .map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
@@ -111,20 +130,34 @@ fn load_one_or_dir(
 }
 
 fn tokenize_clip(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Result<Vec<i32>> {
-    let enc = tok.encode(text, true).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let enc = tok
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
-    if ids.len() > CLIP_MAX_LEN { ids.truncate(CLIP_MAX_LEN); }
-    while ids.len() < CLIP_MAX_LEN { ids.push(pad_id); }
+    if ids.len() > CLIP_MAX_LEN {
+        ids.truncate(CLIP_MAX_LEN);
+    }
+    while ids.len() < CLIP_MAX_LEN {
+        ids.push(pad_id);
+    }
     Ok(ids)
 }
 
 fn tokenize_t5(
-    tok: &tokenizers::Tokenizer, text: &str, max_len: usize,
+    tok: &tokenizers::Tokenizer,
+    text: &str,
+    max_len: usize,
 ) -> anyhow::Result<Vec<i32>> {
-    let enc = tok.encode(text, true).map_err(|e| anyhow::anyhow!("t5 tokenize: {e}"))?;
+    let enc = tok
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("t5 tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
-    if ids.len() > max_len { ids.truncate(max_len); }
-    while ids.len() < max_len { ids.push(0); } // T5 pad id = 0
+    if ids.len() > max_len {
+        ids.truncate(max_len);
+    }
+    while ids.len() < max_len {
+        ids.push(0);
+    } // T5 pad id = 0
     Ok(ids)
 }
 
@@ -133,7 +166,9 @@ fn main() -> anyhow::Result<()> {
     // dataset (memory: feedback_prepare_bins_pool_off / prepare_klein.rs).
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at startup.
-        unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
+        unsafe {
+            std::env::set_var("FLAME_ALLOC_POOL", "0");
+        }
     }
     env_logger::init();
     let args = Args::parse();
@@ -155,10 +190,15 @@ fn main() -> anyhow::Result<()> {
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
     let device = flame_core::global_cuda_device();
 
-    log::info!("[1/5] Loading SD3.5 VAE encoder (16-ch latent, scale={}, shift={})",
-        VAE_SCALE, VAE_SHIFT);
+    log::info!(
+        "[1/5] Loading SD3.5 VAE encoder (16-ch latent, scale={}, shift={})",
+        VAE_SCALE,
+        VAE_SHIFT
+    );
     let vae = LdmVAEEncoder::from_safetensors(
-        args.vae_ckpt.to_str().ok_or_else(|| anyhow::anyhow!("vae path utf8"))?,
+        args.vae_ckpt
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("vae path utf8"))?,
         VAE_LATENT_CHANNELS,
         &device,
     )?;
@@ -173,7 +213,9 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("[4/5] Loading T5-XXL (4096-d, 24L)...");
     let mut t5 = T5Encoder::load(
-        args.t5_ckpt.to_str().ok_or_else(|| anyhow::anyhow!("t5 path utf8"))?,
+        args.t5_ckpt
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("t5 path utf8"))?,
         &device,
     )?;
 
@@ -196,7 +238,9 @@ fn main() -> anyhow::Result<()> {
         }
     }
     pairs.sort();
-    if args.max_samples > 0 { pairs.truncate(args.max_samples); }
+    if args.max_samples > 0 {
+        pairs.truncate(args.max_samples);
+    }
     log::info!("Found {} image-caption pairs", pairs.len());
 
     let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
@@ -207,7 +251,10 @@ fn main() -> anyhow::Result<()> {
     if aug_cfg.is_active() {
         log::info!(
             "[image-aug] flip={} brightness={} contrast={} seed={}",
-            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+            aug_cfg.flip,
+            aug_cfg.brightness,
+            aug_cfg.contrast,
+            args.aug_seed
         );
     }
 
@@ -215,11 +262,17 @@ fn main() -> anyhow::Result<()> {
     for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
-        if args.skip_existing && out_path.exists() { continue; }
+        if args.skip_existing && out_path.exists() {
+            continue;
+        }
 
         // -- Image → VAE latent --
         let img = image::open(img_path)?
-            .resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3)
+            .resize_exact(
+                args.resolution,
+                args.resolution,
+                image::imageops::FilterType::Lanczos3,
+            )
             .to_rgb32f();
         let mut img = img;
         if aug_cfg.is_active() {
@@ -240,7 +293,9 @@ fn main() -> anyhow::Result<()> {
         let mut pixels = vec![0f32; 3 * hu * wu];
         for (x, y, p) in img.enumerate_pixels() {
             let (xu, yu) = (x as usize, y as usize);
-            for c in 0..3 { pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0; }
+            for c in 0..3 {
+                pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0;
+            }
         }
         let img_t = Tensor::from_vec(pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone())?
             .to_dtype(DType::BF16)?;
@@ -275,21 +330,15 @@ fn main() -> anyhow::Result<()> {
         let clip_lg = Tensor::cat(&[&clip_l_h, &clip_g_h], 2)?;
         // Pad last dim 2048 → 4096 with zeros.
         let pad_zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[
-                clip_lg.dims()[0], clip_lg.dims()[1], 4096 - 2048,
-            ]),
+            Shape::from_dims(&[clip_lg.dims()[0], clip_lg.dims()[1], 4096 - 2048]),
             DType::BF16,
             device.clone(),
         )?;
-        let clip_lg_padded = Tensor::cat(
-            &[&clip_lg.to_dtype(DType::BF16)?, &pad_zeros], 2,
-        )?;
-        let context = Tensor::cat(
-            &[&clip_lg_padded, &t5_h.to_dtype(DType::BF16)?], 1,
-        )?.to_dtype(DType::BF16)?;
+        let clip_lg_padded = Tensor::cat(&[&clip_lg.to_dtype(DType::BF16)?, &pad_zeros], 2)?;
+        let context = Tensor::cat(&[&clip_lg_padded, &t5_h.to_dtype(DType::BF16)?], 1)?
+            .to_dtype(DType::BF16)?;
 
-        let pooled = Tensor::cat(&[&clip_l_pool, &clip_g_pool], 1)?
-            .to_dtype(DType::BF16)?; // [1, 2048]
+        let pooled = Tensor::cat(&[&clip_l_pool, &clip_g_pool], 1)?.to_dtype(DType::BF16)?; // [1, 2048]
 
         let mut out = HashMap::new();
         out.insert("latent".to_string(), latent.to_dtype(DType::BF16)?);

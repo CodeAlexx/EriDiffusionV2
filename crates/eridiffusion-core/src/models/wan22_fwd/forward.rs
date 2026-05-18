@@ -111,9 +111,7 @@ fn compute_embeddings(
     let tp_b = get("time_projection.1.bias")?;
     let e_silu = e.silu()?;
     let e0_flat = linear_bias(&e_silu, tp_w, tp_b)?; // [1, 1, 6*dim]
-    let e0 = e0_flat
-        .reshape(&[1, 1, 6, cfg.dim])?
-        .to_dtype(DType::F32)?;
+    let e0 = e0_flat.reshape(&[1, 1, 6, cfg.dim])?.to_dtype(DType::F32)?;
 
     // Text embedding
     let txt_w0 = get("text_embedding.0.weight")?;
@@ -171,8 +169,7 @@ fn patchify(
                                 let src_f = fi * pf + pfi;
                                 let src_h = hi * ph + phi;
                                 let src_w = wi * pw + pwi;
-                                let src_idx =
-                                    ci * f * h * w + src_f * h * w + src_h * w + src_w;
+                                let src_idx = ci * f * h * w + src_f * h * w + src_h * w + src_w;
                                 let dst_ch = ci * pf * ph * pw + pfi * ph * pw + phi * pw + pwi;
                                 out[patch_idx * patch_dim + dst_ch] = x_data[src_idx];
                             }
@@ -183,11 +180,7 @@ fn patchify(
         }
     }
 
-    let out_f32 = Tensor::from_vec(
-        out,
-        Shape::from_dims(&[n_patches, patch_dim]),
-        device,
-    )?;
+    let out_f32 = Tensor::from_vec(out, Shape::from_dims(&[n_patches, patch_dim]), device)?;
     out_f32.to_dtype(DType::BF16)
 }
 
@@ -208,7 +201,9 @@ pub fn forward_with_lora(
     context: &Tensor,
     seq_len: usize,
     text_mask: Option<&Tensor>,
-    offloader: Option<&std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
+    offloader: Option<
+        &std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>,
+    >,
 ) -> Result<Tensor> {
     let dim = cfg.dim;
     let num_heads = cfg.num_heads;
@@ -310,12 +305,22 @@ pub fn forward_with_lora(
             img = flame_core::autograd::AutogradContext::checkpoint_offload(
                 &[img_c.clone()],
                 move || {
-                    let w = off_c.lock().unwrap().ensure_block(bi)
-                        .map_err(|e| flame_core::Error::InvalidInput(format!("ensure_block({bi}): {e}")))?;
+                    let w = off_c.lock().unwrap().ensure_block(bi).map_err(|e| {
+                        flame_core::Error::InvalidInput(format!("ensure_block({bi}): {e}"))
+                    })?;
                     block::block_forward_with_lora(
-                        &img_c, &e0_c, &txt_c, &rope_c, eps, num_heads, head_dim,
-                        &w, &bundle_c, bi,
-                        mask_c.as_ref(), &dev_c,
+                        &img_c,
+                        &e0_c,
+                        &txt_c,
+                        &rope_c,
+                        eps,
+                        num_heads,
+                        head_dim,
+                        &w,
+                        &bundle_c,
+                        bi,
+                        mask_c.as_ref(),
+                        &dev_c,
                     )
                 },
             )?;
@@ -324,8 +329,18 @@ pub fn forward_with_lora(
         // Resident path: weights map already holds all block weights.
         for i in 0..n_blocks {
             img = block::block_forward_with_lora(
-                &img, &e0, &txt, &rope, eps, num_heads, head_dim, weights, bundle, i,
-                cross_attn_mask_ref, &device,
+                &img,
+                &e0,
+                &txt,
+                &rope,
+                eps,
+                num_heads,
+                head_dim,
+                weights,
+                bundle,
+                i,
+                cross_attn_mask_ref,
+                &device,
             )?;
         }
     }

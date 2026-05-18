@@ -23,16 +23,16 @@
 //!
 //! Variant auto-detection: `img_in.weight` first dim → inner_dim → 3072 (4B) or 4096 (9B).
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use cudarc::driver::CudaDevice;
-use flame_core::{parameter::Parameter, DType, Shape, Tensor};
 use crate::adapter::AdapterModule;
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
 use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::models::TrainableModel;
 use crate::Result;
+use cudarc::driver::CudaDevice;
+use flame_core::{parameter::Parameter, DType, Shape, Tensor};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Per-block adapter slice — Klein's checkpoint-replay closures clone one of
 /// these per block per step. Legacy plain-LoRA path stores a `Vec<LoRALinear>`
@@ -65,18 +65,32 @@ pub struct KleinConfig {
 impl KleinConfig {
     pub fn klein_4b() -> Self {
         Self {
-            inner_dim: 3072, in_channels: 128, joint_attention_dim: 7680,
-            num_double: 5, num_single: 20, num_heads: 24, head_dim: 128,
-            mlp_hidden: 3072 * 3, timestep_dim: 256,
-            axes_dims: [32, 32, 32, 32], theta: 2000.0,
+            inner_dim: 3072,
+            in_channels: 128,
+            joint_attention_dim: 7680,
+            num_double: 5,
+            num_single: 20,
+            num_heads: 24,
+            head_dim: 128,
+            mlp_hidden: 3072 * 3,
+            timestep_dim: 256,
+            axes_dims: [32, 32, 32, 32],
+            theta: 2000.0,
         }
     }
     pub fn klein_9b() -> Self {
         Self {
-            inner_dim: 4096, in_channels: 128, joint_attention_dim: 12288,
-            num_double: 8, num_single: 24, num_heads: 32, head_dim: 128,
-            mlp_hidden: 4096 * 3, timestep_dim: 256,
-            axes_dims: [32, 32, 32, 32], theta: 2000.0,
+            inner_dim: 4096,
+            in_channels: 128,
+            joint_attention_dim: 12288,
+            num_double: 8,
+            num_single: 24,
+            num_heads: 32,
+            head_dim: 128,
+            mlp_hidden: 4096 * 3,
+            timestep_dim: 256,
+            axes_dims: [32, 32, 32, 32],
+            theta: 2000.0,
         }
     }
 
@@ -84,12 +98,14 @@ impl KleinConfig {
     /// `txt_in.weight`, and counts `double_blocks.*` / `single_blocks.*`).
     /// Returns the inferred config; mirrors `inference-flame::KleinTransformer::from_weights`.
     pub fn from_weights(weights: &HashMap<String, Tensor>) -> Result<Self> {
-        let img_in = weights.get("img_in.weight").ok_or_else(||
-            crate::EriDiffusionError::Model("missing img_in.weight (Klein autodetect)".into()))?;
+        let img_in = weights.get("img_in.weight").ok_or_else(|| {
+            crate::EriDiffusionError::Model("missing img_in.weight (Klein autodetect)".into())
+        })?;
         let inner_dim = img_in.shape().dims()[0];
         let in_channels = img_in.shape().dims()[1];
-        let joint = weights.get("txt_in.weight").ok_or_else(||
-            crate::EriDiffusionError::Model("missing txt_in.weight (Klein autodetect)".into()))?;
+        let joint = weights.get("txt_in.weight").ok_or_else(|| {
+            crate::EriDiffusionError::Model("missing txt_in.weight (Klein autodetect)".into())
+        })?;
         let joint_attention_dim = joint.shape().dims()[1];
         let mut num_double = 0;
         while weights.contains_key(&format!("double_blocks.{num_double}.img_attn.qkv.weight")) {
@@ -101,10 +117,17 @@ impl KleinConfig {
         }
         let num_heads = inner_dim / 128;
         Ok(Self {
-            inner_dim, in_channels, joint_attention_dim,
-            num_double, num_single, num_heads, head_dim: 128,
-            mlp_hidden: inner_dim * 3, timestep_dim: 256,
-            axes_dims: [32, 32, 32, 32], theta: 2000.0,
+            inner_dim,
+            in_channels,
+            joint_attention_dim,
+            num_double,
+            num_single,
+            num_heads,
+            head_dim: 128,
+            mlp_hidden: inner_dim * 3,
+            timestep_dim: 256,
+            axes_dims: [32, 32, 32, 32],
+            theta: 2000.0,
         })
     }
 }
@@ -142,9 +165,18 @@ const DOUBLE_LORA_SLOTS: usize = 12;
 const SINGLE_LORA_SLOTS: usize = 2;
 
 const DOUBLE_LORA_KEYS: [&str; DOUBLE_LORA_SLOTS] = [
-    "img_attn.to_q", "img_attn.to_k", "img_attn.to_v", "img_attn.proj",
-    "txt_attn.to_q", "txt_attn.to_k", "txt_attn.to_v", "txt_attn.proj",
-    "img_mlp.0", "img_mlp.2", "txt_mlp.0", "txt_mlp.2",
+    "img_attn.to_q",
+    "img_attn.to_k",
+    "img_attn.to_v",
+    "img_attn.proj",
+    "txt_attn.to_q",
+    "txt_attn.to_k",
+    "txt_attn.to_v",
+    "txt_attn.proj",
+    "img_mlp.0",
+    "img_mlp.2",
+    "txt_mlp.0",
+    "txt_mlp.2",
 ];
 const SINGLE_LORA_KEYS: [&str; SINGLE_LORA_SLOTS] = ["linear1", "linear2"];
 
@@ -174,7 +206,8 @@ pub struct KleinModel {
     /// reusable GPU slots per block, per step via BlockOffloader.
     /// Unified index space: `0..num_double` → double_blocks.{i},
     /// `num_double..num_double+num_single` → single_blocks.{i}.
-    pub offloader: Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
+    pub offloader:
+        Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
 }
 
 impl KleinModel {
@@ -213,9 +246,18 @@ impl KleinModel {
         let kconfig = KleinConfig::from_weights(&weights)?;
         log::info!(
             "Klein autodetect: inner={} joint={} double={} single={} heads={} (Klein {})",
-            kconfig.inner_dim, kconfig.joint_attention_dim,
-            kconfig.num_double, kconfig.num_single, kconfig.num_heads,
-            if kconfig.inner_dim == 3072 { "4B" } else if kconfig.inner_dim == 4096 { "9B" } else { "?" },
+            kconfig.inner_dim,
+            kconfig.joint_attention_dim,
+            kconfig.num_double,
+            kconfig.num_single,
+            kconfig.num_heads,
+            if kconfig.inner_dim == 3072 {
+                "4B"
+            } else if kconfig.inner_dim == 4096 {
+                "9B"
+            } else {
+                "?"
+            },
         );
         Self::new_inner(weights, kconfig, config, device, lyc_cfg)
     }
@@ -262,7 +304,8 @@ impl KleinModel {
                 return Err(crate::EriDiffusionError::Model(
                     "Klein LyCORIS: --algo full not yet supported (needs delta_weight \
                      merge into base; forward_delta path is bail-only). Pick locon / \
-                     loha / lokr / oft instead.".into(),
+                     loha / lokr / oft instead."
+                        .into(),
                 ));
             }
             let inner = kconfig.inner_dim;
@@ -270,14 +313,21 @@ impl KleinModel {
             // (in_features, out_features) per slot — mirrors the legacy
             // `LoRALinear::new` shape arguments exactly.
             let double_io: [(usize, usize); DOUBLE_LORA_SLOTS] = [
-                (inner, inner),     (inner, inner),     (inner, inner),     (inner, inner),
-                (inner, inner),     (inner, inner),     (inner, inner),     (inner, inner),
-                (inner, 2 * mlp),   (mlp, inner),       (inner, 2 * mlp),   (mlp, inner),
+                (inner, inner),
+                (inner, inner),
+                (inner, inner),
+                (inner, inner),
+                (inner, inner),
+                (inner, inner),
+                (inner, inner),
+                (inner, inner),
+                (inner, 2 * mlp),
+                (mlp, inner),
+                (inner, 2 * mlp),
+                (mlp, inner),
             ];
-            let single_io: [(usize, usize); SINGLE_LORA_SLOTS] = [
-                (inner, 3 * inner + 2 * mlp),
-                (inner + mlp, inner),
-            ];
+            let single_io: [(usize, usize); SINGLE_LORA_SLOTS] =
+                [(inner, 3 * inner + 2 * mlp), (inner + mlp, inner)];
             let mut store = crate::lycoris::AdapterStore::new(cfg.clone(), device.clone());
             for i in 0..kconfig.num_double {
                 for slot in 0..DOUBLE_LORA_SLOTS {
@@ -299,12 +349,17 @@ impl KleinModel {
                             _ => None,
                         };
                         key.as_ref().and_then(|k| weights.get(k))
-                    } else { None };
-                    store.build_and_push_linear(&name, in_f, out_f, w_orig)
-                        .map_err(|e| crate::EriDiffusionError::Model(format!(
-                            "Klein LyCORIS double {i} slot {slot} ({}): {e}",
-                            DOUBLE_LORA_KEYS[slot]
-                        )))?;
+                    } else {
+                        None
+                    };
+                    store
+                        .build_and_push_linear(&name, in_f, out_f, w_orig)
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "Klein LyCORIS double {i} slot {slot} ({}): {e}",
+                                DOUBLE_LORA_KEYS[slot]
+                            ))
+                        })?;
                 }
             }
             for i in 0..kconfig.num_single {
@@ -314,12 +369,17 @@ impl KleinModel {
                     let w_orig = if cfg.dora {
                         let key = format!("single_blocks.{i}.{}.weight", SINGLE_LORA_KEYS[slot]);
                         weights.get(&key)
-                    } else { None };
-                    store.build_and_push_linear(&name, in_f, out_f, w_orig)
-                        .map_err(|e| crate::EriDiffusionError::Model(format!(
-                            "Klein LyCORIS single {i} slot {slot} ({}): {e}",
-                            SINGLE_LORA_KEYS[slot]
-                        )))?;
+                    } else {
+                        None
+                    };
+                    store
+                        .build_and_push_linear(&name, in_f, out_f, w_orig)
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "Klein LyCORIS single {i} slot {slot} ({}): {e}",
+                                SINGLE_LORA_KEYS[slot]
+                            ))
+                        })?;
                 }
             }
             // Optimizer parameters: walk the store's flat parameter list.
@@ -346,25 +406,109 @@ impl KleinModel {
             for i in 0..kconfig.num_double {
                 let s = 42u64 + i as u64 * 16;
                 // 0/1/2: img_attn.to_q/to_k/to_v  (each inner -> inner)
-                lora_adapters.push(LoRALinear::new(inner, inner, rank, alpha, device.clone(), s)?);
-                lora_adapters.push(LoRALinear::new(inner, inner, rank, alpha, device.clone(), s + 1)?);
-                lora_adapters.push(LoRALinear::new(inner, inner, rank, alpha, device.clone(), s + 2)?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s,
+                )?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 1,
+                )?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 2,
+                )?);
                 // 3: img_attn.proj
-                lora_adapters.push(LoRALinear::new(inner, inner, rank, alpha, device.clone(), s + 3)?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 3,
+                )?);
                 // 4/5/6: txt_attn.to_q/to_k/to_v
-                lora_adapters.push(LoRALinear::new(inner, inner, rank, alpha, device.clone(), s + 4)?);
-                lora_adapters.push(LoRALinear::new(inner, inner, rank, alpha, device.clone(), s + 5)?);
-                lora_adapters.push(LoRALinear::new(inner, inner, rank, alpha, device.clone(), s + 6)?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 4,
+                )?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 5,
+                )?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 6,
+                )?);
                 // 7: txt_attn.proj
-                lora_adapters.push(LoRALinear::new(inner, inner, rank, alpha, device.clone(), s + 7)?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 7,
+                )?);
                 // 8: img_mlp.0 (gate+up fused — diffusers ff.linear_in is also fused)
-                lora_adapters.push(LoRALinear::new(inner, 2 * mlp, rank, alpha, device.clone(), s + 8)?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    2 * mlp,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 8,
+                )?);
                 // 9: img_mlp.2 (down — diffusers ff.linear_out)
-                lora_adapters.push(LoRALinear::new(mlp, inner, rank, alpha, device.clone(), s + 9)?);
+                lora_adapters.push(LoRALinear::new(
+                    mlp,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 9,
+                )?);
                 // 10: txt_mlp.0
-                lora_adapters.push(LoRALinear::new(inner, 2 * mlp, rank, alpha, device.clone(), s + 10)?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    2 * mlp,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 10,
+                )?);
                 // 11: txt_mlp.2
-                lora_adapters.push(LoRALinear::new(mlp, inner, rank, alpha, device.clone(), s + 11)?);
+                lora_adapters.push(LoRALinear::new(
+                    mlp,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 11,
+                )?);
             }
             // Single blocks: linear1 (5*inner fused) + linear2 (out projection).
             // Diffusers `attn.to_qkv_mlp_proj` is fused at the same granularity,
@@ -372,22 +516,48 @@ impl KleinModel {
             for i in 0..kconfig.num_single {
                 let s = 42u64 + (kconfig.num_double + i) as u64 * 16;
                 // 0: linear1 (inner -> 3*inner + 2*mlp)
-                lora_adapters.push(LoRALinear::new(inner, 3 * inner + 2 * mlp, rank, alpha, device.clone(), s)?);
+                lora_adapters.push(LoRALinear::new(
+                    inner,
+                    3 * inner + 2 * mlp,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s,
+                )?);
                 // 1: linear2 (inner + mlp -> inner)
-                lora_adapters.push(LoRALinear::new(inner + mlp, inner, rank, alpha, device.clone(), s + 1)?);
+                lora_adapters.push(LoRALinear::new(
+                    inner + mlp,
+                    inner,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    s + 1,
+                )?);
             }
-            for l in &lora_adapters { parameters.extend(l.parameters()); }
+            for l in &lora_adapters {
+                parameters.extend(l.parameters());
+            }
         } else {
             for (_, t) in &weights {
                 parameters.push(Parameter::new(t.to_dtype(DType::F32)?.requires_grad_(true)));
             }
         }
-        log::info!("Klein: {} tensors loaded, {} LoRA params (lora={})",
-            weights.len(), parameters.len(), is_lora);
+        log::info!(
+            "Klein: {} tensors loaded, {} LoRA params (lora={})",
+            weights.len(),
+            parameters.len(),
+            is_lora
+        );
         Ok(Self {
-            config: config.clone(), kconfig, device,
-            weights, lora_adapters, lyc_adapters, lyc_config: lyc_active,
-            parameters, is_lora,
+            config: config.clone(),
+            kconfig,
+            device,
+            weights,
+            lora_adapters,
+            lyc_adapters,
+            lyc_config: lyc_active,
+            parameters,
+            is_lora,
             offloader: None,
         })
     }
@@ -442,7 +612,9 @@ impl KleinModel {
                 let block = rel / SINGLE_LORA_SLOTS;
                 let slot = rel % SINGLE_LORA_SLOTS;
                 if block >= num_single {
-                    log::warn!("[klein][init_lokr_norm] adapter index {flat_idx} out of range — skipping");
+                    log::warn!(
+                        "[klein][init_lokr_norm] adapter index {flat_idx} out of range — skipping"
+                    );
                     skipped += 1;
                     continue;
                 }
@@ -456,14 +628,18 @@ impl KleinModel {
             let did = adapter
                 .as_ref()
                 .init_perturbed_normal_lokr(base, scale)
-                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
-                    "init_perturbed_normal_lokr({key}): {e}"
-                )))?;
-            if did { applied += 1; } else { skipped += 1; }
+                .map_err(|e| {
+                    flame_core::FlameError::InvalidOperation(format!(
+                        "init_perturbed_normal_lokr({key}): {e}"
+                    ))
+                })?;
+            if did {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
         }
-        log::info!(
-            "[klein][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
-        );
+        log::info!("[klein][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}");
         Ok(skipped)
     }
 
@@ -474,34 +650,51 @@ impl KleinModel {
     pub fn enable_offload(&mut self, shards: Vec<std::path::PathBuf>) -> Result<()> {
         let num_double = self.kconfig.num_double;
         let num_single = self.kconfig.num_single;
-        let to_drop: Vec<String> = self.weights.keys()
+        let to_drop: Vec<String> = self
+            .weights
+            .keys()
             .filter(|k| k.starts_with("double_blocks.") || k.starts_with("single_blocks."))
             .cloned()
             .collect();
         let n = to_drop.len();
-        for k in to_drop { self.weights.remove(&k); }
+        for k in to_drop {
+            self.weights.remove(&k);
+        }
         log::info!("Klein offload: dropped {} per-block weights", n);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
 
-        struct KleinFacilitator { num_double: usize, num_single: usize }
+        struct KleinFacilitator {
+            num_double: usize,
+            num_single: usize,
+        }
         impl crate::training::block_offload::BlockFacilitator for KleinFacilitator {
-            fn block_count(&self) -> usize { self.num_double + self.num_single }
+            fn block_count(&self) -> usize {
+                self.num_double + self.num_single
+            }
             fn classify_key(&self, key: &str) -> Option<usize> {
                 if let Some(rest) = key.strip_prefix("double_blocks.") {
                     let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    if idx < self.num_double { return Some(idx); }
+                    if idx < self.num_double {
+                        return Some(idx);
+                    }
                 }
                 if let Some(rest) = key.strip_prefix("single_blocks.") {
                     let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    if idx < self.num_single { return Some(self.num_double + idx); }
+                    if idx < self.num_single {
+                        return Some(self.num_double + idx);
+                    }
                 }
                 None
             }
         }
-        let facilitator = KleinFacilitator { num_double, num_single };
+        let facilitator = KleinFacilitator {
+            num_double,
+            num_single,
+        };
 
-        let shard_strs: Vec<String> = shards.iter()
+        let shard_strs: Vec<String> = shards
+            .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let path_refs: Vec<&str> = shard_strs.iter().map(|s| s.as_str()).collect();
@@ -518,16 +711,30 @@ impl KleinModel {
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
             .unwrap_or(false);
+        if !use_streaming && std::env::var_os("FLAME_LAYER_OFFLOAD_FRACTION").is_none() {
+            // OT-style resident-set default for Klein 9B on 24 GB: keep a
+            // byte-budgeted forward/backward window on GPU instead of the old
+            // fixed two-slot ping-pong. 0.77 keeps roughly 3.8 GiB of block
+            // weights resident: four 9B double blocks at the start, about
+            // nine single blocks near the forward/backward boundary.
+            unsafe {
+                std::env::set_var("FLAME_LAYER_OFFLOAD_FRACTION", "0.77");
+            }
+        }
 
         let mut offloader = if use_streaming {
             log::info!("Klein BlockOffloader: streaming mode");
             crate::training::block_offload::BlockOffloader::load_streaming(
-                &path_refs, &facilitator, self.device.clone(),
+                &path_refs,
+                &facilitator,
+                self.device.clone(),
             )
         } else {
             log::info!("Klein BlockOffloader: pinned-RAM mode");
             crate::training::block_offload::BlockOffloader::load(
-                &path_refs, &facilitator, self.device.clone(),
+                &path_refs,
+                &facilitator,
+                self.device.clone(),
             )
         }
         // native_layout=true: leave 2D .weight tensors in on-disk [Cout, Cin] layout.
@@ -554,13 +761,17 @@ impl KleinModel {
         }
 
         self.offloader = Some(std::sync::Arc::new(std::sync::Mutex::new(offloader)));
-        log::info!("Klein BlockOffloader ready ({} unified blocks)", num_double + num_single);
+        log::info!(
+            "Klein BlockOffloader ready ({} unified blocks)",
+            num_double + num_single
+        );
         Ok(())
     }
 
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.weights.get(key).ok_or_else(||
-            crate::EriDiffusionError::Model(format!("missing weight: {}", key)))
+        self.weights
+            .get(key)
+            .ok_or_else(|| crate::EriDiffusionError::Model(format!("missing weight: {}", key)))
     }
 
     fn linear(&self, x: &Tensor, key: &str) -> Result<Tensor> {
@@ -600,7 +811,8 @@ fn linear_with_lora(
     let base = linear_3d(x, w)?;
     match adapter {
         Some(a) => {
-            let delta = a.forward_delta(x)
+            let delta = a
+                .forward_delta(x)
                 .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
             base.add(&delta)
         }
@@ -638,24 +850,35 @@ fn linear_with_split_qkv_lora(
     let zeros_like_inner = || -> flame_core::Result<Tensor> {
         // Infer the per-slice inner dimension from the fused weight rows.
         let last = *base.shape().dims().last().unwrap();
-        debug_assert!(last % 3 == 0, "linear_with_split_qkv_lora: fused QKV last dim {} not divisible by 3", last);
+        debug_assert!(
+            last % 3 == 0,
+            "linear_with_split_qkv_lora: fused QKV last dim {} not divisible by 3",
+            last
+        );
         let inner = last / 3;
         let mut shape = base.shape().dims().to_vec();
         *shape.last_mut().unwrap() = inner;
-        Tensor::zeros_dtype(Shape::from_dims(&shape), base.dtype(), base.device().clone())
+        Tensor::zeros_dtype(
+            Shape::from_dims(&shape),
+            base.dtype(),
+            base.device().clone(),
+        )
     };
     let dq = match lora_q {
-        Some(a) => a.forward_delta(x)
+        Some(a) => a
+            .forward_delta(x)
             .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta Q: {e}")))?,
         None => zeros_like_inner()?,
     };
     let dk = match lora_k {
-        Some(a) => a.forward_delta(x)
+        Some(a) => a
+            .forward_delta(x)
             .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta K: {e}")))?,
         None => zeros_like_inner()?,
     };
     let dv = match lora_v {
-        Some(a) => a.forward_delta(x)
+        Some(a) => a
+            .forward_delta(x)
             .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta V: {e}")))?,
         None => zeros_like_inner()?,
     };
@@ -700,22 +923,41 @@ fn linear_with_split_qkv_lora_dyn(
     }
     let zeros_like_inner = || -> flame_core::Result<Tensor> {
         let last = *base.shape().dims().last().unwrap();
-        debug_assert!(last % 3 == 0, "linear_with_split_qkv_lora_dyn: fused QKV last dim {} not divisible by 3", last);
+        debug_assert!(
+            last % 3 == 0,
+            "linear_with_split_qkv_lora_dyn: fused QKV last dim {} not divisible by 3",
+            last
+        );
         let inner = last / 3;
         let mut shape = base.shape().dims().to_vec();
         *shape.last_mut().unwrap() = inner;
-        Tensor::zeros_dtype(Shape::from_dims(&shape), base.dtype(), base.device().clone())
+        Tensor::zeros_dtype(
+            Shape::from_dims(&shape),
+            base.dtype(),
+            base.device().clone(),
+        )
     };
-    let dq = match lora_q { Some(a) => a.forward_delta(x)?, None => zeros_like_inner()? };
-    let dk = match lora_k { Some(a) => a.forward_delta(x)?, None => zeros_like_inner()? };
-    let dv = match lora_v { Some(a) => a.forward_delta(x)?, None => zeros_like_inner()? };
+    let dq = match lora_q {
+        Some(a) => a.forward_delta(x)?,
+        None => zeros_like_inner()?,
+    };
+    let dk = match lora_k {
+        Some(a) => a.forward_delta(x)?,
+        None => zeros_like_inner()?,
+    };
+    let dv = match lora_v {
+        Some(a) => a.forward_delta(x)?,
+        None => zeros_like_inner()?,
+    };
     let delta = Tensor::cat(&[&dq, &dk, &dv], dq.shape().dims().len() - 1)?;
     base.add(&delta)
 }
 
 /// Sinusoidal timestep embedding (ComfyUI convention, time_factor=1000).
 fn timestep_embedding(
-    t: &Tensor, dim: usize, time_factor: f32,
+    t: &Tensor,
+    dim: usize,
+    time_factor: f32,
     device: &Arc<CudaDevice>,
 ) -> flame_core::Result<Tensor> {
     let orig = t.dtype();
@@ -774,9 +1016,13 @@ fn build_rope_klein(
     let cos_refs: Vec<&Tensor> = cos_parts.iter().collect();
     let sin_refs: Vec<&Tensor> = sin_parts.iter().collect();
     let pe_cos = Tensor::cat(&cos_refs, 1)?
-        .unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .to_dtype(DType::BF16)?;
     let pe_sin = Tensor::cat(&sin_refs, 1)?
-        .unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .to_dtype(DType::BF16)?;
     Ok((pe_cos, pe_sin))
 }
 
@@ -784,7 +1030,10 @@ fn build_rope_klein(
 /// `q`: `[B, H, N, D]`, `pe_cos`/`pe_sin`: `[1, 1, N, D/2]`.
 /// Returns `[B, H, N, D]`.
 fn apply_rope_klein(
-    q: &Tensor, k: &Tensor, pe_cos: &Tensor, pe_sin: &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    pe_cos: &Tensor,
+    pe_sin: &Tensor,
 ) -> flame_core::Result<(Tensor, Tensor)> {
     // Use the verified flame-core fused kernel.
     let q_out = flame_core::bf16_ops::rope_fused_bf16(q, pe_cos, pe_sin)?;
@@ -826,16 +1075,15 @@ fn double_block_forward_standalone(
     let h = num_heads;
     let d = head_dim;
     let w = |key: &str| -> flame_core::Result<&Tensor> {
-        layer_weights.get(key).ok_or_else(||
-            flame_core::FlameError::InvalidInput(format!("Klein double {block_idx}: missing {key}")))
+        layer_weights.get(key).ok_or_else(|| {
+            flame_core::FlameError::InvalidInput(format!("Klein double {block_idx}: missing {key}"))
+        })
     };
     let lin = |x: &Tensor, key_suffix: &str, lora_idx: usize| -> flame_core::Result<Tensor> {
         let key = format!("{prefix}.{key_suffix}.weight");
         let weight = w(&key)?;
         match &adapters {
-            Some(BlockAdapterSlice::Legacy(v)) => {
-                linear_with_lora(x, weight, v.get(lora_idx))
-            }
+            Some(BlockAdapterSlice::Legacy(v)) => linear_with_lora(x, weight, v.get(lora_idx)),
             Some(BlockAdapterSlice::Lyc(v)) => {
                 let a: Option<&dyn AdapterModule> = v.get(lora_idx).map(|arc| arc.as_ref());
                 linear_with_lora_dyn(x, weight, a)
@@ -844,18 +1092,22 @@ fn double_block_forward_standalone(
         }
     };
     // Fused-QKV linear with 3 separate Q/K/V LoRAs (audit fix H1.3 / H3).
-    let lin_qkv_split = |x: &Tensor, key_suffix: &str,
-                         lora_q_idx: usize, lora_k_idx: usize, lora_v_idx: usize|
-                         -> flame_core::Result<Tensor> {
+    let lin_qkv_split = |x: &Tensor,
+                         key_suffix: &str,
+                         lora_q_idx: usize,
+                         lora_k_idx: usize,
+                         lora_v_idx: usize|
+     -> flame_core::Result<Tensor> {
         let key = format!("{prefix}.{key_suffix}.weight");
         let weight = w(&key)?;
         match &adapters {
-            Some(BlockAdapterSlice::Legacy(v)) => {
-                linear_with_split_qkv_lora(
-                    x, weight,
-                    v.get(lora_q_idx), v.get(lora_k_idx), v.get(lora_v_idx),
-                )
-            }
+            Some(BlockAdapterSlice::Legacy(v)) => linear_with_split_qkv_lora(
+                x,
+                weight,
+                v.get(lora_q_idx),
+                v.get(lora_k_idx),
+                v.get(lora_v_idx),
+            ),
             Some(BlockAdapterSlice::Lyc(v)) => {
                 let lq: Option<&dyn AdapterModule> = v.get(lora_q_idx).map(|a| a.as_ref());
                 let lk: Option<&dyn AdapterModule> = v.get(lora_k_idx).map(|a| a.as_ref());
@@ -890,10 +1142,22 @@ fn double_block_forward_standalone(
     let (mut txt_q, mut txt_k, txt_v) =
         flame_core::bf16_ops::qkv_split_permute_bf16(&txt_qkv, h, d)?;
 
-    img_q = head_rms_norm_local(&img_q, w(&format!("{prefix}.img_attn.norm.query_norm.scale"))?)?;
-    img_k = head_rms_norm_local(&img_k, w(&format!("{prefix}.img_attn.norm.key_norm.scale"))?)?;
-    txt_q = head_rms_norm_local(&txt_q, w(&format!("{prefix}.txt_attn.norm.query_norm.scale"))?)?;
-    txt_k = head_rms_norm_local(&txt_k, w(&format!("{prefix}.txt_attn.norm.key_norm.scale"))?)?;
+    img_q = head_rms_norm_local(
+        &img_q,
+        w(&format!("{prefix}.img_attn.norm.query_norm.scale"))?,
+    )?;
+    img_k = head_rms_norm_local(
+        &img_k,
+        w(&format!("{prefix}.img_attn.norm.key_norm.scale"))?,
+    )?;
+    txt_q = head_rms_norm_local(
+        &txt_q,
+        w(&format!("{prefix}.txt_attn.norm.query_norm.scale"))?,
+    )?;
+    txt_k = head_rms_norm_local(
+        &txt_k,
+        w(&format!("{prefix}.txt_attn.norm.key_norm.scale"))?,
+    )?;
 
     let q = Tensor::cat(&[&txt_q, &img_q], 2)?;
     let k = Tensor::cat(&[&txt_k, &img_k], 2)?;
@@ -918,21 +1182,11 @@ fn double_block_forward_standalone(
 
     // img_mlp: gate+up fused, then silu(gate)*up, then down
     let img_gu = lin(&img_mlp_in, "img_mlp.0", 8)?;
-    let last_dim = *img_gu.shape().dims().last().unwrap();
-    let half = last_dim / 2;
-    let ndim = img_gu.shape().dims().len();
-    let img_gate = img_gu.narrow(ndim - 1, 0, half)?;
-    let img_up = img_gu.narrow(ndim - 1, half, half)?;
-    let img_act = flame_core::bf16_ops::swiglu_fused_bf16(&img_gate, &img_up)?;
+    let img_act = flame_core::bf16_ops::swiglu_split_lastdim_bf16(&img_gu)?;
     let img_mlp_out = lin(&img_act, "img_mlp.2", 9)?;
 
     let txt_gu = lin(&txt_mlp_in, "txt_mlp.0", 10)?;
-    let last_dim = *txt_gu.shape().dims().last().unwrap();
-    let half = last_dim / 2;
-    let ndim = txt_gu.shape().dims().len();
-    let txt_gate = txt_gu.narrow(ndim - 1, 0, half)?;
-    let txt_up = txt_gu.narrow(ndim - 1, half, half)?;
-    let txt_act = flame_core::bf16_ops::swiglu_fused_bf16(&txt_gate, &txt_up)?;
+    let txt_act = flame_core::bf16_ops::swiglu_split_lastdim_bf16(&txt_gu)?;
     let txt_mlp_out = lin(&txt_act, "txt_mlp.2", 11)?;
 
     let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, img_gate2, &img_mlp_out)?;
@@ -959,16 +1213,15 @@ fn single_block_forward_standalone(
     let h = num_heads;
     let d = head_dim;
     let w = |key: &str| -> flame_core::Result<&Tensor> {
-        layer_weights.get(key).ok_or_else(||
-            flame_core::FlameError::InvalidInput(format!("Klein single {block_idx}: missing {key}")))
+        layer_weights.get(key).ok_or_else(|| {
+            flame_core::FlameError::InvalidInput(format!("Klein single {block_idx}: missing {key}"))
+        })
     };
     let lin = |x: &Tensor, key_suffix: &str, lora_idx: usize| -> flame_core::Result<Tensor> {
         let key = format!("{prefix}.{key_suffix}.weight");
         let weight = w(&key)?;
         match &adapters {
-            Some(BlockAdapterSlice::Legacy(v)) => {
-                linear_with_lora(x, weight, v.get(lora_idx))
-            }
+            Some(BlockAdapterSlice::Legacy(v)) => linear_with_lora(x, weight, v.get(lora_idx)),
             Some(BlockAdapterSlice::Lyc(v)) => {
                 let a: Option<&dyn AdapterModule> = v.get(lora_idx).map(|arc| arc.as_ref());
                 linear_with_lora_dyn(x, weight, a)
@@ -998,9 +1251,7 @@ fn single_block_forward_standalone(
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
     let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?;
 
-    let mlp_gate = gate_up.narrow(2, 0, mlp_hidden)?;
-    let mlp_up = gate_up.narrow(2, mlp_hidden, mlp_hidden)?;
-    let mlp_act = flame_core::bf16_ops::swiglu_fused_bf16(&mlp_gate, &mlp_up)?;
+    let mlp_act = flame_core::bf16_ops::swiglu_split_lastdim_bf16(&gate_up)?;
 
     let fused = Tensor::cat(&[&attn_out, &mlp_act], 2)?;
     let out = lin(&fused, "linear2", 1)?;
@@ -1060,7 +1311,9 @@ impl KleinModel {
         let (b, c, h_lat, w_lat) = (dims[0], dims[1], dims[2], dims[3]);
         if c != self.kconfig.in_channels {
             return Err(crate::EriDiffusionError::Model(format!(
-                "Klein forward: expected {} channels, got {}", self.kconfig.in_channels, c)));
+                "Klein forward: expected {} channels, got {}",
+                self.kconfig.in_channels, c
+            )));
         }
         let n_img = h_lat * w_lat;
         let n_txt = txt.shape().dims()[1];
@@ -1084,8 +1337,11 @@ impl KleinModel {
             }
         }
         let img_ids = Tensor::from_vec(
-            img_ids_data, Shape::from_dims(&[n_img, 4]), self.device.clone()
-        )?.to_dtype(DType::BF16)?;
+            img_ids_data,
+            Shape::from_dims(&[n_img, 4]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::BF16)?;
         // upstream Python `Flux2Model.prepare_text_ids`:
         //   cartesian_prod(arange(1), arange(1), arange(1), arange(L))
         //   → row k = [0, 0, 0, k] for k in [0, L). The L-axis (column 3)
@@ -1098,8 +1354,11 @@ impl KleinModel {
             txt_ids_data[k * 4 + 3] = k as f32;
         }
         let txt_ids = Tensor::from_vec(
-            txt_ids_data, Shape::from_dims(&[n_txt, 4]), self.device.clone(),
-        )?.to_dtype(DType::BF16)?;
+            txt_ids_data,
+            Shape::from_dims(&[n_txt, 4]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::BF16)?;
 
         // Input projections (NO bias)
         let img_proj = self.linear(&img_packed, "img_in.weight")?;
@@ -1113,7 +1372,11 @@ impl KleinModel {
 
         // RoPE
         let (pe_cos, pe_sin) = build_rope_klein(
-            &img_ids, &txt_ids, &self.kconfig.axes_dims, self.kconfig.theta, &self.device,
+            &img_ids,
+            &txt_ids,
+            &self.kconfig.axes_dims,
+            self.kconfig.theta,
+            &self.device,
         )?;
 
         // Pre-compute shared modulations once
@@ -1127,7 +1390,9 @@ impl KleinModel {
             let sz = last / n;
             let ndim = t.shape().dims().len();
             let mut chunks = Vec::with_capacity(n);
-            for j in 0..n { chunks.push(t.narrow(ndim - 1, j * sz, sz)?); }
+            for j in 0..n {
+                chunks.push(t.narrow(ndim - 1, j * sz, sz)?);
+            }
             Ok(chunks)
         };
         let img_mods_v = chunk_n(&img_mods_raw, 6)?;
@@ -1135,13 +1400,18 @@ impl KleinModel {
         let single_mods_v = chunk_n(&single_mods_raw, 3)?;
 
         let to_arr6 = |mut v: Vec<Tensor>| -> [Tensor; 6] {
-            let e5 = v.pop().unwrap(); let e4 = v.pop().unwrap();
-            let e3 = v.pop().unwrap(); let e2 = v.pop().unwrap();
-            let e1 = v.pop().unwrap(); let e0 = v.pop().unwrap();
+            let e5 = v.pop().unwrap();
+            let e4 = v.pop().unwrap();
+            let e3 = v.pop().unwrap();
+            let e2 = v.pop().unwrap();
+            let e1 = v.pop().unwrap();
+            let e0 = v.pop().unwrap();
             [e0, e1, e2, e3, e4, e5]
         };
         let to_arr3 = |mut v: Vec<Tensor>| -> [Tensor; 3] {
-            let e2 = v.pop().unwrap(); let e1 = v.pop().unwrap(); let e0 = v.pop().unwrap();
+            let e2 = v.pop().unwrap();
+            let e1 = v.pop().unwrap();
+            let e0 = v.pop().unwrap();
             [e0, e1, e2]
         };
         let img_mods = to_arr6(img_mods_v);
@@ -1149,7 +1419,8 @@ impl KleinModel {
         let single_mods = to_arr3(single_mods_v);
 
         let use_checkpoint = std::env::var("KLEIN_GRAD_CHECKPOINT")
-            .map(|v| v != "0").unwrap_or(true);
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
         // ---- Double blocks ----
         // Wrapped in `AutogradContext::checkpoint` (same pattern as the
@@ -1181,12 +1452,28 @@ impl KleinModel {
             if let Some(ref off) = self.offloader {
                 off.lock()
                     .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .prefetch_block(0)
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("prefetch_block(0): {e}")))?;
+                    .plan_layer_access(0, true, false)
+                    .map_err(|e| {
+                        crate::EriDiffusionError::Model(format!("plan_layer_access(0): {e}"))
+                    })?;
             }
         }
 
         for i in 0..self.kconfig.num_double {
+            if use_checkpoint {
+                if let Some(ref off) = self.offloader {
+                    off.lock()
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
+                        .plan_layer_access(i, true, false)
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "plan_layer_access(double {i}): {e}"
+                            ))
+                        })?;
+                }
+            }
             let prefix = format!("double_blocks.{i}.");
             let lora_base = i * DOUBLE_LORA_SLOTS;
             let lora: Option<BlockAdapterSlice> = if self.is_lora {
@@ -1199,7 +1486,9 @@ impl KleinModel {
                         self.lora_adapters[lora_base..lora_base + DOUBLE_LORA_SLOTS].to_vec(),
                     ))
                 }
-            } else { None };
+            } else {
+                None
+            };
 
             let img_in = img.clone();
             let txt_in = txt.clone();
@@ -1221,7 +1510,9 @@ impl KleinModel {
             let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
             if self.offloader.is_none() {
                 for (k, v) in self.weights.iter() {
-                    if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
+                    if k.starts_with(&prefix) {
+                        layer_weights.insert(k.clone(), v.clone());
+                    }
                 }
             }
             let offloader_for_closure = self.offloader.clone();
@@ -1252,37 +1543,62 @@ impl KleinModel {
                         // its Drop records `compute_done` on the default
                         // stream AFTER `Tensor::cat`, so the next prefetch
                         // can reuse the slot via stream_wait_event.
-                        let (lw, _handle): (HashMap<String, Tensor>, Option<crate::training::block_offload::BlockHandle>) =
-                            if let Some(ref off) = offloader_for_closure {
-                                let handle = off.lock()
-                                    .map_err(|e| flame_core::FlameError::InvalidInput(
-                                        format!("Klein double {bi}: offloader lock: {e}")))?
-                                    .await_block_handle(bi)
-                                    .map_err(|e| flame_core::FlameError::InvalidInput(
-                                        format!("Klein double {bi}: offloader await_block_handle({bi}): {e}")))?;
-                                if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
-                                    if let Some(next_idx) = backward_prefetch_idx {
-                                        off.lock()
-                                            .map_err(|e| flame_core::FlameError::InvalidInput(
-                                                format!("Klein double {bi}: offloader lock for backward prefetch: {e}")))?
-                                            .prefetch_block(next_idx)
-                                            .map_err(|e| flame_core::FlameError::InvalidInput(
-                                                format!("Klein double {bi}: backward prefetch_block({next_idx}): {e}")))?;
-                                    }
+                        let (lw, _handle): (
+                            HashMap<String, Tensor>,
+                            Option<crate::training::block_offload::BlockHandle>,
+                        ) = if let Some(ref off) = offloader_for_closure {
+                            let is_recompute =
+                                flame_core::autograd::AutogradContext::is_checkpoint_recompute();
+                            let mut guard = off.lock().map_err(|e| {
+                                flame_core::FlameError::InvalidInput(format!(
+                                    "Klein double {bi}: offloader lock: {e}"
+                                ))
+                            })?;
+                            let has_layer_policy = guard.has_layer_offload_policy();
+                            if is_recompute && has_layer_policy {
+                                guard.plan_layer_access(bi, false, false).map_err(|e| {
+                                    flame_core::FlameError::InvalidInput(format!(
+                                        "Klein double {bi}: backward plan_layer_access({bi}): {e}"
+                                    ))
+                                })?;
+                            }
+                            let handle = guard.await_block_handle(bi).map_err(|e| {
+                                flame_core::FlameError::InvalidInput(format!(
+                                    "Klein double {bi}: offloader await_block_handle({bi}): {e}"
+                                ))
+                            })?;
+                            if is_recompute && !has_layer_policy {
+                                if let Some(next_idx) = backward_prefetch_idx {
+                                    guard
+                                        .prefetch_block(next_idx)
+                                        .map_err(|e| flame_core::FlameError::InvalidInput(
+                                            format!("Klein double {bi}: backward prefetch_block({next_idx}): {e}")))?;
                                 }
-                                let mut m = HashMap::with_capacity(handle.weights().len());
-                                for (k, v) in handle.weights().iter() {
-                                    if k.starts_with(&prefix_for_closure) { m.insert(k.clone(), v.clone()); }
+                            }
+                            drop(guard);
+                            let mut m = HashMap::with_capacity(handle.weights().len());
+                            for (k, v) in handle.weights().iter() {
+                                if k.starts_with(&prefix_for_closure) {
+                                    m.insert(k.clone(), v.clone());
                                 }
-                                (m, Some(handle))
-                            } else {
-                                (layer_weights.clone(), None)
-                            };
+                            }
+                            (m, Some(handle))
+                        } else {
+                            (layer_weights.clone(), None)
+                        };
                         let (ni, nt) = double_block_forward_standalone(
-                            img_in.clone(), txt_in.clone(),
-                            (*img_mods_c).clone(), (*txt_mods_c).clone(),
-                            pe_cos_c.clone(), pe_sin_c.clone(),
-                            lw, lora.clone(), bi, nh, hd, inner,
+                            img_in.clone(),
+                            txt_in.clone(),
+                            (*img_mods_c).clone(),
+                            (*txt_mods_c).clone(),
+                            pe_cos_c.clone(),
+                            pe_sin_c.clone(),
+                            lw,
+                            lora.clone(),
+                            bi,
+                            nh,
+                            hd,
+                            inner,
                         )?;
                         // Concat `(new_img, new_txt)` along the seq dim so
                         // the checkpoint API (single output) works. We
@@ -1298,23 +1614,42 @@ impl KleinModel {
                 // for debugging or for very small datasets where the
                 // recompute cost exceeds the memory savings.
                 if let Some(ref off) = offloader_for_closure {
-                    let arc = off.lock()
-                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    let arc = off
+                        .lock()
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
                         .ensure_block(bi)
-                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({bi}): {e}")))?;
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "offloader ensure_block({bi}): {e}"
+                            ))
+                        })?;
                     for (k, v) in arc.iter() {
-                        if k.starts_with(&prefix_for_closure) { layer_weights.insert(k.clone(), v.clone()); }
+                        if k.starts_with(&prefix_for_closure) {
+                            layer_weights.insert(k.clone(), v.clone());
+                        }
                     }
                 }
                 let (ni, nt) = double_block_forward_standalone(
-                    img_in.clone(), txt_in.clone(),
-                    (*img_mods_c).clone(), (*txt_mods_c).clone(),
-                    pe_cos_c.clone(), pe_sin_c.clone(),
-                    layer_weights, lora.clone(), bi, nh, hd, inner,
+                    img_in.clone(),
+                    txt_in.clone(),
+                    (*img_mods_c).clone(),
+                    (*txt_mods_c).clone(),
+                    pe_cos_c.clone(),
+                    pe_sin_c.clone(),
+                    layer_weights,
+                    lora.clone(),
+                    bi,
+                    nh,
+                    hd,
+                    inner,
                 )?;
                 if let Some(ref off) = offloader_for_closure {
                     off.lock()
-                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
                         .evict_block();
                 }
                 Tensor::cat(&[&ni, &nt], 1)?
@@ -1339,10 +1674,14 @@ impl KleinModel {
                         None
                     };
                     if let Some(n) = next {
-                        off.lock()
-                            .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                            .prefetch_block(n)
-                            .map_err(|e| crate::EriDiffusionError::Model(format!("prefetch_block({n}): {e}")))?;
+                        let mut guard = off.lock().map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?;
+                        if !guard.has_layer_offload_policy() {
+                            guard.prefetch_block(n).map_err(|e| {
+                                crate::EriDiffusionError::Model(format!("prefetch_block({n}): {e}"))
+                            })?;
+                        }
                     }
                 }
             }
@@ -1378,13 +1717,29 @@ impl KleinModel {
         let mut pe_sin_routed: Option<Tensor> = None;
 
         for i in 0..self.kconfig.num_single {
+            let unified_idx = self.kconfig.num_double + i;
+            if use_checkpoint {
+                if let Some(ref off) = self.offloader {
+                    off.lock()
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
+                        .plan_layer_access(unified_idx, true, false)
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "plan_layer_access(single {i}): {e}"
+                            ))
+                        })?;
+                }
+            }
             // ---- TREAD: enter routed range — gather kept tokens ----
             if let Some(t) = tread {
                 if i == t.route_block_start && tread_skip_residual.is_none() {
                     if t.total_tokens != x.shape().dims()[1] {
                         return Err(crate::EriDiffusionError::Model(format!(
                             "Klein TREAD: total_tokens {} != x[T] {}",
-                            t.total_tokens, x.shape().dims()[1]
+                            t.total_tokens,
+                            x.shape().dims()[1]
                         )));
                     }
                     tread_skip_residual = Some(x.clone());
@@ -1403,7 +1758,6 @@ impl KleinModel {
             }
 
             let prefix = format!("single_blocks.{i}.");
-            let unified_idx = self.kconfig.num_double + i;
             let backward_prefetch_idx = if i > 0 {
                 Some(self.kconfig.num_double + i - 1)
             } else if self.kconfig.num_double > 0 {
@@ -1422,7 +1776,9 @@ impl KleinModel {
                         self.lora_adapters[lora_base..lora_base + SINGLE_LORA_SLOTS].to_vec(),
                     ))
                 }
-            } else { None };
+            } else {
+                None
+            };
 
             let x_in = x.clone();
             let mods_c = single_mods.clone();
@@ -1434,12 +1790,18 @@ impl KleinModel {
                 .map(|t| i >= t.route_block_start && i < t.route_block_end)
                 .unwrap_or(false);
             let pe_cos_c = if inside_route {
-                pe_cos_routed.as_ref().expect("pe_cos_routed set on entry").clone()
+                pe_cos_routed
+                    .as_ref()
+                    .expect("pe_cos_routed set on entry")
+                    .clone()
             } else {
                 pe_cos.clone()
             };
             let pe_sin_c = if inside_route {
-                pe_sin_routed.as_ref().expect("pe_sin_routed set on entry").clone()
+                pe_sin_routed
+                    .as_ref()
+                    .expect("pe_sin_routed set on entry")
+                    .clone()
             } else {
                 pe_sin.clone()
             };
@@ -1468,7 +1830,9 @@ impl KleinModel {
             let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
             if self.offloader.is_none() {
                 for (k, v) in self.weights.iter() {
-                    if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
+                    if k.starts_with(&prefix) {
+                        layer_weights.insert(k.clone(), v.clone());
+                    }
                 }
             }
             let offloader_for_closure = self.offloader.clone();
@@ -1490,39 +1854,59 @@ impl KleinModel {
                         // end of closure body — Tensor result has been
                         // produced by then, kernels queued, so compute_done
                         // is recorded AFTER all weight-reading kernels.
-                        let (lw, _handle): (HashMap<String, Tensor>, Option<crate::training::block_offload::BlockHandle>) =
-                            if let Some(ref off) = offloader_for_closure {
-                                let handle = off.lock()
+                        let (lw, _handle): (
+                            HashMap<String, Tensor>,
+                            Option<crate::training::block_offload::BlockHandle>,
+                        ) = if let Some(ref off) = offloader_for_closure {
+                            let is_recompute =
+                                flame_core::autograd::AutogradContext::is_checkpoint_recompute();
+                            let mut guard = off.lock().map_err(|e| {
+                                flame_core::FlameError::InvalidInput(format!(
+                                    "Klein single {i}: offloader lock: {e}"
+                                ))
+                            })?;
+                            let has_layer_policy = guard.has_layer_offload_policy();
+                            if is_recompute && has_layer_policy {
+                                guard
+                                    .plan_layer_access(unified_idx, false, false)
                                     .map_err(|e| flame_core::FlameError::InvalidInput(
-                                        format!("Klein single {i}: offloader lock: {e}")))?
-                                    .await_block_handle(unified_idx)
-                                    .map_err(|e| flame_core::FlameError::InvalidInput(
-                                        format!("Klein single {i}: offloader await_block_handle({unified_idx}): {e}")))?;
-                                if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
-                                    if let Some(next_idx) = backward_prefetch_idx {
-                                        off.lock()
-                                            .map_err(|e| flame_core::FlameError::InvalidInput(
-                                                format!("Klein single {i}: offloader lock for backward prefetch: {e}")))?
-                                            .prefetch_block(next_idx)
-                                            .map_err(|e| flame_core::FlameError::InvalidInput(
-                                                format!("Klein single {i}: backward prefetch_block({next_idx}): {e}")))?;
-                                    }
+                                        format!("Klein single {i}: backward plan_layer_access({unified_idx}): {e}")))?;
+                            }
+                            let handle = guard
+                                .await_block_handle(unified_idx)
+                                .map_err(|e| flame_core::FlameError::InvalidInput(
+                                    format!("Klein single {i}: offloader await_block_handle({unified_idx}): {e}")))?;
+                            if is_recompute && !has_layer_policy {
+                                if let Some(next_idx) = backward_prefetch_idx {
+                                    guard
+                                        .prefetch_block(next_idx)
+                                        .map_err(|e| flame_core::FlameError::InvalidInput(
+                                            format!("Klein single {i}: backward prefetch_block({next_idx}): {e}")))?;
                                 }
-                                let mut m = HashMap::with_capacity(handle.weights().len());
-                                for (k, v) in handle.weights().iter() {
-                                    if k.starts_with(&prefix_for_closure) {
-                                        m.insert(k.clone(), v.clone());
-                                    }
+                            }
+                            drop(guard);
+                            let mut m = HashMap::with_capacity(handle.weights().len());
+                            for (k, v) in handle.weights().iter() {
+                                if k.starts_with(&prefix_for_closure) {
+                                    m.insert(k.clone(), v.clone());
                                 }
-                                (m, Some(handle))
-                            } else {
-                                (layer_weights.clone(), None)
-                            };
+                            }
+                            (m, Some(handle))
+                        } else {
+                            (layer_weights.clone(), None)
+                        };
                         single_block_forward_standalone(
-                            x_in.clone(), mods_c.clone(),
-                            pe_cos_c.clone(), pe_sin_c.clone(),
-                            lw, lora.clone(),
-                            i, nh, hd, inner, mlp,
+                            x_in.clone(),
+                            mods_c.clone(),
+                            pe_cos_c.clone(),
+                            pe_sin_c.clone(),
+                            lw,
+                            lora.clone(),
+                            i,
+                            nh,
+                            hd,
+                            inner,
+                            mlp,
                         )
                     },
                 )?
@@ -1530,21 +1914,41 @@ impl KleinModel {
                 // Non-checkpoint path: legacy behavior — load via offloader
                 // into self.weights, run, evict.
                 if let Some(ref off) = self.offloader {
-                    let arc = off.lock()
-                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    let arc = off
+                        .lock()
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
                         .ensure_block(unified_idx)
-                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({unified_idx}): {e}")))?;
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "offloader ensure_block({unified_idx}): {e}"
+                            ))
+                        })?;
                     for (k, v) in arc.iter() {
-                        if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
+                        if k.starts_with(&prefix) {
+                            layer_weights.insert(k.clone(), v.clone());
+                        }
                     }
                 }
                 let out = single_block_forward_standalone(
-                    x_in, mods_c, pe_cos_c, pe_sin_c,
-                    layer_weights, lora, i, nh, hd, inner, mlp,
+                    x_in,
+                    mods_c,
+                    pe_cos_c,
+                    pe_sin_c,
+                    layer_weights,
+                    lora,
+                    i,
+                    nh,
+                    hd,
+                    inner,
+                    mlp,
                 )?;
                 if let Some(ref off) = self.offloader {
                     off.lock()
-                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
                         .evict_block();
                 }
                 out
@@ -1556,10 +1960,16 @@ impl KleinModel {
             if use_checkpoint && i + 1 < self.kconfig.num_single {
                 if let Some(ref off) = self.offloader {
                     let next_unified = self.kconfig.num_double + i + 1;
-                    off.lock()
-                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                        .prefetch_block(next_unified)
-                        .map_err(|e| crate::EriDiffusionError::Model(format!("prefetch_block({next_unified}): {e}")))?;
+                    let mut guard = off.lock().map_err(|e| {
+                        crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                    })?;
+                    if !guard.has_layer_offload_policy() {
+                        guard.prefetch_block(next_unified).map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "prefetch_block({next_unified}): {e}"
+                            ))
+                        })?;
+                    }
                 }
             }
 
@@ -1619,18 +2029,23 @@ impl TrainableModel for KleinModel {
         context: &[Tensor],
         _pooled: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let txt = context.first().ok_or_else(||
-            crate::EriDiffusionError::Model("Klein needs text embeddings".into()))?.clone();
+        let txt = context
+            .first()
+            .ok_or_else(|| crate::EriDiffusionError::Model("Klein needs text embeddings".into()))?
+            .clone();
         KleinModel::forward(self, noisy, &txt, timestep)
     }
 
-    fn parameters(&self) -> Vec<Parameter> { self.parameters.clone() }
+    fn parameters(&self) -> Vec<Parameter> {
+        self.parameters.clone()
+    }
     fn post_optimizer_step(&mut self) {}
 
     fn save_weights(&self, path: &str) -> Result<()> {
         if !self.is_lora {
             return Err(crate::EriDiffusionError::Model(
-                "save_weights for non-LoRA Klein not implemented".into()));
+                "save_weights for non-LoRA Klein not implemented".into(),
+            ));
         }
         let mut out = HashMap::new();
         if let Some(ref lyc) = self.lyc_adapters {
@@ -1683,7 +2098,8 @@ impl TrainableModel for KleinModel {
     fn load_weights(&mut self, path: &str) -> Result<()> {
         if !self.is_lora {
             return Err(crate::EriDiffusionError::Model(
-                "load_weights for non-LoRA Klein not implemented".into()));
+                "load_weights for non-LoRA Klein not implemented".into(),
+            ));
         }
         if self.lyc_adapters.is_some() {
             // Per-algo in-place tensor population for the LyCORIS variants
@@ -1695,12 +2111,12 @@ impl TrainableModel for KleinModel {
                 "load_weights for Klein LyCORIS path is not yet implemented \
                  (Phase 2c). Use --resume-full to restore through the \
                  optimizer's parameter list — works for both legacy LoRA and \
-                 LyCORIS bundles via shared Parameter handles.".into(),
+                 LyCORIS bundles via shared Parameter handles."
+                    .into(),
             ));
         }
-        let source = flame_core::serialization::load_file(
-            std::path::Path::new(path), &self.device,
-        ).map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
+        let source = flame_core::serialization::load_file(std::path::Path::new(path), &self.device)
+            .map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
         let mut k = 0;
         for i in 0..self.kconfig.num_double {
             for slot in 0..DOUBLE_LORA_SLOTS {
@@ -1741,8 +2157,11 @@ impl KleinModel {
                     let prefix = format!("double_blocks.{i}.{}", DOUBLE_LORA_KEYS[slot]);
                     let nt = lyc[k].named_tensors();
                     let pp = lyc[k].to_parameters();
-                    debug_assert_eq!(nt.len(), pp.len(),
-                        "AdapterModule contract: named_tensors and to_parameters length mismatch");
+                    debug_assert_eq!(
+                        nt.len(),
+                        pp.len(),
+                        "AdapterModule contract: named_tensors and to_parameters length mismatch"
+                    );
                     for ((suffix, _), param) in nt.iter().zip(pp.into_iter()) {
                         out.push((format!("{prefix}.{suffix}"), param));
                     }
@@ -1754,8 +2173,11 @@ impl KleinModel {
                     let prefix = format!("single_blocks.{i}.{}", SINGLE_LORA_KEYS[slot]);
                     let nt = lyc[k].named_tensors();
                     let pp = lyc[k].to_parameters();
-                    debug_assert_eq!(nt.len(), pp.len(),
-                        "AdapterModule contract: named_tensors and to_parameters length mismatch");
+                    debug_assert_eq!(
+                        nt.len(),
+                        pp.len(),
+                        "AdapterModule contract: named_tensors and to_parameters length mismatch"
+                    );
                     for ((suffix, _), param) in nt.iter().zip(pp.into_iter()) {
                         out.push((format!("{prefix}.{suffix}"), param));
                     }
@@ -1770,16 +2192,28 @@ impl KleinModel {
         for i in 0..self.kconfig.num_double {
             for slot in 0..DOUBLE_LORA_SLOTS {
                 let prefix = format!("double_blocks.{i}.{}", DOUBLE_LORA_KEYS[slot]);
-                out.push((format!("{prefix}.lora_A.weight"), self.lora_adapters[k].lora_a().clone()));
-                out.push((format!("{prefix}.lora_B.weight"), self.lora_adapters[k].lora_b().clone()));
+                out.push((
+                    format!("{prefix}.lora_A.weight"),
+                    self.lora_adapters[k].lora_a().clone(),
+                ));
+                out.push((
+                    format!("{prefix}.lora_B.weight"),
+                    self.lora_adapters[k].lora_b().clone(),
+                ));
                 k += 1;
             }
         }
         for i in 0..self.kconfig.num_single {
             for slot in 0..SINGLE_LORA_SLOTS {
                 let prefix = format!("single_blocks.{i}.{}", SINGLE_LORA_KEYS[slot]);
-                out.push((format!("{prefix}.lora_A.weight"), self.lora_adapters[k].lora_a().clone()));
-                out.push((format!("{prefix}.lora_B.weight"), self.lora_adapters[k].lora_b().clone()));
+                out.push((
+                    format!("{prefix}.lora_A.weight"),
+                    self.lora_adapters[k].lora_a().clone(),
+                ));
+                out.push((
+                    format!("{prefix}.lora_B.weight"),
+                    self.lora_adapters[k].lora_b().clone(),
+                ));
                 k += 1;
             }
         }

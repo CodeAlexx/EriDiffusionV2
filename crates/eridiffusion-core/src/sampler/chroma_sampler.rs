@@ -16,10 +16,10 @@
 //! sampled images are identical to what the working inference binary produces
 //! for the same model + text + seed.
 
+use crate::encoders::flux_vae_decoder::LdmVAEDecoder;
+use crate::sampler::flux_sampler;
 use cudarc::driver::CudaDevice;
 use flame_core::{autograd::AutogradContext, DType, Error, Result, Shape, Tensor};
-use crate::sampler::flux_sampler;
-use crate::encoders::flux_vae_decoder::LdmVAEDecoder;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{path::Path, sync::Arc};
 
@@ -150,11 +150,8 @@ fn sample_inner(
         let dt = t_next - t_curr;
 
         let next_x = {
-            let t_vec = Tensor::from_f32_to_bf16(
-                vec![t_curr],
-                Shape::from_dims(&[1]),
-                device.clone(),
-            )?;
+            let t_vec =
+                Tensor::from_f32_to_bf16(vec![t_curr], Shape::from_dims(&[1]), device.clone())?;
 
             // Cond forward
             let pred_cond = model.forward(&x, text_embed, &t_vec)?;

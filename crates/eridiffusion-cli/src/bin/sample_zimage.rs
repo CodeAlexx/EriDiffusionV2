@@ -3,11 +3,11 @@
 //! Mirrors sample_ernie's CLI shape but uses Qwen3 / Z-Image model / Z-Image VAE.
 
 use clap::Parser;
-use flame_core::DType;
-use std::path::PathBuf;
 use eridiffusion_core::encoders::qwen3::Qwen3Encoder;
 use eridiffusion_core::models::zimage::ZImageModel;
 use eridiffusion_core::sampler::zimage_sampler;
+use flame_core::DType;
+use std::path::PathBuf;
 
 // See prepare_zimage.rs for the full justification of dropping the
 // `<think>\n\n</think>\n\n` block. Train and sample MUST use identical templates;
@@ -20,31 +20,47 @@ const TXT_PAD_LEN: usize = 512;
 #[derive(Parser)]
 struct Args {
     /// Single prompt. Mutually exclusive with `--prompts-file`.
-    #[arg(long)] prompt: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
     /// Newline-separated prompts file for batch sampling. Blank lines and
     /// `#`-prefixed comments are skipped. Requires `--output-dir`. Encoder
     /// loads once for all prompts; DiT loads once and serves all denoises.
-    #[arg(long)] prompts_file: Option<PathBuf>,
-    #[arg(long, default_value = "output.png")] output: PathBuf,
+    #[arg(long)]
+    prompts_file: Option<PathBuf>,
+    #[arg(long, default_value = "output.png")]
+    output: PathBuf,
     /// Multi-prompt output directory. Required with `--prompts-file`.
     /// Files are written as `sample_001.png`, `sample_002.png`, ...
-    #[arg(long)] output_dir: Option<PathBuf>,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
     /// Single-file Z-Image transformer safetensors (e.g. z_image_base_bf16.safetensors).
-    #[arg(long)] model: PathBuf,
-    #[arg(long)] vae_path: PathBuf,
+    #[arg(long)]
+    model: PathBuf,
+    #[arg(long)]
+    vae_path: PathBuf,
     /// Path to Qwen3 weights (single file or directory of shards).
-    #[arg(long)] qwen3: PathBuf,
-    #[arg(long)] tokenizer_path: PathBuf,
-    #[arg(long, default_value = "512")] size: usize,
-    #[arg(long, default_value = "20")] steps: usize,
-    #[arg(long, default_value = "4.0")] cfg: f32,
-    #[arg(long, default_value = "3.0")] shift: f32,
-    #[arg(long, default_value = "42")] seed: u64,
+    #[arg(long)]
+    qwen3: PathBuf,
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    #[arg(long, default_value = "512")]
+    size: usize,
+    #[arg(long, default_value = "20")]
+    steps: usize,
+    #[arg(long, default_value = "4.0")]
+    cfg: f32,
+    #[arg(long, default_value = "3.0")]
+    shift: f32,
+    #[arg(long, default_value = "42")]
+    seed: u64,
     /// Optional safetensors of a trained LoRA (matches train_zimage save format).
-    #[arg(long)] lora_path: Option<PathBuf>,
-    #[arg(long, default_value = "16")] lora_rank: usize,
+    #[arg(long)]
+    lora_path: Option<PathBuf>,
+    #[arg(long, default_value = "16")]
+    lora_rank: usize,
     /// Match OT default = 1.0. See train_zimage.rs for justification.
-    #[arg(long, default_value = "1.0")] lora_alpha: f32,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -62,7 +78,8 @@ fn main() -> anyhow::Result<()> {
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
-            content.lines()
+            content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
@@ -93,10 +110,17 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
 
     log::info!("[2/4] Encoding {} prompt(s) + uncond...", prompts.len());
-    let cond_pairs: Vec<(flame_core::Tensor, flame_core::Tensor)> = prompts.iter().enumerate()
+    let cond_pairs: Vec<(flame_core::Tensor, flame_core::Tensor)> = prompts
+        .iter()
+        .enumerate()
         .map(|(i, p)| {
             let pair = encode_prompt(&qwen3, &tokenizer, p, &device)?;
-            log::info!("  prompt {}/{}: cond shape={:?}", i + 1, prompts.len(), pair.0.shape().dims());
+            log::info!(
+                "  prompt {}/{}: cond shape={:?}",
+                i + 1,
+                prompts.len(),
+                pair.0.shape().dims()
+            );
             Ok(pair)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -114,12 +138,22 @@ fn main() -> anyhow::Result<()> {
     )?;
     if let Some(lp) = &args.lora_path {
         model.bundle.load(lp, &device)?;
-        log::info!("  applied LoRA from {:?} (rank={}, alpha={})",
-            lp, args.lora_rank, args.lora_alpha);
+        log::info!(
+            "  applied LoRA from {:?} (rank={}, alpha={})",
+            lp,
+            args.lora_rank,
+            args.lora_alpha
+        );
     }
 
-    log::info!("[4/4] Sampling {} prompt(s) at {}² ({} steps, cfg={}, shift={})...",
-        cond_pairs.len(), args.size, args.steps, args.cfg, args.shift);
+    log::info!(
+        "[4/4] Sampling {} prompt(s) at {}² ({} steps, cfg={}, shift={})...",
+        cond_pairs.len(),
+        args.size,
+        args.steps,
+        args.cfg,
+        args.shift
+    );
 
     // Split path: denoise every prompt while the transformer is resident,
     // then unload it and VAE-decode each collected latent. At 1024² the
@@ -135,9 +169,12 @@ fn main() -> anyhow::Result<()> {
         log::info!("  [{}/{}] denoising prompt...", idx + 1, cond_pairs.len());
         let latent = zimage_sampler::denoise_latent(
             &mut model,
-            cap_feats, Some(cap_mask),
-            Some(&cap_uncond), Some(&cap_mask_uncond),
-            args.size, args.size,
+            cap_feats,
+            Some(cap_mask),
+            Some(&cap_uncond),
+            Some(&cap_mask_uncond),
+            args.size,
+            args.size,
             args.steps,
             args.cfg,
             args.shift,
@@ -155,7 +192,11 @@ fn main() -> anyhow::Result<()> {
     for (idx, latent) in latents.iter().enumerate() {
         let out_path = if multi_mode {
             let dir = args.output_dir.as_ref().unwrap();
-            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+            dir.join(format!(
+                "sample_{:0>width$}.png",
+                idx + 1,
+                width = pad_width
+            ))
         } else {
             args.output.clone()
         };
@@ -176,32 +217,44 @@ fn encode_prompt(
     prompt: &str,
     device: &std::sync::Arc<flame_core::CudaDevice>,
 ) -> anyhow::Result<(flame_core::Tensor, flame_core::Tensor)> {
-    let wrapped = format!("{ZIMAGE_TEMPLATE_PRE}{}{ZIMAGE_TEMPLATE_POST}", prompt.trim());
-    let enc = tok.encode(wrapped.as_str(), false)
+    let wrapped = format!(
+        "{ZIMAGE_TEMPLATE_PRE}{}{ZIMAGE_TEMPLATE_POST}",
+        prompt.trim()
+    );
+    let enc = tok
+        .encode(wrapped.as_str(), false)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
     let valid_len = ids.len().min(TXT_PAD_LEN);
     ids.resize(TXT_PAD_LEN, PAD_TOKEN_ID);
     let hidden = qwen.encode(&ids)?.to_dtype(DType::BF16)?;
     let mut mask_data = vec![0.0f32; TXT_PAD_LEN];
-    for slot in mask_data.iter_mut().take(valid_len) { *slot = 1.0; }
+    for slot in mask_data.iter_mut().take(valid_len) {
+        *slot = 1.0;
+    }
     let mask = flame_core::Tensor::from_vec(
         mask_data,
         flame_core::Shape::from_dims(&[1, TXT_PAD_LEN]),
         device.clone(),
-    )?.to_dtype(DType::BF16)?;
+    )?
+    .to_dtype(DType::BF16)?;
     Ok((hidden, mask))
 }
 
-fn load_qwen3_weights(path: &std::path::Path, device: &std::sync::Arc<flame_core::CudaDevice>)
-    -> flame_core::Result<std::collections::HashMap<String, flame_core::Tensor>>
-{
+fn load_qwen3_weights(
+    path: &std::path::Path,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> flame_core::Result<std::collections::HashMap<String, flame_core::Tensor>> {
     if path.is_file() {
         return flame_core::serialization::load_file(path, device);
     }
     let mut all = std::collections::HashMap::new();
-    for entry in std::fs::read_dir(path).map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))? {
-        let p = entry.map_err(|e| flame_core::Error::Io(format!("entry: {e}")))?.path();
+    for entry in
+        std::fs::read_dir(path).map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
+    {
+        let p = entry
+            .map_err(|e| flame_core::Error::Io(format!("entry: {e}")))?
+            .path();
         if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
             let part = flame_core::serialization::load_file(&p, device)?;
             all.extend(part);

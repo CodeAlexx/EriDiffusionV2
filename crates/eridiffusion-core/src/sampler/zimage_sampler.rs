@@ -89,21 +89,30 @@ pub fn denoise_latent(
     let _ = seed;
     let mut x = Tensor::randn(
         Shape::from_dims(&[1, 16, latent_h, latent_w]),
-        0.0, 1.0, device.clone(),
-    )?.to_dtype(DType::BF16)?;
+        0.0,
+        1.0,
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
 
     let sigmas = build_sigma_schedule(num_steps, shift);
-    log::info!("  sampling: {}x{}, {} steps, shift={:.1}, cfg={:.1}, mask={}",
-        width, height, num_steps, shift, cfg_scale, cap_mask.is_some());
+    log::info!(
+        "  sampling: {}x{}, {} steps, shift={:.1}, cfg={:.1}, mask={}",
+        width,
+        height,
+        num_steps,
+        shift,
+        cfg_scale,
+        cap_mask.is_some()
+    );
 
     let t_denoise = std::time::Instant::now();
     for step in 0..num_steps {
         let sigma = sigmas[step];
         let sigma_next = sigmas[step + 1];
 
-        let t_tensor = Tensor::from_vec(
-            vec![1.0 - sigma], Shape::from_dims(&[1]), device.clone(),
-        )?.to_dtype(DType::BF16)?;
+        let t_tensor = Tensor::from_vec(vec![1.0 - sigma], Shape::from_dims(&[1]), device.clone())?
+            .to_dtype(DType::BF16)?;
 
         // Z-Image's base "predicts negative noise" (clean - noise); the
         // sampler step then has to add |dt| * (noise - clean). Equivalent
@@ -111,7 +120,8 @@ pub fn denoise_latent(
         // which is the form below (matches musubi-tuner step + sign-flip,
         // and inference-flame's `euler_step` after substituting
         // `pred_cond = -model_out`).
-        let pred_cond = model.forward(&x, &t_tensor, cap_feats, cap_mask)?
+        let pred_cond = model
+            .forward(&x, &t_tensor, cap_feats, cap_mask)?
             .mul_scalar(-1.0)?;
 
         // CFG matching musubi/inference-flame: post-negation, the formula
@@ -121,7 +131,8 @@ pub fn denoise_latent(
         // zimage_infer euler_step.
         let pred = if let Some(uncond) = cap_feats_uncond {
             if cfg_scale > 0.0 {
-                let pred_uncond = model.forward(&x, &t_tensor, uncond, cap_mask_uncond)?
+                let pred_uncond = model
+                    .forward(&x, &t_tensor, uncond, cap_mask_uncond)?
                     .mul_scalar(-1.0)?;
                 let diff = pred_cond.sub(&pred_uncond)?;
                 pred_cond.add(&diff.mul_scalar(cfg_scale)?)?
@@ -155,9 +166,7 @@ pub fn decode_latent_to_png(
     flame_core::trim_cuda_mempool(0);
 
     let t_vae = std::time::Instant::now();
-    let vae = ZImageVAEDecoder::from_safetensors(
-        &vae_path.to_string_lossy(), device,
-    )?;
+    let vae = ZImageVAEDecoder::from_safetensors(&vae_path.to_string_lossy(), device)?;
     let rgb = vae.decode(latent)?;
     log::info!("  VAE decoded in {:.1}s", t_vae.elapsed().as_secs_f32());
 
@@ -197,8 +206,18 @@ pub fn sample_image(
     let _no_grad = AutogradContext::no_grad();
     let _ckpt = CheckpointGuard::disable();
     let latent = denoise_latent(
-        model, cap_feats, cap_mask, cap_feats_uncond, cap_mask_uncond,
-        width, height, num_steps, cfg_scale, shift, seed, device,
+        model,
+        cap_feats,
+        cap_mask,
+        cap_feats_uncond,
+        cap_mask_uncond,
+        width,
+        height,
+        num_steps,
+        cfg_scale,
+        shift,
+        seed,
+        device,
     )?;
     decode_latent_to_png(&latent, vae_path, output_png, device)
 }
@@ -229,12 +248,9 @@ fn save_tensor_as_png(rgb: &Tensor, path: &Path) -> Result<()> {
         .map_err(|e| flame_core::Error::Io(format!("create {}: {e}", path.display())))?;
     let mut writer = std::io::BufWriter::new(file);
     let encoder = image::codecs::png::PngEncoder::new(&mut writer);
-    encoder.encode(
-        &pixels,
-        w as u32,
-        h as u32,
-        image::ColorType::Rgb8,
-    ).map_err(|e| flame_core::Error::Io(format!("PNG encode: {e}")))?;
+    encoder
+        .encode(&pixels, w as u32, h as u32, image::ColorType::Rgb8)
+        .map_err(|e| flame_core::Error::Io(format!("PNG encode: {e}")))?;
 
     Ok(())
 }

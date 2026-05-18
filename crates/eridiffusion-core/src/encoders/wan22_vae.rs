@@ -72,10 +72,9 @@ const STD: [f32; 48] = [
 // ---------------------------------------------------------------------------
 
 fn get(weights: &Weights, key: &str) -> Result<Tensor> {
-    weights
-        .get(key)
-        .cloned()
-        .ok_or_else(|| Error::InvalidOperation(format!("Wan2.2 VAE encoder: missing weight: {key}")))
+    weights.get(key).cloned().ok_or_else(|| {
+        Error::InvalidOperation(format!("Wan2.2 VAE encoder: missing weight: {key}"))
+    })
 }
 fn get_bf16(weights: &Weights, key: &str) -> Result<Tensor> {
     get(weights, key)?.to_dtype(DType::BF16)
@@ -137,7 +136,11 @@ impl CausalConv3d {
                 DType::BF16,
                 x.device().clone(),
             )?;
-            let x_bf16 = if x.dtype() == DType::BF16 { x.clone() } else { x.to_dtype(DType::BF16)? };
+            let x_bf16 = if x.dtype() == DType::BF16 {
+                x.clone()
+            } else {
+                x.to_dtype(DType::BF16)?
+            };
             Tensor::cat(&[&pad, &x_bf16], 2)?
         } else if x.dtype() != DType::BF16 {
             x.to_dtype(DType::BF16)?
@@ -157,7 +160,8 @@ impl CausalConv3d {
         let hw = dims_in[3] * dims_in[4];
         let col_rows = dims_in[1] * kd * self.conv.kernel_size.1 * self.conv.kernel_size.2;
         let cols_per_out_frame = hw;
-        let max_frames_per_chunk = (COL_BYTE_BUDGET / 2 / col_rows / cols_per_out_frame.max(1)).max(1);
+        let max_frames_per_chunk =
+            (COL_BYTE_BUDGET / 2 / col_rows / cols_per_out_frame.max(1)).max(1);
 
         if max_frames_per_chunk >= d_out_total || d_out_total == 1 {
             return self.conv.forward(&x_padded);
@@ -184,12 +188,20 @@ impl CausalConv3d {
     /// If cache_x.T < time_pad, remaining left-padding is zeros.
     /// When `cache_x` is None, same as `forward` (full zero-pad).
     fn forward_cached(&self, x: &Tensor, cache_x: Option<&Tensor>) -> Result<Tensor> {
-        let x_bf16 = if x.dtype() != DType::BF16 { x.to_dtype(DType::BF16)? } else { x.clone() };
+        let x_bf16 = if x.dtype() != DType::BF16 {
+            x.to_dtype(DType::BF16)?
+        } else {
+            x.clone()
+        };
 
         let x_padded = if self.time_pad > 0 {
             match cache_x {
                 Some(cx) => {
-                    let cx_bf16 = if cx.dtype() != DType::BF16 { cx.to_dtype(DType::BF16)? } else { cx.clone() };
+                    let cx_bf16 = if cx.dtype() != DType::BF16 {
+                        cx.to_dtype(DType::BF16)?
+                    } else {
+                        cx.clone()
+                    };
                     let cx_t = cx_bf16.shape().dims()[2];
                     if cx_t >= self.time_pad {
                         // Cache provides enough frames — just prepend
@@ -306,34 +318,53 @@ impl ResidualBlock {
         let conv1 = CausalConv3d::load(
             weights,
             &format!("{prefix}.residual.2"),
-            in_dim, out_dim,
-            (3, 3, 3), (1, 1, 1), (1, 1, 1),
+            in_dim,
+            out_dim,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
             device,
         )?;
         let norm2 = RmsNorm5d::load(weights, &format!("{prefix}.residual.3"), out_dim)?;
         let conv2 = CausalConv3d::load(
             weights,
             &format!("{prefix}.residual.6"),
-            out_dim, out_dim,
-            (3, 3, 3), (1, 1, 1), (1, 1, 1),
+            out_dim,
+            out_dim,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
             device,
         )?;
         let shortcut = if in_dim != out_dim {
             Some(CausalConv3d::load(
                 weights,
                 &format!("{prefix}.shortcut"),
-                in_dim, out_dim,
-                (1, 1, 1), (1, 1, 1), (0, 0, 0),
+                in_dim,
+                out_dim,
+                (1, 1, 1),
+                (1, 1, 1),
+                (0, 0, 0),
                 device,
             )?)
         } else {
             None
         };
-        Ok(Self { norm1, conv1, norm2, conv2, shortcut })
+        Ok(Self {
+            norm1,
+            conv1,
+            norm2,
+            conv2,
+            shortcut,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = if let Some(ref s) = self.shortcut { s.forward(x)? } else { x.clone() };
+        let h = if let Some(ref s) = self.shortcut {
+            s.forward(x)?
+        } else {
+            x.clone()
+        };
         let mut out = self.norm1.forward(x)?;
         out = out.silu()?;
         out = self.conv1.forward(&out)?;
@@ -354,7 +385,11 @@ impl ResidualBlock {
         idx: &mut usize,
     ) -> Result<Tensor> {
         // Shortcut — no cache (kernel=1, no temporal padding)
-        let h = if let Some(ref s) = self.shortcut { s.forward(x)? } else { x.clone() };
+        let h = if let Some(ref s) = self.shortcut {
+            s.forward(x)?
+        } else {
+            x.clone()
+        };
 
         // --- conv1 through residual path ---
         // Python: for each CausalConv3d in self.residual:
@@ -401,7 +436,11 @@ impl ResidualBlock {
         // Conv1 cache
         {
             let i = *idx;
-            let mut cache_x = out.narrow(2, out.shape().dims()[2].saturating_sub(CACHE_T), out.shape().dims()[2].min(CACHE_T))?;
+            let mut cache_x = out.narrow(
+                2,
+                out.shape().dims()[2].saturating_sub(CACHE_T),
+                out.shape().dims()[2].min(CACHE_T),
+            )?;
             if cache_x.shape().dims()[2] < CACHE_T {
                 if let Some(ref old) = cache[i] {
                     // Prepend last frame from old cache
@@ -421,7 +460,11 @@ impl ResidualBlock {
         // Conv2 cache
         {
             let i = *idx;
-            let mut cache_x = out.narrow(2, out.shape().dims()[2].saturating_sub(CACHE_T), out.shape().dims()[2].min(CACHE_T))?;
+            let mut cache_x = out.narrow(
+                2,
+                out.shape().dims()[2].saturating_sub(CACHE_T),
+                out.shape().dims()[2].min(CACHE_T),
+            )?;
             if cache_x.shape().dims()[2] < CACHE_T {
                 if let Some(ref old) = cache[i] {
                     let old_last = old.narrow(2, old.shape().dims()[2] - 1, 1)?;
@@ -510,8 +553,13 @@ impl AttentionBlock {
 // ---------------------------------------------------------------------------
 
 enum DownResample {
-    Downsample2d { conv: Conv2d },
-    Downsample3d { conv: Conv2d, time_conv: CausalConv3d },
+    Downsample2d {
+        conv: Conv2d,
+    },
+    Downsample3d {
+        conv: Conv2d,
+        time_conv: CausalConv3d,
+    },
 }
 
 impl DownResample {
@@ -550,8 +598,11 @@ impl DownResample {
         let time_conv = CausalConv3d::load(
             weights,
             &format!("{prefix}.time_conv"),
-            dim, dim,
-            (3, 1, 1), (2, 1, 1), (0, 0, 0),
+            dim,
+            dim,
+            (3, 1, 1),
+            (2, 1, 1),
+            (0, 0, 0),
             device,
         )?;
 
@@ -620,7 +671,11 @@ impl DownResample {
                     // time_conv kernel=(3,1,1), stride=(2,1,1), no padding needed.
                     // Input: all t frames → output: (t-3)/2 + 1 = (t-1)/2 frames
                     // For t=5: (5-3)/2+1 = 2 frames. Total = 1+2 = 3. ✓
-                    let x_bf16 = if x_5d.dtype() == DType::BF16 { x_5d.clone() } else { x_5d.to_dtype(DType::BF16)? };
+                    let x_bf16 = if x_5d.dtype() == DType::BF16 {
+                        x_5d.clone()
+                    } else {
+                        x_5d.to_dtype(DType::BF16)?
+                    };
                     let rest_frames = time_conv.conv.forward(&x_bf16)?;
                     // Concatenate: [first_frame, rest_frames]
                     Tensor::cat(&[&first_frame, &rest_frames], 2)
@@ -745,7 +800,13 @@ impl AvgDown3D {
         let factor = factor_t * factor_s * factor_s;
         debug_assert_eq!((in_channels * factor) % out_channels, 0);
         let group_size = in_channels * factor / out_channels;
-        Self { in_channels, out_channels, factor_t, factor_s, group_size }
+        Self {
+            in_channels,
+            out_channels,
+            factor_t,
+            factor_s,
+            group_size,
+        }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -821,7 +882,7 @@ impl DownResidualBlock {
         prefix: &str,
         in_dim: usize,
         out_dim: usize,
-        mult: usize,           // num_res_blocks
+        mult: usize, // num_res_blocks
         temperal_downsample: bool,
         down_flag: bool,
         device: &Arc<cudarc::driver::CudaDevice>,
@@ -859,7 +920,11 @@ impl DownResidualBlock {
             if down_flag { 2 } else { 1 },
         );
 
-        Ok(Self { residuals, resample, avg_shortcut })
+        Ok(Self {
+            residuals,
+            resample,
+            avg_shortcut,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -942,10 +1007,7 @@ impl Wan22VaeEncoder {
         Self::from_weights(&weights, device)
     }
 
-    fn from_weights(
-        weights: &Weights,
-        device: &Arc<cudarc::driver::CudaDevice>,
-    ) -> Result<Self> {
+    fn from_weights(weights: &Weights, device: &Arc<cudarc::driver::CudaDevice>) -> Result<Self> {
         let z_dim: usize = 48;
         let enc_dim: usize = 160; // c_dim in Python
         let dim_mult: [usize; 4] = [1, 2, 4, 4];
@@ -979,9 +1041,13 @@ impl Wan22VaeEncoder {
 
         // encoder.conv1: CausalConv3d(12, dims[0]=160, 3, pad=1)
         let encoder_conv1 = CausalConv3d::load(
-            weights, "encoder.conv1",
-            12, dims[0],
-            (3, 3, 3), (1, 1, 1), (1, 1, 1),
+            weights,
+            "encoder.conv1",
+            12,
+            dims[0],
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
             device,
         )?;
 
@@ -1003,7 +1069,14 @@ impl Wan22VaeEncoder {
             let down_flag = i != dim_mult.len() - 1; // i != 3
             let prefix = format!("encoder.downsamples.{i}");
             down_groups.push(DownResidualBlock::load(
-                weights, &prefix, in_d, out_d, num_res_blocks, t_down, down_flag, device,
+                weights,
+                &prefix,
+                in_d,
+                out_d,
+                num_res_blocks,
+                t_down,
+                down_flag,
+                device,
             )?);
         }
 
@@ -1016,27 +1089,39 @@ impl Wan22VaeEncoder {
         // Head: RMS_norm(top_dim) + SiLU + CausalConv3d(top_dim, z_dim*2=96, 3, pad=1)
         let head_norm = RmsNorm5d::load(weights, "encoder.head.0", top_dim)?;
         let head_conv = CausalConv3d::load(
-            weights, "encoder.head.2",
-            top_dim, z_dim * 2,
-            (3, 3, 3), (1, 1, 1), (1, 1, 1),
+            weights,
+            "encoder.head.2",
+            top_dim,
+            z_dim * 2,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
             device,
         )?;
 
         // Top-level conv1: CausalConv3d(z_dim*2=96, z_dim*2=96, 1)
         let conv1 = CausalConv3d::load(
-            weights, "conv1",
-            z_dim * 2, z_dim * 2,
-            (1, 1, 1), (1, 1, 1), (0, 0, 0),
+            weights,
+            "conv1",
+            z_dim * 2,
+            z_dim * 2,
+            (1, 1, 1),
+            (1, 1, 1),
+            (0, 0, 0),
             device,
         )?;
 
         Ok(Self {
             device: device.clone(),
-            mean, inv_std,
+            mean,
+            inv_std,
             encoder_conv1,
             down_groups,
-            mid_res0, mid_attn, mid_res1,
-            head_norm, head_conv,
+            mid_res0,
+            mid_attn,
+            mid_res1,
+            head_norm,
+            head_conv,
             conv1,
         })
     }
@@ -1050,48 +1135,73 @@ impl Wan22VaeEncoder {
 
         // 1. Patchify: [B, 3, T, H, W] → [B, 12, T, H/2, W/2]
         let x = Self::patchify2(video)?;
-        if dbg { Self::dbg_stats("after patchify", &x); }
+        if dbg {
+            Self::dbg_stats("after patchify", &x);
+        }
 
         // 2. Encoder conv1
         let mut x = self.encoder_conv1.forward(&x)?;
-        if dbg { Self::dbg_stats("after encoder_conv1", &x); }
+        if dbg {
+            Self::dbg_stats("after encoder_conv1", &x);
+        }
 
         // 3. Downsample groups
         for (i, g) in self.down_groups.iter().enumerate() {
             x = g.forward(&x)?;
-            if dbg { Self::dbg_stats(&format!("after down_group[{i}]"), &x); }
+            if dbg {
+                Self::dbg_stats(&format!("after down_group[{i}]"), &x);
+            }
         }
 
         // 4. Middle block
         x = self.mid_res0.forward(&x)?;
-        if dbg { Self::dbg_stats("after mid_res0", &x); }
+        if dbg {
+            Self::dbg_stats("after mid_res0", &x);
+        }
         x = self.mid_attn.forward(&x)?;
-        if dbg { Self::dbg_stats("after mid_attn", &x); }
+        if dbg {
+            Self::dbg_stats("after mid_attn", &x);
+        }
         x = self.mid_res1.forward(&x)?;
-        if dbg { Self::dbg_stats("after mid_res1", &x); }
+        if dbg {
+            Self::dbg_stats("after mid_res1", &x);
+        }
 
         // 5. Head: RMS_norm + SiLU + CausalConv3d → [B, 96, T', H', W']
         x = self.head_norm.forward(&x)?;
-        if dbg { Self::dbg_stats("after head_norm", &x); }
+        if dbg {
+            Self::dbg_stats("after head_norm", &x);
+        }
         x = x.silu()?;
-        if dbg { Self::dbg_stats("after head_silu", &x); }
+        if dbg {
+            Self::dbg_stats("after head_silu", &x);
+        }
         x = self.head_conv.forward(&x)?;
-        if dbg { Self::dbg_stats("after head_conv", &x); }
+        if dbg {
+            Self::dbg_stats("after head_conv", &x);
+        }
 
         // 6. conv1 (top-level 1×1) → chunk into mu/log_var
         let out = self.conv1.forward(&x)?;
-        if dbg { Self::dbg_stats("after conv1 (top-level)", &out); }
+        if dbg {
+            Self::dbg_stats("after conv1 (top-level)", &out);
+        }
 
         // Chunk along channel dim: first 48 = mu, second 48 = log_var (discarded)
         let mu = out.narrow(1, 0, 48)?;
-        if dbg { Self::dbg_stats("mu (before normalize)", &mu); }
+        if dbg {
+            Self::dbg_stats("mu (before normalize)", &mu);
+        }
 
         // 7. Normalize: z = (mu - mean) * inv_std = (mu - mean) / std
         //    Compute in F32 for numerical stability, matching PyTorch behavior.
         let mu_f32 = mu.to_dtype(DType::F32)?;
         let mean_f32 = self.mean.to_dtype(DType::F32)?;
         let inv_std_f32 = self.inv_std.to_dtype(DType::F32)?;
-        let z = mu_f32.sub(&mean_f32)?.mul(&inv_std_f32)?.to_dtype(DType::BF16)?;
+        let z = mu_f32
+            .sub(&mean_f32)?
+            .mul(&inv_std_f32)?
+            .to_dtype(DType::BF16)?;
 
         Ok(z)
     }
@@ -1105,7 +1215,9 @@ impl Wan22VaeEncoder {
 
         // 1. Patchify: [B, 3, T, H, W] → [B, 12, T, H/2, W/2]
         let x = Self::patchify2(video)?;
-        if dbg { Self::dbg_stats("after patchify", &x); }
+        if dbg {
+            Self::dbg_stats("after patchify", &x);
+        }
 
         let t = x.shape().dims()[2];
         let num_iters = 1 + (t.saturating_sub(1)) / 4;
@@ -1125,10 +1237,14 @@ impl Wan22VaeEncoder {
                 let len = (4).min(t - start);
                 x.narrow(2, start, len)?
             };
-            if dbg { Self::dbg_stats(&format!("chunk {i} input"), &chunk); }
+            if dbg {
+                Self::dbg_stats(&format!("chunk {i} input"), &chunk);
+            }
 
             let chunk_out = self.encode_chunk(&chunk, &mut cache, &mut idx)?;
-            if dbg { Self::dbg_stats(&format!("chunk {i} output"), &chunk_out); }
+            if dbg {
+                Self::dbg_stats(&format!("chunk {i} output"), &chunk_out);
+            }
 
             out = match out {
                 None => Some(chunk_out),
@@ -1137,21 +1253,30 @@ impl Wan22VaeEncoder {
         }
 
         let out = out.unwrap();
-        if dbg { Self::dbg_stats("after encoder (all chunks)", &out); }
+        if dbg {
+            Self::dbg_stats("after encoder (all chunks)", &out);
+        }
 
         // conv1 (top-level 1×1, after all chunks — NOT inside chunked loop)
         let out = self.conv1.forward(&out)?;
-        if dbg { Self::dbg_stats("after conv1 (top-level)", &out); }
+        if dbg {
+            Self::dbg_stats("after conv1 (top-level)", &out);
+        }
 
         // Chunk into mu (first 48 channels)
         let mu = out.narrow(1, 0, 48)?;
-        if dbg { Self::dbg_stats("mu (before normalize)", &mu); }
+        if dbg {
+            Self::dbg_stats("mu (before normalize)", &mu);
+        }
 
         // Normalize in F32
         let mu_f32 = mu.to_dtype(DType::F32)?;
         let mean_f32 = self.mean.to_dtype(DType::F32)?;
         let inv_std_f32 = self.inv_std.to_dtype(DType::F32)?;
-        let z = mu_f32.sub(&mean_f32)?.mul(&inv_std_f32)?.to_dtype(DType::BF16)?;
+        let z = mu_f32
+            .sub(&mean_f32)?
+            .mul(&inv_std_f32)?
+            .to_dtype(DType::BF16)?;
 
         Ok(z)
     }
@@ -1224,8 +1349,16 @@ impl Wan22VaeEncoder {
             let n = data.len();
             let mean: f32 = data.iter().copied().sum::<f32>() / n as f32;
             let abs_mean: f32 = data.iter().map(|v| v.abs()).sum::<f32>() / n as f32;
-            let lo = data.iter().copied().filter(|v| v.is_finite()).fold(f32::INFINITY, f32::min);
-            let hi = data.iter().copied().filter(|v| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
+            let lo = data
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f32::INFINITY, f32::min);
+            let hi = data
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f32::NEG_INFINITY, f32::max);
             let nan = data.iter().filter(|v| v.is_nan()).count();
             eprintln!(
                 "  [DBG {name}] shape={:?} mean={mean:.4} |mean|={abs_mean:.4} range=[{lo:.4}, {hi:.4}] nan={nan}",
@@ -1242,7 +1375,10 @@ impl Wan22VaeEncoder {
         let dims = x.shape().dims().to_vec();
         assert_eq!(dims.len(), 5, "patchify2 expects [B,C,T,H,W]");
         let (b, c, t, h, w) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
-        assert!(h % 2 == 0 && w % 2 == 0, "H and W must be even for patchify");
+        assert!(
+            h % 2 == 0 && w % 2 == 0,
+            "H and W must be even for patchify"
+        );
 
         // Reshape: [B, C, T, H/2, 2, W/2, 2]
         let v = x.reshape(&[b, c, t, h / 2, 2, w / 2, 2])?;
@@ -1255,5 +1391,7 @@ impl Wan22VaeEncoder {
         p.reshape(&[b, c * 4, t, h / 2, w / 2])
     }
 
-    pub fn device(&self) -> &Arc<cudarc::driver::CudaDevice> { &self.device }
+    pub fn device(&self) -> &Arc<cudarc::driver::CudaDevice> {
+        &self.device
+    }
 }

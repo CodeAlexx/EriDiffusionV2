@@ -192,10 +192,16 @@ pub struct BlockVisit {
 
 impl BlockVisit {
     pub fn forward(block_idx: usize) -> Self {
-        Self { pass: TrainPass::Forward, block_idx }
+        Self {
+            pass: TrainPass::Forward,
+            block_idx,
+        }
     }
     pub fn backward(block_idx: usize) -> Self {
-        Self { pass: TrainPass::BackwardRecompute, block_idx }
+        Self {
+            pass: TrainPass::BackwardRecompute,
+            block_idx,
+        }
     }
 
     /// Pick `Forward` or `BackwardRecompute` based on the current
@@ -211,9 +217,15 @@ impl BlockVisit {
     /// contexts.
     pub fn from_autograd_state(block_idx: usize) -> Self {
         if flame_core::autograd::AutogradContext::is_recording() {
-            Self { pass: TrainPass::BackwardRecompute, block_idx }
+            Self {
+                pass: TrainPass::BackwardRecompute,
+                block_idx,
+            }
         } else {
-            Self { pass: TrainPass::Forward, block_idx }
+            Self {
+                pass: TrainPass::Forward,
+                block_idx,
+            }
         }
     }
 }
@@ -383,10 +395,7 @@ impl PinnedBlockStore {
                         .ok_or_else(|| anyhow::anyhow!("bad end offset for {name}"))?
                         as usize;
                 let dtype_str = info["dtype"].as_str().unwrap_or("F32").to_string();
-                if !matches!(
-                    dtype_str.as_str(),
-                    "F32" | "BF16" | "F16" | "F8_E4M3"
-                ) {
+                if !matches!(dtype_str.as_str(), "F32" | "BF16" | "F16" | "F8_E4M3") {
                     continue;
                 }
                 staged[block_idx].push(StagedTensor {
@@ -419,11 +428,9 @@ impl PinnedBlockStore {
                 });
                 continue;
             }
-            let mut pinned = PinnedHostBuffer::<u8>::with_capacity_elems(
-                block_total,
-                PinnedAllocFlags::DEFAULT,
-            )
-            .map_err(|e| anyhow::anyhow!("pinned alloc block {block_idx}: {e}"))?;
+            let mut pinned =
+                PinnedHostBuffer::<u8>::with_capacity_elems(block_total, PinnedAllocFlags::DEFAULT)
+                    .map_err(|e| anyhow::anyhow!("pinned alloc block {block_idx}: {e}"))?;
             // Pack tensors back-to-back in the slab.
             let mut metas: Vec<PinnedTensorMeta> = Vec::with_capacity(items.len());
             let mut cursor: usize = 0;
@@ -454,7 +461,10 @@ impl PinnedBlockStore {
             });
         }
 
-        Ok(Self { blocks, total_bytes })
+        Ok(Self {
+            blocks,
+            total_bytes,
+        })
     }
 
     pub fn block_count(&self) -> usize {
@@ -574,7 +584,10 @@ impl TransferEngine {
         if s != 0 {
             anyhow::bail!("cudaStreamCreateWithFlags (transfer): {s}");
         }
-        Ok(Self { raw_stream: raw, device })
+        Ok(Self {
+            raw_stream: raw,
+            device,
+        })
     }
 
     pub fn raw_stream(&self) -> *mut c_void {
@@ -704,9 +717,7 @@ impl ResidencyMap {
                         continue;
                     }
                     let state = bs[*b];
-                    if matches!(state, BlockResidency::Releasable)
-                        && releasable.is_none()
-                    {
+                    if matches!(state, BlockResidency::Releasable) && releasable.is_none() {
                         releasable = Some(slot_idx);
                     }
                 }
@@ -793,7 +804,10 @@ impl BudgetManager {
             .activation_reserve_bytes
             .saturating_add(config.optimizer_reserve_bytes)
             .saturating_add(config.workspace_reserve_bytes);
-        Self { config, reserved_bytes }
+        Self {
+            config,
+            reserved_bytes,
+        }
     }
 
     /// Maximum number of GPU slots to allocate, given each slab's byte
@@ -1071,10 +1085,9 @@ impl TrainingBlockOffloader {
         if self.pool.num_slots() == 1 {
             return Ok(None);
         }
-        let exclude = self
-            .residency
-            .slot_for(visit.block_idx)
-            .or(self.prefetch_in_flight.and_then(|b| self.residency.slot_for(b)));
+        let exclude = self.residency.slot_for(visit.block_idx).or(self
+            .prefetch_in_flight
+            .and_then(|b| self.residency.slot_for(b)));
         let Some(target) = self.residency.pick_evictable_slot(exclude) else {
             // No evictable slot — caller is holding everything live.
             return Ok(None);
@@ -1124,7 +1137,8 @@ impl TrainingBlockOffloader {
             let state = self.residency.state(block_idx);
             if matches!(state, BlockResidency::Prefetching) {
                 self.gate_default_on_h2d(slot_idx)?;
-                self.residency.set_state(block_idx, BlockResidency::GpuReady);
+                self.residency
+                    .set_state(block_idx, BlockResidency::GpuReady);
                 self.prefetch_in_flight = None;
             }
             match visit.pass {
@@ -1135,14 +1149,14 @@ impl TrainingBlockOffloader {
         }
 
         // Not on a slot — synchronous load into the next evictable slot.
-        let target = self
-            .residency
-            .pick_evictable_slot(None)
-            .ok_or_else(|| anyhow::anyhow!("await_block: no evictable slot for block {block_idx}"))?;
+        let target = self.residency.pick_evictable_slot(None).ok_or_else(|| {
+            anyhow::anyhow!("await_block: no evictable slot for block {block_idx}")
+        })?;
         self.issue_h2d(block_idx, target)?;
         // Wait on the just-issued H2D from the default stream.
         self.gate_default_on_h2d(target)?;
-        self.residency.set_state(block_idx, BlockResidency::GpuReady);
+        self.residency
+            .set_state(block_idx, BlockResidency::GpuReady);
         self.prefetch_in_flight = None;
         self.stats.forced_syncs += 1;
         match visit.pass {
@@ -1269,7 +1283,10 @@ impl TrainingBlockOffloader {
         let prior_block = self.residency.block_in(target);
         if let Some(pb) = prior_block {
             let prior_state = self.residency.state(pb);
-            if matches!(prior_state, BlockResidency::Releasable | BlockResidency::GpuReady) {
+            if matches!(
+                prior_state,
+                BlockResidency::Releasable | BlockResidency::GpuReady
+            ) {
                 let prior_events = &self.pool.slots[target].events;
                 if prior_events.compute_recorded.load(Ordering::Acquire) {
                     stream_wait_event(self.transfer.raw_stream(), &prior_events.compute_done)?;
@@ -1313,9 +1330,7 @@ impl TrainingBlockOffloader {
             let gpu_buf = unsafe { self.transfer.device.alloc::<u16>(num_elems) }
                 .map_err(|e| anyhow::anyhow!("GPU alloc {} bytes: {e:?}", meta.byte_len))?;
             let dst = (*gpu_buf.device_ptr()) as *mut c_void;
-            let src = unsafe {
-                pinned.buffer.as_ptr().add(meta.offset)
-            } as *const c_void;
+            let src = unsafe { pinned.buffer.as_ptr().add(meta.offset) } as *const c_void;
             self.transfer.h2d(dst, src, meta.byte_len)?;
             bytes_sent += meta.byte_len as u64;
             let tensor = Tensor::from_bf16_slice_gpu(
@@ -1351,7 +1366,8 @@ impl TrainingBlockOffloader {
         self.pool.slots[target].current_block = Some(block_idx);
         self.pool.slots[target].tensors = arc;
         self.pool.slots[target].events = events;
-        self.residency.assign(block_idx, target, BlockResidency::Prefetching);
+        self.residency
+            .assign(block_idx, target, BlockResidency::Prefetching);
         self.prefetch_in_flight = Some(block_idx);
         self.stats.h2d_count += 1;
         self.stats.h2d_bytes += bytes_sent;
@@ -1404,10 +1420,9 @@ fn parse_dtype_from_safetensors(s: &str) -> DType {
 }
 
 fn mmap_safetensors(path: &str) -> anyhow::Result<(String, usize, memmap2::Mmap)> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| anyhow::anyhow!("mmap {path}: {e}"))?;
+    let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
+    let mmap =
+        unsafe { memmap2::Mmap::map(&file) }.map_err(|e| anyhow::anyhow!("mmap {path}: {e}"))?;
     if mmap.len() < 8 {
         anyhow::bail!("file too small for safetensors: {path}");
     }
@@ -1521,12 +1536,14 @@ mod tests {
         shape_elems: usize,
         slots: usize,
     ) -> anyhow::Result<(TrainingBlockOffloader, tempfile::TempDir)> {
-        let device = CudaDevice::new(0)
-            .map_err(|e| anyhow::anyhow!("CudaDevice::new: {e:?}"))?;
+        let device = CudaDevice::new(0).map_err(|e| anyhow::anyhow!("CudaDevice::new: {e:?}"))?;
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("synthetic.safetensors");
         write_synthetic_safetensors(&path, block_count, keys_per_block, shape_elems)?;
-        let facilitator = FakeFacilitator { block_count, keys_per_block };
+        let facilitator = FakeFacilitator {
+            block_count,
+            keys_per_block,
+        };
         let mut config = TrainingOffloadConfig::default();
         config.gpu_slots = slots;
         let store = PinnedBlockStore::load(&[path], &facilitator)?;

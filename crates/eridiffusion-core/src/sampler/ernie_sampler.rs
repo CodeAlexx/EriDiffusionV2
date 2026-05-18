@@ -20,7 +20,9 @@ pub fn schedule(num_steps: usize) -> Vec<f32> {
 }
 
 /// Convert sigma to model timestep (sigma * 1000).
-pub fn sigma_to_timestep(sigma: f32) -> f32 { sigma * NUM_TRAIN_TIMESTEPS }
+pub fn sigma_to_timestep(sigma: f32) -> f32 {
+    sigma * NUM_TRAIN_TIMESTEPS
+}
 
 /// One Euler ODE step: x_next = x + (sigma_next - sigma) * pred
 pub fn euler_step(x: &Tensor, pred: &Tensor, sigma: f32, sigma_next: f32) -> Result<Tensor> {

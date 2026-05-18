@@ -11,11 +11,11 @@
 //! Default paths match the Chroma1-HD HuggingFace snapshot on this machine.
 
 use clap::Parser;
-use std::path::PathBuf;
-use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::encoders::t5_xxl::T5Encoder;
 use eridiffusion_core::models::ChromaTrainingModel;
 use eridiffusion_core::sampler::flux_sampler;
+use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
+use std::path::PathBuf;
 
 const DEFAULT_DIT_DIR: &str =
     "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/transformer";
@@ -23,8 +23,7 @@ const DEFAULT_DIT_DIR: &str =
 const DEFAULT_VAE: &str =
     "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/vae/diffusion_pytorch_model.safetensors";
 
-const DEFAULT_T5_PATH: &str =
-    "/home/alex/.serenity/models/text_encoders/t5xxl_fp16.safetensors";
+const DEFAULT_T5_PATH: &str = "/home/alex/.serenity/models/text_encoders/t5xxl_fp16.safetensors";
 
 const DEFAULT_T5_TOKENIZER: &str =
     "/home/alex/.serenity/models/text_encoders/t5xxl_fp16.tokenizer.json";
@@ -49,64 +48,129 @@ const AE_SHIFT_FACTOR: f32 = 0.1159;
 #[command(about = "Chroma image generation")]
 struct Args {
     /// Single prompt. Mutually exclusive with `--prompts-file`.
-    #[arg(long)] prompt: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
     /// Newline-separated prompts file for batch sampling. Blank lines and
     /// `#`-prefixed comments are skipped. Requires `--output-dir`. The
     /// text encoder is loaded once, every prompt is encoded, the TE is
     /// dropped, then the DiT loads once and serves all prompts; the VAE
     /// loads once at the end and decodes every collected latent.
-    #[arg(long)] prompts_file: Option<PathBuf>,
-    #[arg(long, default_value = "")] negative: String,
+    #[arg(long)]
+    prompts_file: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    negative: String,
     /// Single-prompt output path. Used when `--prompt` is given.
-    #[arg(long, default_value = "output/chroma_sample.png")] output: PathBuf,
+    #[arg(long, default_value = "output/chroma_sample.png")]
+    output: PathBuf,
     /// Multi-prompt output directory. Required with `--prompts-file`.
     /// Files are written as `sample_001.png`, `sample_002.png`, ...
-    #[arg(long)] output_dir: Option<PathBuf>,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
     /// Chroma transformer: directory of shards OR single safetensors.
-    #[arg(long, default_value = DEFAULT_DIT_DIR)] transformer: PathBuf,
-    #[arg(long, default_value = DEFAULT_VAE)] vae_path: PathBuf,
-    #[arg(long, default_value = DEFAULT_T5_PATH)] t5_path: PathBuf,
-    #[arg(long, default_value = DEFAULT_T5_TOKENIZER)] tokenizer_path: PathBuf,
+    #[arg(long, default_value = DEFAULT_DIT_DIR)]
+    transformer: PathBuf,
+    #[arg(long, default_value = DEFAULT_VAE)]
+    vae_path: PathBuf,
+    #[arg(long, default_value = DEFAULT_T5_PATH)]
+    t5_path: PathBuf,
+    #[arg(long, default_value = DEFAULT_T5_TOKENIZER)]
+    tokenizer_path: PathBuf,
     /// Output image height (must be divisible by 16).
-    #[arg(long, default_value = "1024")] height: usize,
+    #[arg(long, default_value = "1024")]
+    height: usize,
     /// Output image width (must be divisible by 16).
-    #[arg(long, default_value = "1024")] width: usize,
-    #[arg(long, default_value = "20")] steps: usize,
-    #[arg(long, default_value = "4.0")] cfg: f32,
-    #[arg(long, default_value = "42")] seed: u64,
+    #[arg(long, default_value = "1024")]
+    width: usize,
+    #[arg(long, default_value = "20")]
+    steps: usize,
+    #[arg(long, default_value = "4.0")]
+    cfg: f32,
+    #[arg(long, default_value = "42")]
+    seed: u64,
     /// Sampler: `euler` (default, FlowMatch flux convention) or
     /// `dpmpp_2m` (DPM++ 2M multistep, tighter prompt adherence per step).
     /// chroma1-HD's creator-recommended config is cfg=3.6 steps=26 with
     /// either sampler.
-    #[arg(long, default_value = "euler")] sampler: String,
+    #[arg(long, default_value = "euler")]
+    sampler: String,
     /// Use BlockOffloader (recommended for 24 GB cards — keeps ~3 GB free).
-    #[arg(long)] offload: bool,
+    #[arg(long)]
+    offload: bool,
     /// Optional path to a LoRA safetensors file produced by `train_chroma`
     /// (or `ChromaLoraBundle::save`). When set, the LoRA is attached to the
     /// transformer before sampling. Use this to inspect a trained LoRA:
     ///   sample_chroma --lora /path/to/chroma_lora_step1500.safetensors \
     ///                 --prompt "..." --output sample.png --offload
-    #[arg(long)] lora: Option<PathBuf>,
+    #[arg(long)]
+    lora: Option<PathBuf>,
     /// LoRA rank — must match the rank used at training time. Default 16.
-    #[arg(long, default_value_t = 16)] lora_rank: usize,
+    #[arg(long, default_value_t = 16)]
+    lora_rank: usize,
     /// LoRA alpha — must match training time. Default = rank (effective scale 1.0).
-    #[arg(long)] lora_alpha: Option<f32>,
+    #[arg(long)]
+    lora_alpha: Option<f32>,
 }
 
-fn tokenize_t5(
+fn tokenize_t5_with_mask(
     tokenizer_path: &std::path::Path,
     prompt: &str,
     seq_len: usize,
-) -> anyhow::Result<Vec<i32>> {
+) -> anyhow::Result<(Vec<i32>, Vec<f32>, usize)> {
     let tok = tokenizers::Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow::anyhow!("T5 tokenizer load: {e}"))?;
     let enc = tok
         .encode(prompt, true)
         .map_err(|e| anyhow::anyhow!("T5 tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+    if ids.len() > seq_len {
+        ids.truncate(seq_len);
+    }
+    let real_len = ids.len();
+    let keep_len = (real_len + 1).min(seq_len);
+    let mut mask = vec![0.0f32; seq_len];
+    for v in mask.iter_mut().take(keep_len) {
+        *v = 1.0;
+    }
     // Pad with 0 (T5 pad token) or truncate to seq_len.
     ids.resize(seq_len, 0);
-    Ok(ids)
+    Ok((ids, mask, real_len))
+}
+
+fn build_joint_attention_mask(
+    text_mask: &Tensor,
+    n_img: usize,
+) -> anyhow::Result<Option<Tensor>> {
+    let dims = text_mask.shape().dims().to_vec();
+    let (batch, n_txt) = match dims.as_slice() {
+        [n] => (1usize, *n),
+        [b, n] => (*b, *n),
+        other => anyhow::bail!("text attention mask must be [T] or [B,T], got {:?}", other),
+    };
+    let values = text_mask.to_dtype(DType::F32)?.to_vec()?;
+    if values.iter().all(|v| *v > 0.5) {
+        return Ok(None);
+    }
+
+    let total = n_txt + n_img;
+    let mut data = vec![1.0f32; batch * total * total];
+    for b in 0..batch {
+        let mask_base = b * n_txt;
+        let batch_base = b * total * total;
+        for q in 0..total {
+            let row = batch_base + q * total;
+            for k in 0..n_txt {
+                if values[mask_base + k] <= 0.5 {
+                    data[row + k] = 0.0;
+                }
+            }
+        }
+    }
+
+    Ok(Some(Tensor::from_f32_to_bf16(
+        data,
+        Shape::from_dims(&[batch, 1, total, total]),
+        text_mask.device().clone(),
+    )?))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -130,8 +194,8 @@ fn main() -> anyhow::Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("t5_path not valid UTF-8"))?;
 
-    let mut t5 = T5Encoder::load(t5_path_str, &device)
-        .map_err(|e| anyhow::anyhow!("T5 load: {e}"))?;
+    let mut t5 =
+        T5Encoder::load(t5_path_str, &device).map_err(|e| anyhow::anyhow!("T5 load: {e}"))?;
 
     // Resolve prompt list. Single-prompt mode keeps the legacy
     // `--prompt` / `--output` contract; multi-prompt mode reads
@@ -141,7 +205,8 @@ fn main() -> anyhow::Result<()> {
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
-            content.lines()
+            content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
@@ -162,36 +227,75 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
     }
 
-    log::info!("[1/4] Encoding {} prompt(s) + uncond (seq_len={})...", prompts.len(), T5_SEQ_LEN);
-    let conds: Vec<Tensor> = prompts.iter().enumerate()
-        .map(|(i, p)| {
-            let tokens = tokenize_t5(&args.tokenizer_path, p, T5_SEQ_LEN)?;
-            let c = t5.encode(&tokens)
-                .map_err(|e| anyhow::anyhow!("T5 cond encode {}: {e}", i + 1))?;
-            let c = c.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("cond dtype: {e}"))?;
-            log::info!("  prompt {}/{}: cond shape={:?}", i + 1, prompts.len(), c.shape().dims());
-            Ok(c)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    log::info!(
+        "[1/4] Encoding {} prompt(s) + uncond (seq_len={})...",
+        prompts.len(),
+        T5_SEQ_LEN
+    );
+    let mut conds: Vec<Tensor> = Vec::with_capacity(prompts.len());
+    let mut cond_text_masks: Vec<Tensor> = Vec::with_capacity(prompts.len());
+    for (i, p) in prompts.iter().enumerate() {
+        let (tokens, mask, real_len) = tokenize_t5_with_mask(&args.tokenizer_path, p, T5_SEQ_LEN)?;
+        let c = t5
+            .encode(&tokens)
+            .map_err(|e| anyhow::anyhow!("T5 cond encode {}: {e}", i + 1))?;
+        let c = c
+            .to_dtype(DType::BF16)
+            .map_err(|e| anyhow::anyhow!("cond dtype: {e}"))?;
+        let mask = Tensor::from_vec(
+            mask,
+            Shape::from_dims(&[1, T5_SEQ_LEN]),
+            device.clone(),
+        )?
+        .to_dtype(DType::BF16)?;
+        log::info!(
+            "  prompt {}/{}: cond shape={:?} real_len={}",
+            i + 1,
+            prompts.len(),
+            c.shape().dims(),
+            real_len
+        );
+        conds.push(c);
+        cond_text_masks.push(mask);
+    }
 
-    let uncond_tokens = tokenize_t5(&args.tokenizer_path, &args.negative, T5_SEQ_LEN)?;
+    let (uncond_tokens, uncond_mask, uncond_real_len) =
+        tokenize_t5_with_mask(&args.tokenizer_path, &args.negative, T5_SEQ_LEN)?;
     let uncond = t5
         .encode(&uncond_tokens)
         .map_err(|e| anyhow::anyhow!("T5 uncond encode: {e}"))?;
-    let uncond = uncond.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("uncond dtype: {e}"))?;
+    let uncond = uncond
+        .to_dtype(DType::BF16)
+        .map_err(|e| anyhow::anyhow!("uncond dtype: {e}"))?;
+    let uncond_text_mask = Tensor::from_vec(
+        uncond_mask,
+        Shape::from_dims(&[1, T5_SEQ_LEN]),
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
 
-    log::info!("[1/4] uncond={:?}", uncond.shape().dims());
+    log::info!(
+        "[1/4] uncond={:?} real_len={}",
+        uncond.shape().dims(),
+        uncond_real_len
+    );
     drop(t5); // free ~10 GB before loading DiT
 
     // ------------------------------------------------------------------
     // Stage 2: Load Chroma transformer
     // ------------------------------------------------------------------
-    log::info!("[2/4] Loading Chroma transformer (offload={})...", args.offload);
+    log::info!(
+        "[2/4] Loading Chroma transformer (offload={})...",
+        args.offload
+    );
     // When a LoRA is requested, build the model with the matching rank/alpha
     // so the bundle's adapter shapes line up; otherwise the trivial rank=1
     // shapes are fine (bundle weights will be replaced on load).
     let (init_rank, init_alpha) = if args.lora.is_some() {
-        (args.lora_rank, args.lora_alpha.unwrap_or(args.lora_rank as f32))
+        (
+            args.lora_rank,
+            args.lora_alpha.unwrap_or(args.lora_rank as f32),
+        )
     } else {
         (1usize, 1.0f32)
     };
@@ -225,29 +329,48 @@ fn main() -> anyhow::Result<()> {
         let alpha = args.lora_alpha.unwrap_or(args.lora_rank as f32);
         log::info!(
             "[2.5/4] Loading LoRA from {} (rank={}, alpha={})",
-            lora_path.display(), args.lora_rank, alpha
+            lora_path.display(),
+            args.lora_rank,
+            alpha
         );
         let bundle = eridiffusion_core::models::chroma::ChromaLoraBundle::load_from_safetensors(
-            lora_path, args.lora_rank, alpha, device.clone(),
-        ).map_err(|e| anyhow::anyhow!("LoRA load: {e}"))?;
+            lora_path,
+            args.lora_rank,
+            alpha,
+            device.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("LoRA load: {e}"))?;
         model.bundle = Some(bundle);
-        log::info!("[2.5/4] LoRA attached: {} adapters", model.bundle.as_ref().unwrap().num_adapters());
+        log::info!(
+            "[2.5/4] LoRA attached: {} adapters",
+            model.bundle.as_ref().unwrap().num_adapters()
+        );
     }
 
     // ------------------------------------------------------------------
     // Stage 3: Denoise
     // ------------------------------------------------------------------
     if args.height % 16 != 0 || args.width % 16 != 0 {
-        anyhow::bail!("height and width must be divisible by 16 (got {}x{})", args.height, args.width);
+        anyhow::bail!(
+            "height and width must be divisible by 16 (got {}x{})",
+            args.height,
+            args.width
+        );
     }
 
     // Latent geometry: VAE 8x + patchify 2x = 16x total.
-    let latent_h = args.height / 8;   // VAE-level (before patchify)
+    let latent_h = args.height / 8; // VAE-level (before patchify)
     let latent_w = args.width / 8;
 
     log::info!(
         "[3/4] Denoising {} prompt(s) at {}x{} → latent {}x{}, {} steps, cfg={}...",
-        conds.len(), args.width, args.height, latent_w, latent_h, args.steps, args.cfg
+        conds.len(),
+        args.width,
+        args.height,
+        latent_w,
+        latent_h,
+        args.steps,
+        args.cfg
     );
 
     let timesteps = flux_sampler::schedule(args.steps, args.width, args.height);
@@ -263,9 +386,12 @@ fn main() -> anyhow::Result<()> {
     // Collect each prompt's final latent so we can drop the DiT once and
     // decode every latent through a single VAE-load pass.
     let mut latents: Vec<Tensor> = Vec::with_capacity(conds.len());
+    let n_img = (latent_h / 2) * (latent_w / 2);
+    let uncond_attn_mask = build_joint_attention_mask(&uncond_text_mask, n_img)?;
 
     for (idx, cond) in conds.iter().enumerate() {
         log::info!("  [{}/{}] denoising...", idx + 1, conds.len());
+        let cond_attn_mask = build_joint_attention_mask(&cond_text_masks[idx], n_img)?;
 
         // Box-Muller noise, matches chroma_sampler::sample_image seeding.
         // Same seed across prompts keeps noise pattern fixed; if you want
@@ -308,21 +434,20 @@ fn main() -> anyhow::Result<()> {
             let t_next = timesteps[step + 1];
             let dt = t_next - t_curr;
 
-            let t_vec = Tensor::from_f32_to_bf16(
-                vec![t_curr],
-                Shape::from_dims(&[1]),
-                device.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("t_vec: {e}"))?;
+            let t_vec =
+                Tensor::from_f32_to_bf16(vec![t_curr], Shape::from_dims(&[1]), device.clone())
+                    .map_err(|e| anyhow::anyhow!("t_vec: {e}"))?;
 
             // Cond forward
             let pred_cond = model
-                .forward(&x, cond, &t_vec)
+                .forward_with_attention_mask(&x, cond, &t_vec, cond_attn_mask.as_ref())
                 .map_err(|e| anyhow::anyhow!("forward cond prompt {} step {step}: {e}", idx + 1))?;
             // Uncond forward
             let pred_uncond = model
-                .forward(&x, &uncond, &t_vec)
-                .map_err(|e| anyhow::anyhow!("forward uncond prompt {} step {step}: {e}", idx + 1))?;
+                .forward_with_attention_mask(&x, &uncond, &t_vec, uncond_attn_mask.as_ref())
+                .map_err(|e| {
+                    anyhow::anyhow!("forward uncond prompt {} step {step}: {e}", idx + 1)
+                })?;
 
             // CFG: pred = uncond + cfg_scale * (cond - uncond)
             let diff = pred_cond
@@ -338,16 +463,23 @@ fn main() -> anyhow::Result<()> {
             x = match args.sampler.as_str() {
                 "euler" => {
                     // Euler step: x_next = x + dt * pred  (dt < 0)
-                    x.add(&pred.mul_scalar(dt).map_err(|e| anyhow::anyhow!("dt mul: {e}"))?)
-                        .map_err(|e| anyhow::anyhow!("euler step: {e}"))?
+                    x.add(
+                        &pred
+                            .mul_scalar(dt)
+                            .map_err(|e| anyhow::anyhow!("dt mul: {e}"))?,
+                    )
+                    .map_err(|e| anyhow::anyhow!("euler step: {e}"))?
                 }
                 "dpmpp_2m" => {
                     // Data-prediction form for flow-match velocity model:
                     // denoised = x - σ * v
-                    let denoised = x.sub(&pred.mul_scalar(t_curr)?).map_err(|e| anyhow::anyhow!("denoised: {e}"))?;
+                    let denoised = x
+                        .sub(&pred.mul_scalar(t_curr)?)
+                        .map_err(|e| anyhow::anyhow!("denoised: {e}"))?;
                     let lambda = flux_sampler::lambda_from_sigma(t_curr);
-                    let x_next = flux_sampler::dpmpp_2m_step(&x, &denoised, t_curr, t_next, &history)
-                        .map_err(|e| anyhow::anyhow!("dpmpp_2m_step: {e}"))?;
+                    let x_next =
+                        flux_sampler::dpmpp_2m_step(&x, &denoised, t_curr, t_next, &history)
+                            .map_err(|e| anyhow::anyhow!("dpmpp_2m_step: {e}"))?;
                     history.push(denoised, lambda);
                     x_next
                 }
@@ -369,7 +501,11 @@ fn main() -> anyhow::Result<()> {
         latents.push(x);
     }
     let denoise_secs = t_denoise_total.elapsed().as_secs_f32();
-    log::info!("[3/4] Denoising {} prompt(s) done in {:.1}s", latents.len(), denoise_secs);
+    log::info!(
+        "[3/4] Denoising {} prompt(s) done in {:.1}s",
+        latents.len(),
+        denoise_secs
+    );
 
     // ------------------------------------------------------------------
     // Stage 4: VAE decode + save PNG (single VAE load for all prompts)
@@ -397,12 +533,21 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("VAE decode prompt {}: {e}", idx + 1))?;
         let out_path = if multi_mode {
             let dir = args.output_dir.as_ref().unwrap();
-            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+            dir.join(format!(
+                "sample_{:0>width$}.png",
+                idx + 1,
+                width = pad_width
+            ))
         } else {
             args.output.clone()
         };
         save_rgb_png(&rgb, &out_path).map_err(|e| anyhow::anyhow!("save PNG: {e}"))?;
-        log::info!("  [{}/{}] saved {}", idx + 1, latents.len(), out_path.display());
+        log::info!(
+            "  [{}/{}] saved {}",
+            idx + 1,
+            latents.len(),
+            out_path.display()
+        );
         saved_paths.push(out_path);
     }
     drop(vae);

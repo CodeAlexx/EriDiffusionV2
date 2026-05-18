@@ -11,7 +11,6 @@
 //! Schnell uses 1.0 and skips guidance injection (model has no guidance_in).
 
 use clap::{Parser, ValueEnum};
-use flame_core::{DType, Shape, Tensor};
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};
 use eridiffusion_core::encoders::{
     clip_l::{ClipConfig, ClipEncoder},
@@ -20,76 +19,109 @@ use eridiffusion_core::encoders::{
 };
 use eridiffusion_core::models::{flux::FluxModel, TrainableModel};
 use eridiffusion_core::sampler::flux_sampler;
+use flame_core::{DType, Shape, Tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 const T5_MAX_LEN: usize = 512;
 
 #[derive(Copy, Clone, ValueEnum, Debug)]
-enum Variant { Dev, Schnell }
+enum Variant {
+    Dev,
+    Schnell,
+}
 
 #[derive(Parser)]
 struct Args {
     /// Single prompt. Mutually exclusive with `--prompts-file`.
-    #[arg(long)] prompt: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
     /// Newline-separated prompts file for batch sampling. Blank lines and
     /// `#`-prefixed comments are skipped. Requires `--output-dir`. T5 +
     /// CLIP load once for all prompts; DiT and VAE each load once total.
-    #[arg(long)] prompts_file: Option<PathBuf>,
-    #[arg(long, default_value = "")] negative: String,
-    #[arg(long, default_value = "output.png")] output: PathBuf,
+    #[arg(long)]
+    prompts_file: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    negative: String,
+    #[arg(long, default_value = "output.png")]
+    output: PathBuf,
     /// Multi-prompt output directory. Required with `--prompts-file`.
     /// Files are written as `sample_001.png`, `sample_002.png`, ...
-    #[arg(long)] output_dir: Option<PathBuf>,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
     /// Flux transformer (single .safetensors or directory).
-    #[arg(long)] transformer: PathBuf,
-    #[arg(long)] vae_path: PathBuf,
-    #[arg(long)] t5_ckpt: PathBuf,
-    #[arg(long)] clip_ckpt: PathBuf,
-    #[arg(long)] t5_tokenizer: PathBuf,
-    #[arg(long)] clip_tokenizer: PathBuf,
-    #[arg(long, value_enum, default_value_t = Variant::Dev)] variant: Variant,
-    #[arg(long, default_value = "1024")] size: usize,
-    #[arg(long, default_value = "20")] steps: usize,
+    #[arg(long)]
+    transformer: PathBuf,
+    #[arg(long)]
+    vae_path: PathBuf,
+    #[arg(long)]
+    t5_ckpt: PathBuf,
+    #[arg(long)]
+    clip_ckpt: PathBuf,
+    #[arg(long)]
+    t5_tokenizer: PathBuf,
+    #[arg(long)]
+    clip_tokenizer: PathBuf,
+    #[arg(long, value_enum, default_value_t = Variant::Dev)]
+    variant: Variant,
+    #[arg(long, default_value = "1024")]
+    size: usize,
+    #[arg(long, default_value = "20")]
+    steps: usize,
     /// External classifier-free guidance. **Disabled by default** — FLUX.1 Dev/Schnell
     /// are guidance-distilled (single forward, guidance fed via model input).
     /// Audit fix FLUX_VERIFY §H3 / §H8 / SKEPTIC §H8: pre-fix the sampler ran
     /// 2 forwards/step and combined `pred_uncond + cfg*(pred_cond - pred_uncond)`
     /// — over-amplifies the prediction (uncond branch was never trained as a
     /// separate distribution). Only honoured when `> 1.0`.
-    #[arg(long, default_value = "1.0")] cfg: f32,
+    #[arg(long, default_value = "1.0")]
+    cfg: f32,
     /// Internal Flux Dev guidance value (passed to the DiT via `guidance_in`
     /// MLP). 3.5 is the BFL inference default; Schnell ignores this.
-    #[arg(long, default_value = "3.5")] flux_guidance: f32,
-    #[arg(long, default_value = "42")] seed: u64,
-    #[arg(long)] lora_path: Option<PathBuf>,
-    #[arg(long, default_value = "16")] lora_rank: usize,
+    #[arg(long, default_value = "3.5")]
+    flux_guidance: f32,
+    #[arg(long, default_value = "42")]
+    seed: u64,
+    #[arg(long)]
+    lora_path: Option<PathBuf>,
+    #[arg(long, default_value = "16")]
+    lora_rank: usize,
     /// Convention: alpha = rank (effective scale 1.0). FLUX_VERIFY §H12.
-    #[arg(long, default_value = "16.0")] lora_alpha: f64,
-    #[arg(long)] offload: bool,
+    #[arg(long, default_value = "16.0")]
+    lora_alpha: f64,
+    #[arg(long)]
+    offload: bool,
 }
 
 fn collect_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
-    if path.is_file() { return Ok(vec![path.to_path_buf()]); }
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
     let mut shards: Vec<PathBuf> = std::fs::read_dir(path)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
         .collect();
     shards.sort();
-    if shards.is_empty() { anyhow::bail!("no safetensors at {:?}", path); }
+    if shards.is_empty() {
+        anyhow::bail!("no safetensors at {:?}", path);
+    }
     Ok(shards)
 }
 
-fn load_clip_weights(path: &std::path::Path, device: &std::sync::Arc<flame_core::CudaDevice>)
-    -> flame_core::Result<HashMap<String, Tensor>>
-{
+fn load_clip_weights(
+    path: &std::path::Path,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> flame_core::Result<HashMap<String, Tensor>> {
     if path.is_file() {
         return flame_core::serialization::load_file(path, device);
     }
     let mut all = HashMap::new();
-    for entry in std::fs::read_dir(path)
-        .map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))? {
-        let p = entry.map_err(|e| flame_core::Error::Io(format!("entry: {e}")))?.path();
+    for entry in
+        std::fs::read_dir(path).map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
+    {
+        let p = entry
+            .map_err(|e| flame_core::Error::Io(format!("entry: {e}")))?
+            .path();
         if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
             let part = flame_core::serialization::load_file(&p, device)?;
             all.extend(part);
@@ -109,7 +141,13 @@ fn main() -> anyhow::Result<()> {
     let h_tok = args.size / 16;
     let w_tok = args.size / 16;
     let n_img = h_tok * w_tok;
-    log::info!("size={}² → packed n_img={} ({}x{})", args.size, n_img, h_tok, w_tok);
+    log::info!(
+        "size={}² → packed n_img={} ({}x{})",
+        args.size,
+        n_img,
+        h_tok,
+        w_tok
+    );
 
     // ── 1. Encode text ──
     log::info!("[1/4] T5 + CLIP encode...");
@@ -135,18 +173,26 @@ fn main() -> anyhow::Result<()> {
     let clip = ClipEncoder::new(clip_weights, ClipConfig::default(), device.clone());
 
     let mut encode_t5 = |text: &str| -> anyhow::Result<Tensor> {
-        let e = t5_tok.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let e = t5_tok
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ids: Vec<i32> = e.get_ids().iter().map(|&x| x as i32).collect();
         // Truncate to T5_MAX_LEN, then pad with 0 to exactly T5_MAX_LEN.
         // `build_txt_ids` always produces T5_MAX_LEN RoPE positions; the T5
         // embedding must match that length or the RoPE table is misaligned.
         // Mirrors inference-flame's `tokenize_t5` (flux1_infer.rs pad-to-512).
-        if ids.len() > T5_MAX_LEN { ids.truncate(T5_MAX_LEN); }
-        while ids.len() < T5_MAX_LEN { ids.push(0); }
+        if ids.len() > T5_MAX_LEN {
+            ids.truncate(T5_MAX_LEN);
+        }
+        while ids.len() < T5_MAX_LEN {
+            ids.push(0);
+        }
         Ok(t5.encode(&ids)?)
     };
     let encode_clip = |text: &str| -> anyhow::Result<Tensor> {
-        let e = clip_tok.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let e = clip_tok
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let ids: Vec<i32> = e.get_ids().iter().map(|&x| x as i32).collect();
         let (_h, pool) = clip.encode(&ids)?;
         Ok(pool)
@@ -160,7 +206,8 @@ fn main() -> anyhow::Result<()> {
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
-            content.lines()
+            content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
@@ -184,12 +231,19 @@ fn main() -> anyhow::Result<()> {
     // T5 / CLIP encoders return F32 by default; flux's DiT layer_norm is
     // strict-BF16. Cast at the boundary before passing into the model.
     // Encode all prompts while T5 + CLIP are resident, then drop them.
-    let conds: Vec<(Tensor, Tensor)> = prompts.iter().enumerate()
+    let conds: Vec<(Tensor, Tensor)> = prompts
+        .iter()
+        .enumerate()
         .map(|(i, p)| {
             let t5 = encode_t5(p)?.to_dtype(DType::BF16)?;
             let cl = encode_clip(p)?.to_dtype(DType::BF16)?;
-            log::info!("  prompt {}/{}: t5={:?} clip={:?}",
-                i + 1, prompts.len(), t5.shape().dims(), cl.shape().dims());
+            log::info!(
+                "  prompt {}/{}: t5={:?} clip={:?}",
+                i + 1,
+                prompts.len(),
+                t5.shape().dims(),
+                cl.shape().dims()
+            );
             Ok((t5, cl))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -239,7 +293,12 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(lp) = &args.lora_path {
         model.load_weights(lp.to_str().unwrap())?;
-        log::info!("  Applied LoRA from {:?} (rank={}, alpha={})", lp, args.lora_rank, args.lora_alpha);
+        log::info!(
+            "  Applied LoRA from {:?} (rank={}, alpha={})",
+            lp,
+            args.lora_rank,
+            args.lora_alpha
+        );
     }
     if args.offload {
         model.enable_offload(shards.clone())?;
@@ -271,9 +330,11 @@ fn main() -> anyhow::Result<()> {
             // (1)
             {
                 let mut g = off_arc.lock().unwrap();
-                let arc1 = g.ensure_block(0)
+                let arc1 = g
+                    .ensure_block(0)
                     .map_err(|e| anyhow::anyhow!("probe ensure_block(0)#1: {e}"))?;
-                let t1 = arc1.get(target_key)
+                let t1 = arc1
+                    .get(target_key)
                     .ok_or_else(|| anyhow::anyhow!("probe: missing {target_key}"))?;
                 stats(t1, "1: ensure_block(0)")?;
                 g.evict_block();
@@ -281,9 +342,11 @@ fn main() -> anyhow::Result<()> {
             // (2)
             {
                 let mut g = off_arc.lock().unwrap();
-                let arc2 = g.ensure_block(0)
+                let arc2 = g
+                    .ensure_block(0)
                     .map_err(|e| anyhow::anyhow!("probe ensure_block(0)#2: {e}"))?;
-                let t2 = arc2.get(target_key)
+                let t2 = arc2
+                    .get(target_key)
                     .ok_or_else(|| anyhow::anyhow!("probe: missing {target_key} on second call"))?;
                 stats(t2, "2: ensure_block(0) again")?;
                 g.evict_block();
@@ -291,9 +354,10 @@ fn main() -> anyhow::Result<()> {
             // (3) direct load — find the shard containing this key
             let prefix = "double_blocks.0.";
             for shard in &shards {
-                let part = flame_core::serialization::load_file_filtered(
-                    shard, &device, |k| k.starts_with(prefix),
-                ).map_err(|e| anyhow::anyhow!("probe direct load: {e}"))?;
+                let part = flame_core::serialization::load_file_filtered(shard, &device, |k| {
+                    k.starts_with(prefix)
+                })
+                .map_err(|e| anyhow::anyhow!("probe direct load: {e}"))?;
                 if let Some(t3) = part.get(target_key) {
                     let t3_bf16 = t3.to_dtype(flame_core::DType::BF16)?;
                     stats(&t3_bf16, "3: serialization::load_file_filtered")?;
@@ -304,13 +368,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── 3. Denoise — once per prompt, all latents collected ──
-    log::info!("[3/4] Denoising {} prompt(s) × {} steps...", conds.len(), args.steps);
+    log::info!(
+        "[3/4] Denoising {} prompt(s) × {} steps...",
+        conds.len(),
+        args.steps
+    );
     let sigmas = flux_sampler::schedule(args.steps, args.size, args.size);
 
-    let img_ids = flux_sampler::build_img_ids(h_tok, w_tok, device.clone())?
-        .to_dtype(DType::BF16)?;
-    let txt_ids = flux_sampler::build_txt_ids(T5_MAX_LEN, device.clone())?
-        .to_dtype(DType::BF16)?;
+    let img_ids =
+        flux_sampler::build_img_ids(h_tok, w_tok, device.clone())?.to_dtype(DType::BF16)?;
+    let txt_ids = flux_sampler::build_txt_ids(T5_MAX_LEN, device.clone())?.to_dtype(DType::BF16)?;
 
     let pad_width = std::cmp::max(3, conds.len().to_string().len());
     let mut latents: Vec<Tensor> = Vec::with_capacity(conds.len());
@@ -322,8 +389,9 @@ fn main() -> anyhow::Result<()> {
         // a diverse batch (idx 0 uses seed, idx 1 uses seed+1, ...).
         flame_core::rng::set_seed(args.seed.wrapping_add(idx as u64))
             .map_err(|e| anyhow::anyhow!("flame_core set_seed: {e}"))?;
-        let mut latent = Tensor::randn(Shape::from_dims(&[1, n_img, 64]), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        let mut latent =
+            Tensor::randn(Shape::from_dims(&[1, n_img, 64]), 0.0, 1.0, device.clone())?
+                .to_dtype(DType::BF16)?;
 
         for step in 0..args.steps {
             let s = sigmas[step];
@@ -341,14 +409,22 @@ fn main() -> anyhow::Result<()> {
             // the prediction without improving sample quality.
             let ctx_cond = vec![cond_t5.clone(), img_ids.clone(), txt_ids.clone()];
             let pred_cond = <FluxModel as TrainableModel>::forward(
-                &mut model, &latent, &t_tensor, &ctx_cond, Some(cond_clip),
+                &mut model,
+                &latent,
+                &t_tensor,
+                &ctx_cond,
+                Some(cond_clip),
             )?;
             let pred = if cfg_enabled {
                 let ut5 = uncond_t5.as_ref().unwrap();
                 let uclip = uncond_clip.as_ref().unwrap();
                 let ctx_uncond = vec![ut5.clone(), img_ids.clone(), txt_ids.clone()];
                 let pred_uncond = <FluxModel as TrainableModel>::forward(
-                    &mut model, &latent, &t_tensor, &ctx_uncond, Some(uclip),
+                    &mut model,
+                    &latent,
+                    &t_tensor,
+                    &ctx_uncond,
+                    Some(uclip),
                 )?;
                 pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(args.cfg)?)?
             } else {
@@ -357,8 +433,14 @@ fn main() -> anyhow::Result<()> {
 
             latent = flux_sampler::euler_step(&latent, &pred, s, s_next)?;
             if step % 5 == 0 || step == args.steps - 1 {
-                log::info!("    prompt {}/{} step {}/{} sigma={:.4}",
-                    idx + 1, conds.len(), step + 1, args.steps, s);
+                log::info!(
+                    "    prompt {}/{} step {}/{} sigma={:.4}",
+                    idx + 1,
+                    conds.len(),
+                    step + 1,
+                    args.steps,
+                    s
+                );
             }
         }
         latents.push(latent);
@@ -390,8 +472,13 @@ fn main() -> anyhow::Result<()> {
         let var: f32 = lat_f32.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
         let mn = lat_f32.iter().cloned().fold(f32::INFINITY, f32::min);
         let mx = lat_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        log::info!("  packed latent stats: mean={:.4} std={:.4} min={:.4} max={:.4}",
-            mean, var.sqrt(), mn, mx);
+        log::info!(
+            "  packed latent stats: mean={:.4} std={:.4} min={:.4} max={:.4}",
+            mean,
+            var.sqrt(),
+            mn,
+            mx
+        );
 
         let unpacked = flux_sampler::unpack_latents(latent, h_tok, w_tok)?;
         // Audit fix FLUX_VERIFY §H2 / SKEPTIC §H2: BFL decode is `raw = scaled /
@@ -400,30 +487,53 @@ fn main() -> anyhow::Result<()> {
 
         let lat2_f32 = latent_for_vae.to_dtype(DType::F32)?.to_vec()?;
         let mean2: f32 = lat2_f32.iter().sum::<f32>() / lat2_f32.len() as f32;
-        let var2: f32 = lat2_f32.iter().map(|v| (v - mean2).powi(2)).sum::<f32>() / lat2_f32.len() as f32;
+        let var2: f32 =
+            lat2_f32.iter().map(|v| (v - mean2).powi(2)).sum::<f32>() / lat2_f32.len() as f32;
         let mn2 = lat2_f32.iter().cloned().fold(f32::INFINITY, f32::min);
         let mx2 = lat2_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        log::info!("  unpacked+unscale stats: mean={:.4} std={:.4} min={:.4} max={:.4}",
-            mean2, var2.sqrt(), mn2, mx2);
+        log::info!(
+            "  unpacked+unscale stats: mean={:.4} std={:.4} min={:.4} max={:.4}",
+            mean2,
+            var2.sqrt(),
+            mn2,
+            mx2
+        );
 
         let img = dec.decode(&latent_for_vae)?;
 
         let img_f32_full = img.to_dtype(DType::F32)?.to_vec()?;
         let m3: f32 = img_f32_full.iter().sum::<f32>() / img_f32_full.len() as f32;
-        let v3: f32 = img_f32_full.iter().map(|v| (v - m3).powi(2)).sum::<f32>() / img_f32_full.len() as f32;
+        let v3: f32 =
+            img_f32_full.iter().map(|v| (v - m3).powi(2)).sum::<f32>() / img_f32_full.len() as f32;
         let mn3 = img_f32_full.iter().cloned().fold(f32::INFINITY, f32::min);
-        let mx3 = img_f32_full.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        log::info!("  decoded RGB stats: mean={:.4} std={:.4} min={:.4} max={:.4}",
-            m3, v3.sqrt(), mn3, mx3);
+        let mx3 = img_f32_full
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        log::info!(
+            "  decoded RGB stats: mean={:.4} std={:.4} min={:.4} max={:.4}",
+            m3,
+            v3.sqrt(),
+            mn3,
+            mx3
+        );
 
         let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
         let dims = img.shape().dims();
-        let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
+        let (c, h, w) = if dims.len() == 4 {
+            (dims[1], dims[2], dims[3])
+        } else {
+            (3, dims[0], dims[1])
+        };
         let mut buf = vec![0u8; c * h * w];
         for y in 0..h {
             for x in 0..w {
                 for ch in 0..c {
-                    let id = if dims.len() == 4 { ch * h * w + y * w + x } else { y * w * c + x * c + ch };
+                    let id = if dims.len() == 4 {
+                        ch * h * w + y * w + x
+                    } else {
+                        y * w * c + x * c + ch
+                    };
                     let v = pixels.get(id).copied().unwrap_or(0.0);
                     buf[y * w * c + x * c + ch] = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
                 }
@@ -431,7 +541,11 @@ fn main() -> anyhow::Result<()> {
         }
         let out_path = if multi_mode {
             let dir = args.output_dir.as_ref().unwrap();
-            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+            dir.join(format!(
+                "sample_{:0>width$}.png",
+                idx + 1,
+                width = pad_width
+            ))
         } else {
             args.output.clone()
         };

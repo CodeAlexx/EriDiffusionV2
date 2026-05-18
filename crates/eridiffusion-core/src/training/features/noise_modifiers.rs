@@ -56,8 +56,8 @@ pub fn maybe_apply_offset_noise(
         2 => Shape::from_dims(&[dims[0], dims[1]]),
         _ => return Ok(noise.clone()),
     };
-    let offset = Tensor::randn(per_channel_shape, 0.0, 1.0, noise.device().clone())?
-        .mul_scalar(weight)?;
+    let offset =
+        Tensor::randn(per_channel_shape, 0.0, 1.0, noise.device().clone())?.mul_scalar(weight)?;
     let offset = offset.to_dtype(noise.dtype())?;
     let broadcast = offset.broadcast_to(noise.shape())?;
     noise.add(&broadcast)
@@ -117,9 +117,8 @@ pub fn maybe_apply_multires_noise(
         return Ok(noise.clone());
     }
     let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
-    let upsampler = Upsample2d::new(
-        Upsample2dConfig::new(UpsampleMode::Bilinear).with_size((h, w)),
-    );
+    let upsampler =
+        Upsample2d::new(Upsample2dConfig::new(UpsampleMode::Bilinear).with_size((h, w)));
     let mut out = noise.clone();
     for k in 1..=levels {
         let scale = 1usize << k;
@@ -145,12 +144,7 @@ pub fn maybe_apply_multires_noise(
 // ── Legacy skeleton names (Phase 0 callers) ─────────────────────────────────
 
 /// Legacy skeleton name — forwards to [`maybe_apply_offset_noise`].
-pub fn offset_noise(
-    noise: &Tensor,
-    weight: f32,
-    prob: f32,
-    rng: &mut StdRng,
-) -> Result<Tensor> {
+pub fn offset_noise(noise: &Tensor, weight: f32, prob: f32, rng: &mut StdRng) -> Result<Tensor> {
     maybe_apply_offset_noise(noise, weight, prob, rng)
 }
 

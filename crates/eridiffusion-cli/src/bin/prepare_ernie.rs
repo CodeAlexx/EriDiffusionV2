@@ -1,26 +1,37 @@
 //! prepare_ernie — image+caption → cached latents+embeddings for Ernie LoRA training.
 use clap::Parser;
+use eridiffusion_core::encoders::{mistral3b::Mistral3bEncoder, vae::KleinVaeEncoder};
 use flame_core::{serialization::save_file, DType, Shape, Tensor};
-use eridiffusion_core::encoders::{vae::KleinVaeEncoder, mistral3b::Mistral3bEncoder};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] input_dir: PathBuf,
-    #[arg(long)] output_dir: PathBuf,
-    #[arg(long)] vae_ckpt: PathBuf,
-    #[arg(long)] text_ckpt: PathBuf,
-    #[arg(long)] tokenizer_path: PathBuf,
-    #[arg(long, default_value = "128")] size: usize,
-    #[arg(long)] skip_existing: bool,
+    #[arg(long)]
+    input_dir: PathBuf,
+    #[arg(long)]
+    output_dir: PathBuf,
+    #[arg(long)]
+    vae_ckpt: PathBuf,
+    #[arg(long)]
+    text_ckpt: PathBuf,
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    #[arg(long, default_value = "128")]
+    size: usize,
+    #[arg(long)]
+    skip_existing: bool,
     /// Image augmentations at prep time. All default-off → byte-identical
     /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
     /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
     /// seeds the per-sample RNG.
-    #[arg(long, default_value_t = false)] aug_flip: bool,
-    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
-    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
-    #[arg(long, default_value_t = 0)] aug_seed: u64,
+    #[arg(long, default_value_t = false)]
+    aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)]
+    aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)]
+    aug_contrast: f32,
+    #[arg(long, default_value_t = 0)]
+    aug_seed: u64,
 }
 
 /// ERNIE text-encoder pad token id. Matches:
@@ -41,7 +52,9 @@ fn main() -> anyhow::Result<()> {
     // OOM-killing the box around sample 75 on 62 GB. Pool off → flat RSS.
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at this point.
-        unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
+        unsafe {
+            std::env::set_var("FLAME_ALLOC_POOL", "0");
+        }
     }
     env_logger::init();
     let args = Args::parse();
@@ -68,7 +81,10 @@ fn main() -> anyhow::Result<()> {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp") {
                 let stem = path.file_stem().unwrap().to_str().unwrap();
-                pairs.push((path.to_path_buf(), args.input_dir.join(format!("{stem}.txt"))));
+                pairs.push((
+                    path.to_path_buf(),
+                    args.input_dir.join(format!("{stem}.txt")),
+                ));
             }
         }
     }
@@ -82,7 +98,10 @@ fn main() -> anyhow::Result<()> {
     if aug_cfg.is_active() {
         log::info!(
             "[image-aug] flip={} brightness={} contrast={} seed={}",
-            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+            aug_cfg.flip,
+            aug_cfg.brightness,
+            aug_cfg.contrast,
+            args.aug_seed
         );
     }
 
@@ -90,11 +109,17 @@ fn main() -> anyhow::Result<()> {
     for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
-        if args.skip_existing && out_path.exists() { continue; }
+        if args.skip_existing && out_path.exists() {
+            continue;
+        }
 
         // Image → VAE latent
         let img = image::open(img_path)?
-            .resize_exact(args.size as u32, args.size as u32, image::imageops::FilterType::Lanczos3)
+            .resize_exact(
+                args.size as u32,
+                args.size as u32,
+                image::imageops::FilterType::Lanczos3,
+            )
             .to_rgb32f();
         let mut img = img;
         if aug_cfg.is_active() {
@@ -115,7 +140,9 @@ fn main() -> anyhow::Result<()> {
         let mut pixels = vec![0f32; 3 * hu * wu];
         for (x, y, p) in img.enumerate_pixels() {
             let (xu, yu) = (x as usize, y as usize);
-            for c in 0..3 { pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0; }
+            for c in 0..3 {
+                pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0;
+            }
         }
         let img_t = Tensor::from_vec(pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone())?
             .to_dtype(DType::BF16)?;
@@ -134,14 +161,19 @@ fn main() -> anyhow::Result<()> {
         // safe to corrupt). Without BOS, the FIRST CONTENT TOKEN (e.g. "box")
         // becomes the sink and gets a 996-magnitude spike on dim 0, corrupting
         // identity-bearing conditioning. sample_ernie uses true; this MUST match.
-        let encoding = tokenizer.encode(caption.trim(), true)
+        let encoding = tokenizer
+            .encode(caption.trim(), true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
         let mut ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
 
         // Pad/truncate to upstream Python PROMPT_MAX_LENGTH = 512.
-        if ids.len() > ERNIE_MAX_LEN { ids.truncate(ERNIE_MAX_LEN); }
-        let real_len = ids.len();  // post-truncate, pre-pad: real token count
-        while ids.len() < ERNIE_MAX_LEN { ids.push(pad_id); }
+        if ids.len() > ERNIE_MAX_LEN {
+            ids.truncate(ERNIE_MAX_LEN);
+        }
+        let real_len = ids.len(); // post-truncate, pre-pad: real token count
+        while ids.len() < ERNIE_MAX_LEN {
+            ids.push(pad_id);
+        }
 
         // Encode with explicit pad_id so padded positions get the proper PAD
         // embedding row (and the encoder's causal mask zeroes them out).

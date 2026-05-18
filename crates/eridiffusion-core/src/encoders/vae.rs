@@ -26,9 +26,9 @@
 //! Weight key format: diffusers-style (decoder.up_blocks.{n}.resnets.{m}.*, etc.)
 
 use flame_core::conv::Conv2d;
+use flame_core::device::Device;
 use flame_core::group_norm::GroupNorm;
 use flame_core::linear::Linear;
-use flame_core::device::Device;
 use flame_core::{CudaDevice, DType, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,7 +82,14 @@ fn load_gn(
     channels: usize,
     device: &CudaArc,
 ) -> Result<GroupNorm> {
-    let mut gn = GroupNorm::new(NORM_GROUPS, channels, NORM_EPS, true, DType::BF16, device.clone())?;
+    let mut gn = GroupNorm::new(
+        NORM_GROUPS,
+        channels,
+        NORM_EPS,
+        true,
+        DType::BF16,
+        device.clone(),
+    )?;
     let w = get_weight(weights, &format!("{prefix}.weight"))?.to_dtype(DType::BF16)?;
     let b = get_weight(weights, &format!("{prefix}.bias"))?.to_dtype(DType::BF16)?;
     gn.weight = Some(w);
@@ -130,9 +137,27 @@ impl ResBlock {
         device: &CudaArc,
     ) -> Result<Self> {
         let norm1 = load_gn(weights, &format!("{prefix}.norm1"), in_ch, device)?;
-        let conv1 = load_conv(weights, &format!("{prefix}.conv1"), in_ch, out_ch, 3, 1, 1, device)?;
+        let conv1 = load_conv(
+            weights,
+            &format!("{prefix}.conv1"),
+            in_ch,
+            out_ch,
+            3,
+            1,
+            1,
+            device,
+        )?;
         let norm2 = load_gn(weights, &format!("{prefix}.norm2"), out_ch, device)?;
-        let conv2 = load_conv(weights, &format!("{prefix}.conv2"), out_ch, out_ch, 3, 1, 1, device)?;
+        let conv2 = load_conv(
+            weights,
+            &format!("{prefix}.conv2"),
+            out_ch,
+            out_ch,
+            3,
+            1,
+            1,
+            device,
+        )?;
 
         let shortcut_key = format!("{prefix}.conv_shortcut.weight");
         let conv_shortcut = if weights.contains_key(&shortcut_key) {
@@ -150,7 +175,13 @@ impl ResBlock {
             None
         };
 
-        Ok(Self { norm1, conv1, norm2, conv2, conv_shortcut })
+        Ok(Self {
+            norm1,
+            conv1,
+            norm2,
+            conv2,
+            conv_shortcut,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -194,12 +225,43 @@ impl AttnBlock {
         device: &CudaArc,
     ) -> Result<Self> {
         let group_norm = load_gn(weights, &format!("{prefix}.group_norm"), channels, device)?;
-        let to_q = load_linear(weights, &format!("{prefix}.to_q"), channels, channels, device)?;
-        let to_k = load_linear(weights, &format!("{prefix}.to_k"), channels, channels, device)?;
-        let to_v = load_linear(weights, &format!("{prefix}.to_v"), channels, channels, device)?;
-        let to_out = load_linear(weights, &format!("{prefix}.to_out.0"), channels, channels, device)?;
+        let to_q = load_linear(
+            weights,
+            &format!("{prefix}.to_q"),
+            channels,
+            channels,
+            device,
+        )?;
+        let to_k = load_linear(
+            weights,
+            &format!("{prefix}.to_k"),
+            channels,
+            channels,
+            device,
+        )?;
+        let to_v = load_linear(
+            weights,
+            &format!("{prefix}.to_v"),
+            channels,
+            channels,
+            device,
+        )?;
+        let to_out = load_linear(
+            weights,
+            &format!("{prefix}.to_out.0"),
+            channels,
+            channels,
+            device,
+        )?;
 
-        Ok(Self { group_norm, to_q, to_k, to_v, to_out, channels })
+        Ok(Self {
+            group_norm,
+            to_q,
+            to_k,
+            to_v,
+            to_out,
+            channels,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -227,7 +289,9 @@ impl AttnBlock {
         let out = self.to_out.forward(&out)?; // [B, N, C]
 
         // [B, N, C] → [B, H, W, C] → [B, C, H, W]
-        let out = out.reshape(&[b, height, width, c])?.permute(&[0, 3, 1, 2])?;
+        let out = out
+            .reshape(&[b, height, width, c])?
+            .permute(&[0, 3, 1, 2])?;
 
         x.add(&out)
     }
@@ -251,10 +315,26 @@ impl MidBlock {
         channels: usize,
         device: &CudaArc,
     ) -> Result<Self> {
-        let resnet0 = ResBlock::load(weights, &format!("{prefix}.resnets.0"), channels, channels, device)?;
+        let resnet0 = ResBlock::load(
+            weights,
+            &format!("{prefix}.resnets.0"),
+            channels,
+            channels,
+            device,
+        )?;
         let attn = AttnBlock::load(weights, &format!("{prefix}.attentions.0"), channels, device)?;
-        let resnet1 = ResBlock::load(weights, &format!("{prefix}.resnets.1"), channels, channels, device)?;
-        Ok(Self { resnet0, attn, resnet1 })
+        let resnet1 = ResBlock::load(
+            weights,
+            &format!("{prefix}.resnets.1"),
+            channels,
+            channels,
+            device,
+        )?;
+        Ok(Self {
+            resnet0,
+            attn,
+            resnet1,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -314,7 +394,10 @@ impl UpBlock {
             None
         };
 
-        Ok(Self { resnets, upsample_conv })
+        Ok(Self {
+            resnets,
+            upsample_conv,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -370,8 +453,8 @@ pub fn unpatchify_latents(latents: &Tensor) -> Result<Tensor> {
 pub struct KleinVaeDecoder {
     /// BatchNorm running stats for inverse normalization (BFL latent space).
     /// `inv_normalize(z) = z * sqrt(running_var + eps) + running_mean`
-    bn_scale: Tensor,  // sqrt(running_var + eps), [128] BF16
-    bn_bias: Tensor,   // running_mean, [128] BF16
+    bn_scale: Tensor, // sqrt(running_var + eps), [128] BF16
+    bn_bias: Tensor, // running_mean, [128] BF16
     post_quant_conv: Conv2d,
     conv_in: Conv2d,
     mid_block: MidBlock,
@@ -410,10 +493,28 @@ impl KleinVaeDecoder {
         };
 
         // post_quant_conv: Conv2d(32, 32, 1) — 1x1 on latent space
-        let post_quant_conv = load_conv(weights, "post_quant_conv", LATENT_CH, LATENT_CH, 1, 1, 0, &cuda)?;
+        let post_quant_conv = load_conv(
+            weights,
+            "post_quant_conv",
+            LATENT_CH,
+            LATENT_CH,
+            1,
+            1,
+            0,
+            &cuda,
+        )?;
 
         // conv_in: Conv2d(32, 512, 3, pad=1)
-        let conv_in = load_conv(weights, "decoder.conv_in", LATENT_CH, top_ch, 3, 1, 1, &cuda)?;
+        let conv_in = load_conv(
+            weights,
+            "decoder.conv_in",
+            LATENT_CH,
+            top_ch,
+            3,
+            1,
+            1,
+            &cuda,
+        )?;
 
         // mid block: ResBlock(512) + Attention(512) + ResBlock(512)
         let mid_block = MidBlock::load(weights, "decoder.mid_block", top_ch, &cuda)?;
@@ -546,13 +647,7 @@ const ENCODER_BLOCK_CHANNELS: [usize; 4] = [128, 256, 512, 512];
 const ENCODER_LAYERS_PER_BLOCK: usize = 2;
 
 /// Pad an NCHW tensor with zeros: `(left, right, top, bottom)`.
-fn pad2d_zeros(
-    x: &Tensor,
-    left: usize,
-    right: usize,
-    top: usize,
-    bottom: usize,
-) -> Result<Tensor> {
+fn pad2d_zeros(x: &Tensor, left: usize, right: usize, top: usize, bottom: usize) -> Result<Tensor> {
     if left == 0 && right == 0 && top == 0 && bottom == 0 {
         return Ok(x.clone());
     }
@@ -570,38 +665,24 @@ fn pad2d_zeros(
     // Pad width first (left/right) along axis 3.
     let mut current = x.clone();
     if left > 0 {
-        let zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, c, h, left]),
-            dtype,
-            device.clone(),
-        )?;
+        let zeros = Tensor::zeros_dtype(Shape::from_dims(&[b, c, h, left]), dtype, device.clone())?;
         current = Tensor::cat(&[&zeros, &current], 3)?;
     }
     if right > 0 {
-        let zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, c, h, right]),
-            dtype,
-            device.clone(),
-        )?;
+        let zeros =
+            Tensor::zeros_dtype(Shape::from_dims(&[b, c, h, right]), dtype, device.clone())?;
         current = Tensor::cat(&[&current, &zeros], 3)?;
     }
 
     // Then pad height (top/bottom) along axis 2.
     let new_w = w + left + right;
     if top > 0 {
-        let zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, c, top, new_w]),
-            dtype,
-            device.clone(),
-        )?;
+        let zeros =
+            Tensor::zeros_dtype(Shape::from_dims(&[b, c, top, new_w]), dtype, device.clone())?;
         current = Tensor::cat(&[&zeros, &current], 2)?;
     }
     if bottom > 0 {
-        let zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, c, bottom, new_w]),
-            dtype,
-            device,
-        )?;
+        let zeros = Tensor::zeros_dtype(Shape::from_dims(&[b, c, bottom, new_w]), dtype, device)?;
         current = Tensor::cat(&[&current, &zeros], 2)?;
     }
     Ok(current)
@@ -807,11 +888,8 @@ impl KleinVaeEncoder {
         let scale_f32 = var.add_scalar(bn_eps)?.sqrt()?;
         let scale_vec: Vec<f32> = scale_f32.to_vec()?;
         let inv_scale_vec: Vec<f32> = scale_vec.into_iter().map(|s| 1.0 / s).collect();
-        let inv_scale_f32 = Tensor::from_vec(
-            inv_scale_vec,
-            scale_f32.shape().clone(),
-            cuda.clone(),
-        )?;
+        let inv_scale_f32 =
+            Tensor::from_vec(inv_scale_vec, scale_f32.shape().clone(), cuda.clone())?;
         let neg_mean_f32 = mean.mul_scalar(-1.0f32)?;
         let bn_inv_scale = inv_scale_f32.to_dtype(DType::BF16)?;
         let bn_neg_mean = neg_mean_f32.to_dtype(DType::BF16)?;
@@ -870,11 +948,7 @@ impl KleinVaeEncoder {
 
     /// Same as `encode()` but dumps every intermediate activation to a safetensors
     /// file in `dump_dir`. Used for VAE-parity bisection vs diffusers.
-    pub fn encode_with_dump(
-        &self,
-        image: &Tensor,
-        dump_dir: &std::path::Path,
-    ) -> Result<Tensor> {
+    pub fn encode_with_dump(&self, image: &Tensor, dump_dir: &std::path::Path) -> Result<Tensor> {
         std::fs::create_dir_all(dump_dir).ok();
         let dump = |name: &str, t: &Tensor| {
             let mut h = HashMap::new();
@@ -902,7 +976,9 @@ impl KleinVaeEncoder {
             let qh = qc.forward(&h)?;
             dump("07_after_quant_conv", &qh);
             qh
-        } else { h };
+        } else {
+            h
+        };
         let mu = h.narrow(1, 0, LATENT_CH)?;
         dump("08_mu", &mu);
         let z = patchify_latents(&mu)?;
@@ -959,12 +1035,7 @@ mod tests {
     fn test_unpatchify_passthrough_32ch() {
         // 32-channel input should pass through unchanged
         let device = CudaDevice::new(0).unwrap();
-        let t = Tensor::zeros_dtype(
-            Shape::from_dims(&[1, 32, 8, 8]),
-            DType::BF16,
-            device,
-        )
-        .unwrap();
+        let t = Tensor::zeros_dtype(Shape::from_dims(&[1, 32, 8, 8]), DType::BF16, device).unwrap();
         let out = unpatchify_latents(&t).unwrap();
         assert_eq!(out.shape().dims(), &[1, 32, 8, 8]);
     }
@@ -973,12 +1044,8 @@ mod tests {
     fn test_unpatchify_128ch() {
         // 128-channel [1, 128, 4, 4] → [1, 32, 8, 8]
         let device = CudaDevice::new(0).unwrap();
-        let t = Tensor::zeros_dtype(
-            Shape::from_dims(&[1, 128, 4, 4]),
-            DType::BF16,
-            device,
-        )
-        .unwrap();
+        let t =
+            Tensor::zeros_dtype(Shape::from_dims(&[1, 128, 4, 4]), DType::BF16, device).unwrap();
         let out = unpatchify_latents(&t).unwrap();
         assert_eq!(out.shape().dims(), &[1, 32, 8, 8]);
     }
@@ -986,12 +1053,7 @@ mod tests {
     #[test]
     fn test_unpatchify_rejects_64ch() {
         let device = CudaDevice::new(0).unwrap();
-        let t = Tensor::zeros_dtype(
-            Shape::from_dims(&[1, 64, 4, 4]),
-            DType::BF16,
-            device,
-        )
-        .unwrap();
+        let t = Tensor::zeros_dtype(Shape::from_dims(&[1, 64, 4, 4]), DType::BF16, device).unwrap();
         assert!(unpatchify_latents(&t).is_err());
     }
 

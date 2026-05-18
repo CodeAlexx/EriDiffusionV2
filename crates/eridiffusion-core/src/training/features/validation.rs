@@ -33,10 +33,7 @@ impl ValidationLoop {
     /// skip eval).
     pub fn new(dir: &Path, every_steps: u64) -> Result<Self> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
-            crate::EriDiffusionError::Data(format!(
-                "validation dir {}: {e}",
-                dir.display()
-            ))
+            crate::EriDiffusionError::Data(format!("validation dir {}: {e}", dir.display()))
         })?;
         let mut files: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())

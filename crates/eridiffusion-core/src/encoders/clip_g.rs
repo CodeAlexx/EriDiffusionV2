@@ -33,7 +33,9 @@ pub struct ClipGEncoder {
 impl ClipGEncoder {
     /// Construct from a pre-loaded weight HashMap (HF `text_encoder_2/`-style keys).
     pub fn new(weights: HashMap<String, Tensor>, device: Arc<CudaDevice>) -> Self {
-        Self { inner: ClipEncoder::new(weights, ClipConfig::clip_g(), device) }
+        Self {
+            inner: ClipEncoder::new(weights, ClipConfig::clip_g(), device),
+        }
     }
 
     /// SDXL convention: returns `(penultimate_hidden [1, 77, 1280], pooled [1, 1280])`.

@@ -1,7 +1,7 @@
-use std::path::Path;
-use flame_core::{self, autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};
 use eridiffusion_core::models::ErnieModel;
+use flame_core::{self, autograd::AutogradContext, DType, Shape, Tensor};
+use std::path::Path;
 
 #[test]
 fn ernie_real_latents() {
@@ -26,7 +26,11 @@ fn ernie_real_latents() {
 
     let t = 0.5;
     let noise = Tensor::randn(latent.shape().clone(), 0.0, 0.01, device.clone()).unwrap();
-    let noisy = latent.mul_scalar(1.0 - t).unwrap().add(&noise.mul_scalar(t).unwrap()).unwrap();
+    let noisy = latent
+        .mul_scalar(1.0 - t)
+        .unwrap()
+        .add(&noise.mul_scalar(t).unwrap())
+        .unwrap();
     let txt = Tensor::zeros(Shape::from_dims(&[1, 77, 3072]), device.clone()).unwrap();
     let timestep = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone()).unwrap();
 
@@ -39,13 +43,19 @@ fn ernie_real_latents() {
     let loss = diff.square().unwrap().mean().unwrap();
     let loss_val = loss.to_dtype(DType::F32).unwrap().to_vec().unwrap()[0];
     println!("Loss: {:.6}", loss_val);
-    assert!(loss_val.is_finite() && loss_val < 10000.0, "Loss bad: {}", loss_val);
+    assert!(
+        loss_val.is_finite() && loss_val < 10000.0,
+        "Loss bad: {}",
+        loss_val
+    );
 
     let grads = loss.backward().unwrap();
     let mut nan = 0;
     for (_, g) in grads.iter() {
         for x in g.to_dtype(DType::F32).unwrap().to_vec().unwrap() {
-            if x.is_nan() { nan += 1; }
+            if x.is_nan() {
+                nan += 1;
+            }
         }
     }
     println!("Grads: {} total, {} NaN", grads.len(), nan);

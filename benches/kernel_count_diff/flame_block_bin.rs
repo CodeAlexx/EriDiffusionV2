@@ -32,10 +32,7 @@
 #![cfg(feature = "cuda")]
 
 use flame_core::{
-    autograd::AutogradContext,
-    global_cuda_device,
-    serialization::load_file,
-    DType, Result, Tensor,
+    autograd::AutogradContext, global_cuda_device, serialization::load_file, DType, Result, Tensor,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -77,11 +74,7 @@ fn rms_norm(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     flame_core::norm::rms_norm(x, &[last], Some(w), EPS)
 }
 
-fn block_forward(
-    x: &Tensor,
-    y: &Tensor,
-    weights: &HashMap<String, Tensor>,
-) -> Result<Tensor> {
+fn block_forward(x: &Tensor, y: &Tensor, weights: &HashMap<String, Tensor>) -> Result<Tensor> {
     let w_norm1 = &weights["w_norm1"];
     let w_norm2 = &weights["w_norm2"];
     let w_qkv = &weights["w_qkv"];
@@ -91,15 +84,21 @@ fn block_forward(
 
     // --- attention ---
     let h = rms_norm(x, w_norm1)?;
-    let qkv = linear3d(&h, w_qkv)?;            // [B, seq, 3H]
+    let qkv = linear3d(&h, w_qkv)?; // [B, seq, 3H]
     let qkv_chunks = qkv.chunk(3, 2)?;
     let q = qkv_chunks[0].clone();
     let k = qkv_chunks[1].clone();
     let v = qkv_chunks[2].clone();
 
-    let q = q.reshape(&[B, SEQ, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let k = k.reshape(&[B, SEQ, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let v = v.reshape(&[B, SEQ, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+    let q = q
+        .reshape(&[B, SEQ, HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let k = k
+        .reshape(&[B, SEQ, HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let v = v
+        .reshape(&[B, SEQ, HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
 
     let attn = flame_core::attention::sdpa(&q, &k, &v, None)?;
     let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[B, SEQ, HIDDEN])?;
@@ -126,9 +125,18 @@ fn parse_args() -> (PathBuf, usize, usize) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--inputs" => { inputs = PathBuf::from(&args[i + 1]); i += 2; }
-            "--steps" => { steps = args[i + 1].parse().expect("--steps"); i += 2; }
-            "--warmup" => { warmup = args[i + 1].parse().expect("--warmup"); i += 2; }
+            "--inputs" => {
+                inputs = PathBuf::from(&args[i + 1]);
+                i += 2;
+            }
+            "--steps" => {
+                steps = args[i + 1].parse().expect("--steps");
+                i += 2;
+            }
+            "--warmup" => {
+                warmup = args[i + 1].parse().expect("--warmup");
+                i += 2;
+            }
             _ => i += 1,
         }
     }
@@ -160,7 +168,10 @@ fn main() -> Result<()> {
     // leaves with requires_grad=false; we promote them.
     let mut weights: HashMap<String, Tensor> = HashMap::new();
     for k in ["w_norm1", "w_norm2", "w_qkv", "w_o", "w_mlp1", "w_mlp2"] {
-        let t = raw.get(k).unwrap_or_else(|| panic!("missing weight {k}")).clone();
+        let t = raw
+            .get(k)
+            .unwrap_or_else(|| panic!("missing weight {k}"))
+            .clone();
         weights.insert(k.to_string(), t.requires_grad_(true));
     }
     let x = raw.get("x").unwrap().clone().requires_grad_(true);
@@ -198,7 +209,12 @@ fn main() -> Result<()> {
         let mut sorted = measured.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let med = sorted[sorted.len() / 2];
-        println!("\nmedian measured step (steps {}..{}): {:.2} ms", warmup, steps - 1, med);
+        println!(
+            "\nmedian measured step (steps {}..{}): {:.2} ms",
+            warmup,
+            steps - 1,
+            med
+        );
     }
     println!("total measured steps: {}", measured.len());
     println!("warmup steps: {}", warmup);

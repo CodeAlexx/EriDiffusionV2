@@ -22,10 +22,7 @@
 #![cfg(feature = "cuda")]
 
 use flame_core::{
-    autograd::AutogradContext,
-    global_cuda_device,
-    serialization::load_file,
-    DType, Result, Tensor,
+    autograd::AutogradContext, global_cuda_device, serialization::load_file, DType, Result, Tensor,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -251,16 +248,41 @@ fn main() -> Result<()> {
         let x = get(&format!("x_bf16_{label}"));
         let y = get(&format!("y_bf16_{label}"));
         let shape = x.shape().dims().to_vec();
-        record_op(&mut results, &format!("silu/{label}"), &shape, "bf16",
-            time_op("silu", || x.silu()));
-        record_op(&mut results, &format!("gelu/{label}"), &shape, "bf16",
-            time_op("gelu", || x.gelu()));
-        record_op(&mut results, &format!("add/{label}"),  &shape, "bf16",
-            time_op("add",  || x.add(&y)));
-        record_op(&mut results, &format!("mul/{label}"),  &shape, "bf16",
-            time_op("mul",  || x.mul(&y)));
-        record_op(&mut results, &format!("mul_scalar/{label}"), &shape, "bf16",
-            time_op("mul_scalar", || x.mul_scalar(0.5)));
+        record_op(
+            &mut results,
+            &format!("silu/{label}"),
+            &shape,
+            "bf16",
+            time_op("silu", || x.silu()),
+        );
+        record_op(
+            &mut results,
+            &format!("gelu/{label}"),
+            &shape,
+            "bf16",
+            time_op("gelu", || x.gelu()),
+        );
+        record_op(
+            &mut results,
+            &format!("add/{label}"),
+            &shape,
+            "bf16",
+            time_op("add", || x.add(&y)),
+        );
+        record_op(
+            &mut results,
+            &format!("mul/{label}"),
+            &shape,
+            "bf16",
+            time_op("mul", || x.mul(&y)),
+        );
+        record_op(
+            &mut results,
+            &format!("mul_scalar/{label}"),
+            &shape,
+            "bf16",
+            time_op("mul_scalar", || x.mul_scalar(0.5)),
+        );
     }
 
     // ── Tier 2: reductions ────────────────────────────────────────────────
@@ -268,13 +290,28 @@ fn main() -> Result<()> {
     for label in ["small", "hot", "large"] {
         let x = get(&format!("x_bf16_{label}"));
         let shape = x.shape().dims().to_vec();
-        record_op(&mut results, &format!("sum_full/{label}"), &shape, "bf16",
-            time_op("sum_full", || x.sum()));
+        record_op(
+            &mut results,
+            &format!("sum_full/{label}"),
+            &shape,
+            "bf16",
+            time_op("sum_full", || x.sum()),
+        );
         let last_dim = shape.len() - 1;
-        record_op(&mut results, &format!("sum_dim_last/{label}"), &shape, "bf16",
-            time_op("sum_dim_last", || x.sum_dim(last_dim)));
-        record_op(&mut results, &format!("mean_full/{label}"), &shape, "bf16",
-            time_op("mean_full", || x.mean()));
+        record_op(
+            &mut results,
+            &format!("sum_dim_last/{label}"),
+            &shape,
+            "bf16",
+            time_op("sum_dim_last", || x.sum_dim(last_dim)),
+        );
+        record_op(
+            &mut results,
+            &format!("mean_full/{label}"),
+            &shape,
+            "bf16",
+            time_op("mean_full", || x.mean()),
+        );
     }
 
     // ── Tier 3: norms ─────────────────────────────────────────────────────
@@ -285,14 +322,24 @@ fn main() -> Result<()> {
         let b = get(&format!("norm_b_{label}"));
         let shape = x.shape().dims().to_vec();
         let ld = last_dim;
-        record_op(&mut results, &format!("rms_norm/{label}"), &shape, "bf16",
+        record_op(
+            &mut results,
+            &format!("rms_norm/{label}"),
+            &shape,
+            "bf16",
             time_op("rms_norm", || {
                 flame_core::norm::rms_norm(&x, &[ld], Some(&w), 1e-6)
-            }));
-        record_op(&mut results, &format!("layer_norm/{label}"), &shape, "bf16",
+            }),
+        );
+        record_op(
+            &mut results,
+            &format!("layer_norm/{label}"),
+            &shape,
+            "bf16",
             time_op("layer_norm", || {
                 flame_core::layer_norm::layer_norm(&x, &[ld], Some(&w), Some(&b), 1e-5)
-            }));
+            }),
+        );
     }
 
     // ── Tier 4: GEMM ──────────────────────────────────────────────────────
@@ -301,8 +348,13 @@ fn main() -> Result<()> {
     let a = get("gemm_sq_a");
     let bsq = get("gemm_sq_b");
     let shape = a.shape().dims().to_vec();
-    record_op(&mut results, "matmul/sq_4096", &shape, "bf16",
-        time_op("matmul_sq", || a.matmul(&bsq)));
+    record_op(
+        &mut results,
+        "matmul/sq_4096",
+        &shape,
+        "bf16",
+        time_op("matmul_sq", || a.matmul(&bsq)),
+    );
 
     // Rect: x @ w.T   (PyTorch F.linear: out = x @ w.T + b, w is [out,in])
     // flame matmul takes [..., M, K] × [..., K, N] → [..., M, N]. We have
@@ -311,17 +363,27 @@ fn main() -> Result<()> {
     let w_oi = get("gemm_rect_w_oi");
     let bias = get("gemm_rect_bias");
     let shape = x.shape().dims().to_vec();
-    record_op(&mut results, "matmul/rect_4096x2560", &shape, "bf16",
+    record_op(
+        &mut results,
+        "matmul/rect_4096x2560",
+        &shape,
+        "bf16",
         time_op("matmul_rect", || {
             let wt = w_oi.transpose()?.contiguous()?;
             x.matmul(&wt)
-        }));
+        }),
+    );
     // Linear-with-bias via fused_linear3d_native (the actual flame call site
     // for 3D linear in inference paths).
-    record_op(&mut results, "linear_bias/rect_4096x2560", &shape, "bf16",
+    record_op(
+        &mut results,
+        "linear_bias/rect_4096x2560",
+        &shape,
+        "bf16",
         time_op("linear_bias", || {
             flame_core::ops::fused_inference::fused_linear3d_native(&x, &w_oi, Some(&bias))
-        }));
+        }),
+    );
 
     // ── Tier 5: SDPA ──────────────────────────────────────────────────────
     println!("\n[Tier 5] SDPA");
@@ -329,27 +391,44 @@ fn main() -> Result<()> {
     let k = get("attn_k");
     let v = get("attn_v");
     let shape = q.shape().dims().to_vec();
-    record_op(&mut results, "sdpa/qkv_4096_h24_d128", &shape, "bf16",
-        time_op("sdpa", || flame_core::attention::sdpa(&q, &k, &v, None)));
+    record_op(
+        &mut results,
+        "sdpa/qkv_4096_h24_d128",
+        &shape,
+        "bf16",
+        time_op("sdpa", || flame_core::attention::sdpa(&q, &k, &v, None)),
+    );
 
     // ── Tier 6: layout (materialised) ─────────────────────────────────────
     println!("\n[Tier 6] Layout (materialised)");
-    let l3 = get("layout_r3");      // [1, 4096, 2560]
-    let l4 = get("layout_r4");      // [1, 24, 4096, 128]
+    let l3 = get("layout_r3"); // [1, 4096, 2560]
+    let l4 = get("layout_r4"); // [1, 24, 4096, 128]
     let shape = l3.shape().dims().to_vec();
-    record_op(&mut results, "transpose_contig/r3", &shape, "bf16",
+    record_op(
+        &mut results,
+        "transpose_contig/r3",
+        &shape,
+        "bf16",
         time_op("transpose_contig_r3", || {
             // Transpose last-2 dims of a rank-3 tensor — flame doesn't have
             // .transpose(-1,-2) directly so we use transpose_dims(1,2)
             l3.transpose_dims(1, 2)?.contiguous()
-        }));
+        }),
+    );
     let shape = l4.shape().dims().to_vec();
-    record_op(&mut results, "permute_reshape/r4", &shape, "bf16",
+    record_op(
+        &mut results,
+        "permute_reshape/r4",
+        &shape,
+        "bf16",
         time_op("permute_reshape_r4", || {
             // permute([2,0,1,3]) on [1,24,4096,128] → [4096,1,24,128]
             // then materialise + reshape to [4096, 24*128].
-            l4.permute(&[2, 0, 1, 3])?.contiguous()?.reshape(&[4096, 24 * 128])
-        }));
+            l4.permute(&[2, 0, 1, 3])?
+                .contiguous()?
+                .reshape(&[4096, 24 * 128])
+        }),
+    );
 
     // ── Tier 7: cast ──────────────────────────────────────────────────────
     println!("\n[Tier 7] Cast");
@@ -357,10 +436,20 @@ fn main() -> Result<()> {
         let x_bf = get(&format!("x_bf16_{label}"));
         let x_f32 = get(&format!("x_f32_{label}"));
         let shape = x_bf.shape().dims().to_vec();
-        record_op(&mut results, &format!("cast_bf16_to_f32/{label}"), &shape, "bf16->f32",
-            time_op("cast_bf16_f32", || x_bf.to_dtype(DType::F32)));
-        record_op(&mut results, &format!("cast_f32_to_bf16/{label}"), &shape, "f32->bf16",
-            time_op("cast_f32_bf16", || x_f32.to_dtype(DType::BF16)));
+        record_op(
+            &mut results,
+            &format!("cast_bf16_to_f32/{label}"),
+            &shape,
+            "bf16->f32",
+            time_op("cast_bf16_f32", || x_bf.to_dtype(DType::F32)),
+        );
+        record_op(
+            &mut results,
+            &format!("cast_f32_to_bf16/{label}"),
+            &shape,
+            "f32->bf16",
+            time_op("cast_f32_bf16", || x_f32.to_dtype(DType::BF16)),
+        );
     }
 
     println!("\nWriting {}...", out_path.display());

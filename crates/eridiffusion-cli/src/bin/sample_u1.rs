@@ -109,8 +109,8 @@ fn build_tokenizer(weights_dir: &std::path::Path) -> Result<Tokenizer> {
     tok.with_pre_tokenizer(Some(ByteLevel::default().add_prefix_space(false)));
     tok.with_decoder(Some(ByteLevel::default()));
 
-    let raw = std::fs::read_to_string(&added)
-        .with_context(|| format!("read {}", added.display()))?;
+    let raw =
+        std::fs::read_to_string(&added).with_context(|| format!("read {}", added.display()))?;
     let map: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(&raw).context("added_tokens.json")?;
     let mut entries: Vec<(String, u64)> = map
@@ -138,7 +138,9 @@ fn build_tokenizer(weights_dir: &std::path::Path) -> Result<Tokenizer> {
         .token_to_id("<|im_start|>")
         .ok_or_else(|| anyhow!("<|im_start|> not in tokenizer"))?;
     if im_start != 151644 {
-        return Err(anyhow!("<|im_start|> mapped to {im_start}, expected 151644"));
+        return Err(anyhow!(
+            "<|im_start|> mapped to {im_start}, expected 151644"
+        ));
     }
     Ok(tok)
 }
@@ -160,15 +162,13 @@ fn build_t2i_query(system: &str, user: &str, append: &str) -> String {
 }
 
 fn encode_query(tok: &Tokenizer, query: &str) -> Result<Vec<i32>> {
-    let enc = tok.encode(query, false).map_err(|e| anyhow!("tokenize: {e}"))?;
+    let enc = tok
+        .encode(query, false)
+        .map_err(|e| anyhow!("tokenize: {e}"))?;
     Ok(enc.get_ids().iter().map(|&id| id as i32).collect())
 }
 
-fn make_noise_image(
-    seed: u64,
-    shape: &[usize],
-    device: &Arc<CudaDevice>,
-) -> Result<Tensor> {
+fn make_noise_image(seed: u64, shape: &[usize], device: &Arc<CudaDevice>) -> Result<Tensor> {
     use rand::{Rng, SeedableRng};
     let numel: usize = shape.iter().product();
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -225,15 +225,20 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // ---- 0) Device + tokenizer + model ----------------------------------
-    let device = flame_core::CudaDevice::new(0)
-        .map_err(|e| anyhow!("CudaDevice::new(0): {e}"))?;
-    log::info!("[sample_u1] loading tokenizer from {}", args.model_path.display());
+    let device = flame_core::CudaDevice::new(0).map_err(|e| anyhow!("CudaDevice::new(0): {e}"))?;
+    log::info!(
+        "[sample_u1] loading tokenizer from {}",
+        args.model_path.display()
+    );
     let tok = build_tokenizer(&args.model_path)?;
 
     log::info!("[sample_u1] loading model");
     let t_load = std::time::Instant::now();
     let mut model = SenseNovaU1::load(&args.model_path, &device)?;
-    log::info!("[sample_u1] model loaded in {:.1}s", t_load.elapsed().as_secs_f32());
+    log::info!(
+        "[sample_u1] model loaded in {:.1}s",
+        t_load.elapsed().as_secs_f32()
+    );
 
     // ---- 0b) Optional LoRA attach ---------------------------------------
     if let Some(lora_path) = args.lora.as_ref() {
@@ -241,6 +246,34 @@ fn main() -> Result<()> {
         let adapters = u1lora::load_adapters(lora_path, device.clone())?;
         log::info!("[sample_u1] attaching {} LoRA adapters", adapters.len());
         model.attach_lora_adapters(adapters);
+
+        // ---- 0c) Optional promoted-Parameter sidecar -------------------
+        // `train_u1 --unfreeze` (and mvp mode) writes a `<lora>.params.safetensors`
+        // sidecar containing the trained F32-master Parameters as BF16
+        // tensors keyed by their full `model.shared` path. Inject them into
+        // `model.shared` to override the base weights — the forward path
+        // reads via `shared_or_param_bf16` which has no `trainable_params`
+        // at inference time and falls through to `shared`, so this is the
+        // correct injection point.
+        let sidecar = lora_path.with_extension("params.safetensors");
+        if sidecar.exists() {
+            log::info!(
+                "[sample_u1] loading promoted Parameters sidecar from {}",
+                sidecar.display(),
+            );
+            let overrides = u1lora::load_promoted_params(&sidecar, device.clone())?;
+            let n_loaded = overrides.len();
+            let (injected, skipped) = u1lora::inject_shared_overrides(&mut model, overrides);
+            log::info!(
+                "[sample_u1] sidecar: loaded {n_loaded} tensors, injected {injected} into \
+                 model.shared, skipped {skipped} (key mismatches)"
+            );
+        } else {
+            log::info!(
+                "[sample_u1] no params sidecar at {}; using base-model weights for non-LoRA layers",
+                sidecar.display(),
+            );
+        }
     }
 
     // ---- 1) Geometry checks --------------------------------------------
@@ -251,7 +284,8 @@ fn main() -> Result<()> {
     if args.width % token_p != 0 || args.height % token_p != 0 {
         anyhow::bail!(
             "--width {} / --height {} must be divisible by patch_size*merge_size = {token_p}",
-            args.width, args.height,
+            args.width,
+            args.height,
         );
     }
     let grid_h = args.height / patch;
@@ -274,26 +308,31 @@ fn main() -> Result<()> {
     let uncond_ids = encode_query(&tok, &uncond_query)?;
     log::info!(
         "[sample_u1] cond tokens={}  uncond tokens={}",
-        cond_ids.len(), uncond_ids.len(),
+        cond_ids.len(),
+        uncond_ids.len(),
     );
 
     // ---- 3) Prefix forwards --------------------------------------------
     let t_prefix = std::time::Instant::now();
     let (cond_cache, _cond_last) = model.forward_und(&cond_ids)?;
     let (uncond_cache, _) = model.forward_und(&uncond_ids)?;
-    log::info!("[sample_u1] prefix forward: {:.2}s", t_prefix.elapsed().as_secs_f32());
+    log::info!(
+        "[sample_u1] prefix forward: {:.2}s",
+        t_prefix.elapsed().as_secs_f32()
+    );
 
     // ---- 4) Init noise --------------------------------------------------
     let noise_scale = model.compute_noise_scale(grid_h, grid_w);
     log::info!(
         "[sample_u1] grid={}x{}, tokens={}x{} (L={}), noise_scale={:.4}",
-        grid_h, grid_w, token_h, token_w, l_tokens, noise_scale,
+        grid_h,
+        grid_w,
+        token_h,
+        token_w,
+        l_tokens,
+        noise_scale,
     );
-    let mut img = make_noise_image(
-        args.seed,
-        &[b, 3, args.height, args.width],
-        &device,
-    )?;
+    let mut img = make_noise_image(args.seed, &[b, 3, args.height, args.width], &device)?;
     img = img.mul_scalar(noise_scale)?;
 
     // ---- 5) Build timestep grid ----------------------------------------
@@ -337,10 +376,20 @@ fn main() -> Result<()> {
         image_embeds = image_embeds.add(&additive)?;
 
         let h_cond = forward_gen_for(
-            &mut model, &image_embeds, cond_cache.next_t_index, token_h, token_w, &cond_cache,
+            &mut model,
+            &image_embeds,
+            cond_cache.next_t_index,
+            token_h,
+            token_w,
+            &cond_cache,
         )?;
         let h_uncond = forward_gen_for(
-            &mut model, &image_embeds, uncond_cache.next_t_index, token_h, token_w, &uncond_cache,
+            &mut model,
+            &image_embeds,
+            uncond_cache.next_t_index,
+            token_h,
+            token_w,
+            &uncond_cache,
         )?;
         let x_cond = model.fm_head_forward(&h_cond)?;
         let x_uncond = model.fm_head_forward(&h_uncond)?;
@@ -355,7 +404,11 @@ fn main() -> Result<()> {
 
         log::info!(
             "[sample_u1] step {:>3}/{}  t={:.4}→{:.4}  {:.2}s",
-            step + 1, args.steps, t, t_next, t_step.elapsed().as_secs_f32(),
+            step + 1,
+            args.steps,
+            t,
+            t_next,
+            t_step.elapsed().as_secs_f32(),
         );
     }
     drop(_no_grad);

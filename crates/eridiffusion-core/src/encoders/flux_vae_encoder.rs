@@ -308,13 +308,7 @@ struct DownBlock {
 }
 
 /// Pad an NCHW tensor with zeros: `(left, right, top, bottom)`.
-fn pad2d_zeros(
-    x: &Tensor,
-    left: usize,
-    right: usize,
-    top: usize,
-    bottom: usize,
-) -> Result<Tensor> {
+fn pad2d_zeros(x: &Tensor, left: usize, right: usize, top: usize, bottom: usize) -> Result<Tensor> {
     if left == 0 && right == 0 && top == 0 && bottom == 0 {
         return Ok(x.clone_result()?);
     }
@@ -331,37 +325,23 @@ fn pad2d_zeros(
 
     let mut current = x.clone_result()?;
     if left > 0 {
-        let zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, c, h, left]),
-            dtype,
-            device.clone(),
-        )?;
+        let zeros = Tensor::zeros_dtype(Shape::from_dims(&[b, c, h, left]), dtype, device.clone())?;
         current = Tensor::cat(&[&zeros, &current], 3)?;
     }
     if right > 0 {
-        let zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, c, h, right]),
-            dtype,
-            device.clone(),
-        )?;
+        let zeros =
+            Tensor::zeros_dtype(Shape::from_dims(&[b, c, h, right]), dtype, device.clone())?;
         current = Tensor::cat(&[&current, &zeros], 3)?;
     }
 
     let new_w = w + left + right;
     if top > 0 {
-        let zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, c, top, new_w]),
-            dtype,
-            device.clone(),
-        )?;
+        let zeros =
+            Tensor::zeros_dtype(Shape::from_dims(&[b, c, top, new_w]), dtype, device.clone())?;
         current = Tensor::cat(&[&zeros, &current], 2)?;
     }
     if bottom > 0 {
-        let zeros = Tensor::zeros_dtype(
-            Shape::from_dims(&[b, c, bottom, new_w]),
-            dtype,
-            device,
-        )?;
+        let zeros = Tensor::zeros_dtype(Shape::from_dims(&[b, c, bottom, new_w]), dtype, device)?;
         current = Tensor::cat(&[&current, &zeros], 2)?;
     }
     Ok(current)
@@ -397,8 +377,7 @@ impl DownBlock {
 
         let downsample_conv = if has_downsample {
             // Stride-2 conv with NO padding — asymmetric (0,1,0,1) pad applied manually
-            let mut conv =
-                Conv2d::new_with_bias(out_ch, out_ch, 3, 2, 0, device.clone(), true)?;
+            let mut conv = Conv2d::new_with_bias(out_ch, out_ch, 3, 2, 0, device.clone(), true)?;
             conv.copy_weight_from(get(&format!("{prefix}.downsamplers.0.conv.weight"))?)?;
             conv.copy_bias_from(get(&format!("{prefix}.downsamplers.0.conv.bias"))?)?;
             Some(conv)
@@ -458,7 +437,9 @@ pub struct LdmVAEEncoder {
 ///   encoder.norm_out.*                   → encoder.conv_norm_out.*
 ///   *.nin_shortcut.*                     → *.conv_shortcut.*
 fn remap_ldm_to_diffusers(w: HashMap<String, Tensor>) -> HashMap<String, Tensor> {
-    let is_ldm = w.keys().any(|k| k.contains("encoder.down.") || k.contains("encoder.mid.block_"));
+    let is_ldm = w
+        .keys()
+        .any(|k| k.contains("encoder.down.") || k.contains("encoder.mid.block_"));
     if !is_ldm {
         return w;
     }
@@ -529,7 +510,9 @@ fn remap_enc_ldm_key(key: &str) -> String {
                     let resnet_idx = &rr[..dot2];
                     let suffix = &rr[dot2 + 1..];
                     let suffix = suffix.replace("nin_shortcut.", "conv_shortcut.");
-                    return format!("encoder.down_blocks.{block_idx}.resnets.{resnet_idx}.{suffix}");
+                    return format!(
+                        "encoder.down_blocks.{block_idx}.resnets.{resnet_idx}.{suffix}"
+                    );
                 }
             }
 
@@ -632,21 +615,15 @@ impl LdmVAEEncoder {
         let norm_out_b = get("encoder.conv_norm_out.bias")?.clone_result()?;
 
         let out_channels = 2 * latent_channels;
-        let mut conv_out = Conv2d::new_with_bias(top_ch, out_channels, 3, 1, 1, device.clone(), true)?;
+        let mut conv_out =
+            Conv2d::new_with_bias(top_ch, out_channels, 3, 1, 1, device.clone(), true)?;
         conv_out.copy_weight_from(get("encoder.conv_out.weight")?)?;
         conv_out.copy_bias_from(get("encoder.conv_out.bias")?)?;
 
         // quant_conv: Conv2d(2*latent_ch, 2*latent_ch, 1) — optional, top-level key
         let quant_conv = if w.contains_key("quant_conv.weight") {
-            let mut qc = Conv2d::new_with_bias(
-                out_channels,
-                out_channels,
-                1,
-                1,
-                0,
-                device.clone(),
-                true,
-            )?;
+            let mut qc =
+                Conv2d::new_with_bias(out_channels, out_channels, 1, 1, 0, device.clone(), true)?;
             qc.copy_weight_from(get("quant_conv.weight")?)?;
             qc.copy_bias_from(get("quant_conv.bias")?)?;
             println!("[LdmVAEEncoder] quant_conv loaded ({out_channels} -> {out_channels})");

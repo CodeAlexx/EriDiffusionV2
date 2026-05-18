@@ -15,11 +15,8 @@
 //! Mirrors prepare_zimage.rs / prepare_ernie.rs structure.
 
 use clap::Parser;
+use eridiffusion_core::encoders::{qwen3::Qwen3Encoder, vae::KleinVaeEncoder};
 use flame_core::{serialization::save_file, DType, Shape, Tensor};
-use eridiffusion_core::encoders::{
-    qwen3::Qwen3Encoder,
-    vae::KleinVaeEncoder,
-};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -30,16 +27,24 @@ const TXT_PAD_LEN: usize = 512;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] input_dir: PathBuf,
-    #[arg(long)] output_dir: PathBuf,
+    #[arg(long)]
+    input_dir: PathBuf,
+    #[arg(long)]
+    output_dir: PathBuf,
     /// Klein VAE safetensors (e.g. flux2-vae.safetensors). Same VAE for 4B and 9B.
-    #[arg(long)] vae_ckpt: PathBuf,
+    #[arg(long)]
+    vae_ckpt: PathBuf,
     /// Qwen3 weights path (single file or sharded dir). qwen_3_4b for 4B, larger for 9B.
-    #[arg(long)] qwen3: PathBuf,
-    #[arg(long)] tokenizer_path: PathBuf,
-    #[arg(long, default_value = "512")] resolution: u32,
-    #[arg(long, default_value_t = true)] skip_existing: bool,
-    #[arg(long, default_value_t = 0)] max_samples: usize,
+    #[arg(long)]
+    qwen3: PathBuf,
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    #[arg(long, default_value = "512")]
+    resolution: u32,
+    #[arg(long, default_value_t = true)]
+    skip_existing: bool,
+    #[arg(long, default_value_t = 0)]
+    max_samples: usize,
     /// Aspect-ratio bucketing. When true, image is resized + center-cropped
     /// to the closest 64-aligned bucket whose total pixel count is
     /// ≈ resolution² and whose aspect ratio is closest to the source. This
@@ -47,42 +52,52 @@ struct Args {
     /// and avoids the ~20% vertical compression that forced-square does on
     /// 4:5 portrait datasets like Alina. Set to false to keep legacy
     /// `resize_exact(R, R)` behavior.
-    #[arg(long, default_value_t = true)] bucketing: bool,
+    #[arg(long, default_value_t = true)]
+    bucketing: bool,
 
     // ── Phase 6 multi-feature rollout ────────────────────────────────────
     /// Per-crop style: `center` (default), `random`, `top_left`, `top_right`,
     /// `bottom_left`, `bottom_right`. `random` chooses uniformly within the
     /// loose-axis margin and adds variation for subject training. Default
     /// `center` preserves byte-invariant prep output.
-    #[arg(long, default_value = "center")] crop_style: String,
+    #[arg(long, default_value = "center")]
+    crop_style: String,
     /// Aspect-bucket alignment in pixels. Default `64` matches OT
     /// `aspect_bucketing_quantization=64`. Smaller values (`32`, `16`) give
     /// finer aspect control at the cost of more buckets. Must be a positive
     /// multiple of 8 (VAE patch size constraint).
-    #[arg(long, default_value_t = 64)] bucket_alignment: u32,
+    #[arg(long, default_value_t = 64)]
+    bucket_alignment: u32,
     /// Optional caption blocklist file. One substring per line; lines
     /// starting with `#` are comments. Any caption containing any pattern
     /// is dropped (the image is not encoded). Default: no filtering.
-    #[arg(long)] caption_filter_list: Option<PathBuf>,
+    #[arg(long)]
+    caption_filter_list: Option<PathBuf>,
     /// Re-encode every sample even if `<hash>.safetensors` already exists.
     /// Equivalent to `--skip-existing=false`; provided as an explicit flag
     /// for cache-rebuild workflows. Default `false` (skip existing).
-    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
     /// Phase 6 plumbing: `--caption-tag-shuffle` records intent to randomize
     /// tag order per training step. Cache files store ENCODED text, not raw
     /// captions, so per-step shuffle requires either pre-encoded variants or
     /// runtime re-encoding. Phase 6 ships infrastructure only — this flag is
     /// recorded in the prep log for forward-compat and otherwise unused.
-    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
     /// Image augmentations at prep time. All default-off → byte-identical
     /// caches. Set `--aug-flip` for 50% horizontal flip per sample (also
     /// flips the latent_mask if present). `--aug-brightness <f>` and
     /// `--aug-contrast <f>` jitter pixel values uniformly. `--aug-seed`
     /// seeds the per-sample RNG.
-    #[arg(long, default_value_t = false)] aug_flip: bool,
-    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
-    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
-    #[arg(long, default_value_t = 0)] aug_seed: u64,
+    #[arg(long, default_value_t = false)]
+    aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)]
+    aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)]
+    aug_contrast: f32,
+    #[arg(long, default_value_t = 0)]
+    aug_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,8 +142,16 @@ impl CropStyle {
         match self {
             CropStyle::Center => (max_x / 2, max_y / 2),
             CropStyle::Random => {
-                let xo = if max_x > 0 { rng.gen_range(0..=max_x) } else { 0 };
-                let yo = if max_y > 0 { rng.gen_range(0..=max_y) } else { 0 };
+                let xo = if max_x > 0 {
+                    rng.gen_range(0..=max_x)
+                } else {
+                    0
+                };
+                let yo = if max_y > 0 {
+                    rng.gen_range(0..=max_y)
+                } else {
+                    0
+                };
                 (xo, yo)
             }
             CropStyle::TopLeft => (0, 0),
@@ -151,10 +174,14 @@ fn pick_bucket(src_w: u32, src_h: u32, target_res: u32, alignment: u32) -> (u32,
     // Order doesn't matter; we pick by (aspect distance, pixel-count distance).
     const RATIOS: &[(u32, u32)] = &[
         (1, 1),
-        (4, 5), (5, 4),
-        (3, 4), (4, 3),
-        (9, 16), (16, 9),
-        (2, 3), (3, 2),
+        (4, 5),
+        (5, 4),
+        (3, 4),
+        (4, 3),
+        (9, 16),
+        (16, 9),
+        (2, 3),
+        (3, 2),
     ];
     let target_pix = (target_res as f32) * (target_res as f32);
     let src_aspect = src_w as f32 / src_h as f32;
@@ -193,7 +220,9 @@ fn main() -> anyhow::Result<()> {
     // Must be set before any flame_core call (OnceLock-cached on first read).
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at this point (before main's first action).
-        unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
+        unsafe {
+            std::env::set_var("FLAME_ALLOC_POOL", "0");
+        }
     }
     env_logger::init();
     let args = Args::parse();
@@ -215,11 +244,17 @@ fn main() -> anyhow::Result<()> {
     if aug_cfg.is_active() {
         log::info!(
             "[image-aug] flip={} brightness={} contrast={} seed={}",
-            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+            aug_cfg.flip,
+            aug_cfg.brightness,
+            aug_cfg.contrast,
+            args.aug_seed
         );
     }
     if !matches!(crop_style, CropStyle::Center) {
-        log::info!("[crop-style] {:?} (default-off path; output bytes will differ from `center`)", crop_style);
+        log::info!(
+            "[crop-style] {:?} (default-off path; output bytes will differ from `center`)",
+            crop_style
+        );
     }
     if args.bucket_alignment != 64 {
         log::info!("[bucket-alignment] {} (default 64)", args.bucket_alignment);
@@ -229,19 +264,17 @@ fn main() -> anyhow::Result<()> {
             "[caption-tag-shuffle] enabled — Phase 6 records intent only. Cache files store encoded text; per-step shuffle requires Phase 7+ runtime re-encoder."
         );
     }
-    let filter_patterns: Vec<String> =
-        if let Some(p) = args.caption_filter_list.as_ref() {
-            let pats =
-                eridiffusion_core::training::features::caption_aug::load_filter_list(p)?;
-            log::info!(
-                "[caption-filter-list] loaded {} pattern(s) from {}",
-                pats.len(),
-                p.display()
-            );
-            pats
-        } else {
-            Vec::new()
-        };
+    let filter_patterns: Vec<String> = if let Some(p) = args.caption_filter_list.as_ref() {
+        let pats = eridiffusion_core::training::features::caption_aug::load_filter_list(p)?;
+        log::info!(
+            "[caption-filter-list] loaded {} pattern(s) from {}",
+            pats.len(),
+            p.display()
+        );
+        pats
+    } else {
+        Vec::new()
+    };
     // Effective skip-existing: --cache-invalidate forces re-encode.
     let skip_existing = args.skip_existing && !args.cache_invalidate;
     if args.cache_invalidate {
@@ -269,7 +302,10 @@ fn main() -> anyhow::Result<()> {
     let joint_dim = qcfg.extract_layers.len() * qcfg.hidden_size;
     log::info!(
         "  Qwen3 hidden={} layers={} extract={:?} → text dim {}",
-        qcfg.hidden_size, qcfg.num_layers, qcfg.extract_layers, joint_dim,
+        qcfg.hidden_size,
+        qcfg.num_layers,
+        qcfg.extract_layers,
+        joint_dim,
     );
     let qwen3 = Qwen3Encoder::new(qwen_weights, qcfg, device.clone());
 
@@ -281,7 +317,10 @@ fn main() -> anyhow::Result<()> {
     for entry in std::fs::read_dir(&args.input_dir)? {
         let p = entry?.path();
         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-            if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp" | "bmp") {
+            if matches!(
+                ext.to_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp" | "bmp"
+            ) {
                 let stem = p.file_stem().unwrap().to_str().unwrap();
                 pairs.push((p.clone(), args.input_dir.join(format!("{stem}.txt"))));
             }
@@ -293,10 +332,15 @@ fn main() -> anyhow::Result<()> {
     let mut skipped = 0usize;
     let t_start = std::time::Instant::now();
     for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
-        if args.max_samples > 0 && written + skipped >= args.max_samples { break; }
+        if args.max_samples > 0 && written + skipped >= args.max_samples {
+            break;
+        }
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
-        if skip_existing && out_path.exists() { skipped += 1; continue; }
+        if skip_existing && out_path.exists() {
+            skipped += 1;
+            continue;
+        }
 
         // Phase 6: caption-filter-list — drop captions matching any pattern.
         // Read caption EARLY so we don't waste a VAE encode + Qwen3 forward
@@ -305,10 +349,14 @@ fn main() -> anyhow::Result<()> {
         let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
         if !filter_patterns.is_empty()
             && !eridiffusion_core::training::features::caption_aug::caption_passes(
-                &caption, &filter_patterns,
+                &caption,
+                &filter_patterns,
             )
         {
-            log::debug!("[filter] dropped {}: caption matched blocklist", img_path.display());
+            log::debug!(
+                "[filter] dropped {}: caption matched blocklist",
+                img_path.display()
+            );
             skipped += 1;
             continue;
         }
@@ -354,7 +402,8 @@ fn main() -> anyhow::Result<()> {
                         None
                     }
                 };
-                let resized = src.resize_exact(scaled_w, scaled_h, image::imageops::FilterType::Lanczos3);
+                let resized =
+                    src.resize_exact(scaled_w, scaled_h, image::imageops::FilterType::Lanczos3);
                 let resized_rgb = resized.to_rgb8();
                 let (rw, rh) = resized_rgb.dimensions();
                 let (xoff, yoff) = crop_style.pick_offset(rw, rh, tw, th, &mut crop_rng);
@@ -363,14 +412,23 @@ fn main() -> anyhow::Result<()> {
                         "[bucket] src={sw}x{sh} → bucket={tw}x{th} (resized={rw}x{rh}, crop_off=({xoff},{yoff}))"
                     );
                 }
-                let cropped = image::imageops::crop_imm(&resized_rgb, xoff, yoff, tw, th).to_image();
+                let cropped =
+                    image::imageops::crop_imm(&resized_rgb, xoff, yoff, tw, th).to_image();
                 if let Some(m) = mask_src {
-                    let r = image::imageops::resize(&m, scaled_w, scaled_h, image::imageops::FilterType::Lanczos3);
+                    let r = image::imageops::resize(
+                        &m,
+                        scaled_w,
+                        scaled_h,
+                        image::imageops::FilterType::Lanczos3,
+                    );
                     mask_opt = Some(image::imageops::crop_imm(&r, xoff, yoff, tw, th).to_image());
                 }
                 image::DynamicImage::ImageRgb8(cropped).to_rgb32f()
             }
-            Err(e) => { log::warn!("[{idx}] skipping {}: {e}", img_path.display()); continue; }
+            Err(e) => {
+                log::warn!("[{idx}] skipping {}: {e}", img_path.display());
+                continue;
+            }
         };
         // Phase-7 augmentations (default-off). When the AugConfig is inert,
         // `apply_augs` returns immediately and pixels stay byte-identical.
@@ -400,14 +458,17 @@ fn main() -> anyhow::Result<()> {
                 pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0;
             }
         }
-        let img_t = Tensor::from_vec(
-            pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone(),
-        )?.to_dtype(DType::BF16)?;
+        let img_t = Tensor::from_vec(pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone())?
+            .to_dtype(DType::BF16)?;
         // KleinVaeEncoder.encode handles posterior.mode + patchify + BN → [B, 128, H/16, W/16].
         let latent = vae.encode(&img_t)?;
 
-        let prompt = format!("{KLEIN_TEMPLATE_PRE}{}{KLEIN_TEMPLATE_POST}", caption.trim());
-        let enc = tokenizer.encode(prompt.as_str(), false)
+        let prompt = format!(
+            "{KLEIN_TEMPLATE_PRE}{}{KLEIN_TEMPLATE_POST}",
+            caption.trim()
+        );
+        let enc = tokenizer
+            .encode(prompt.as_str(), false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
         let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
         let valid_len = ids.len().min(TXT_PAD_LEN);
@@ -415,9 +476,13 @@ fn main() -> anyhow::Result<()> {
         let text_hidden = qwen3.encode(&ids)?; // [1, TXT_PAD_LEN, joint_dim]
 
         let mut mask_data = vec![0.0f32; TXT_PAD_LEN];
-        for slot in mask_data.iter_mut().take(valid_len) { *slot = 1.0; }
+        for slot in mask_data.iter_mut().take(valid_len) {
+            *slot = 1.0;
+        }
         let text_mask = Tensor::from_vec(
-            mask_data, Shape::from_dims(&[1, TXT_PAD_LEN]), device.clone(),
+            mask_data,
+            Shape::from_dims(&[1, TXT_PAD_LEN]),
+            device.clone(),
         )?;
 
         // Both `latent` and `text_hidden` are already BF16 — the previous
@@ -442,12 +507,9 @@ fn main() -> anyhow::Result<()> {
             for (x, y, p) in down.enumerate_pixels() {
                 mp[y as usize * lat_w + x as usize] = p.0[0] as f32 / 255.0;
             }
-            let mask_t = Tensor::from_vec(
-                mp,
-                Shape::from_dims(&[1, 1, lat_h, lat_w]),
-                device.clone(),
-            )?
-            .to_dtype(DType::BF16)?;
+            let mask_t =
+                Tensor::from_vec(mp, Shape::from_dims(&[1, 1, lat_h, lat_w]), device.clone())?
+                    .to_dtype(DType::BF16)?;
             tensors.insert("latent_mask".into(), mask_t);
         }
         tensors.insert("latent".into(), latent);
@@ -467,25 +529,33 @@ fn main() -> anyhow::Result<()> {
             // Read /proc/self/status VmRSS so the user can spot regressions.
             let rss_kb: usize = std::fs::read_to_string("/proc/self/status")
                 .ok()
-                .and_then(|s| s.lines()
-                    .find(|l| l.starts_with("VmRSS:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|n| n.parse().ok()))
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmRSS:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|n| n.parse().ok())
+                })
                 .unwrap_or(0);
-            log::info!("  cached {written} (skipped {skipped}) — {:.2}/s — RSS {:.1} GB",
+            log::info!(
+                "  cached {written} (skipped {skipped}) — {:.2}/s — RSS {:.1} GB",
                 written as f32 / elapsed.max(1e-3),
-                rss_kb as f32 / 1024.0 / 1024.0);
+                rss_kb as f32 / 1024.0 / 1024.0
+            );
         }
     }
 
-    log::info!("Done: wrote {written}, skipped {skipped}, total {} in {:.1}s",
-        pairs.len(), t_start.elapsed().as_secs_f32());
+    log::info!(
+        "Done: wrote {written}, skipped {skipped}, total {} in {:.1}s",
+        pairs.len(),
+        t_start.elapsed().as_secs_f32()
+    );
     Ok(())
 }
 
-fn load_qwen3_weights(path: &std::path::Path, device: &std::sync::Arc<flame_core::CudaDevice>)
-    -> flame_core::Result<HashMap<String, Tensor>>
-{
+fn load_qwen3_weights(
+    path: &std::path::Path,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> flame_core::Result<HashMap<String, Tensor>> {
     if path.is_file() {
         return flame_core::serialization::load_file(path, device);
     }
@@ -493,7 +563,9 @@ fn load_qwen3_weights(path: &std::path::Path, device: &std::sync::Arc<flame_core
     for entry in std::fs::read_dir(path)
         .map_err(|e| flame_core::Error::Io(format!("read_dir {}: {e}", path.display())))?
     {
-        let p = entry.map_err(|e| flame_core::Error::Io(format!("entry: {e}")))?.path();
+        let p = entry
+            .map_err(|e| flame_core::Error::Io(format!("entry: {e}")))?
+            .path();
         if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
             let part = flame_core::serialization::load_file(&p, device)?;
             all.extend(part);

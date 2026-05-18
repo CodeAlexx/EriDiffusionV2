@@ -21,11 +21,7 @@
 //!   null_condition_emb  [1, 1, 2048]
 
 use cudarc::driver::CudaDevice;
-use flame_core::{
-    conv1d,
-    parameter::Parameter,
-    serialization, DType, Error, Shape, Tensor,
-};
+use flame_core::{conv1d, parameter::Parameter, serialization, DType, Error, Shape, Tensor};
 
 use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::lora::LoRALinear;
@@ -55,10 +51,10 @@ impl AceStepLoraTarget {
     /// [`AceStepLoRAModel::save_lora`] / [`AceStepLoRAModel::named_parameters`].
     pub fn suffix(self) -> &'static str {
         match self {
-            AceStepLoraTarget::SelfQ  => "self_attn.q_proj",
-            AceStepLoraTarget::SelfK  => "self_attn.k_proj",
-            AceStepLoraTarget::SelfV  => "self_attn.v_proj",
-            AceStepLoraTarget::SelfO  => "self_attn.o_proj",
+            AceStepLoraTarget::SelfQ => "self_attn.q_proj",
+            AceStepLoraTarget::SelfK => "self_attn.k_proj",
+            AceStepLoraTarget::SelfV => "self_attn.v_proj",
+            AceStepLoraTarget::SelfO => "self_attn.o_proj",
             AceStepLoraTarget::CrossQ => "cross_attn.q_proj",
             AceStepLoraTarget::CrossK => "cross_attn.k_proj",
             AceStepLoraTarget::CrossV => "cross_attn.v_proj",
@@ -70,17 +66,17 @@ impl AceStepLoraTarget {
 /// ACE-Step DiT decoder configuration, auto-detected from weights.
 #[derive(Debug, Clone)]
 pub struct AceStepConfig {
-    pub hidden_size: usize,     // 2048 (turbo) or 2560 (xl-base)
-    pub num_heads: usize,       // 16 or 32
-    pub num_kv_heads: usize,    // 8 or 32
-    pub head_dim: usize,        // 128
+    pub hidden_size: usize,       // 2048 (turbo) or 2560 (xl-base)
+    pub num_heads: usize,         // 16 or 32
+    pub num_kv_heads: usize,      // 8 or 32
+    pub head_dim: usize,          // 128
     pub intermediate_size: usize, // 6144 or larger
-    pub num_layers: usize,      // 24 or 32
-    pub in_channels: usize,     // 192
-    pub acoustic_dim: usize,    // 64
-    pub patch_size: usize,      // 2
-    pub rope_theta: f32,        // 1_000_000
-    pub rms_norm_eps: f32,      // 1e-6
+    pub num_layers: usize,        // 24 or 32
+    pub in_channels: usize,       // 192
+    pub acoustic_dim: usize,      // 64
+    pub patch_size: usize,        // 2
+    pub rope_theta: f32,          // 1_000_000
+    pub rms_norm_eps: f32,        // 1e-6
 }
 
 /// LoRA adapters for one DiT layer (self-attn + cross-attn).
@@ -133,43 +129,59 @@ impl AceStepLoRAModel {
         device: Arc<CudaDevice>,
     ) -> Result<Self> {
         let hidden_size = {
-            let w = weights.get("decoder.condition_embedder.weight")
-                .ok_or_else(|| Error::InvalidInput("Missing decoder.condition_embedder.weight".into()))?;
+            let w = weights
+                .get("decoder.condition_embedder.weight")
+                .ok_or_else(|| {
+                    Error::InvalidInput("Missing decoder.condition_embedder.weight".into())
+                })?;
             w.shape().dims()[0]
         };
 
         let num_heads = {
-            let q = weights.get("decoder.layers.0.self_attn.q_proj.weight")
-                .ok_or_else(|| Error::InvalidInput("Missing decoder.layers.0.self_attn.q_proj.weight".into()))?;
+            let q = weights
+                .get("decoder.layers.0.self_attn.q_proj.weight")
+                .ok_or_else(|| {
+                    Error::InvalidInput("Missing decoder.layers.0.self_attn.q_proj.weight".into())
+                })?;
             q.shape().dims()[0] / 128
         };
 
         let num_kv_heads = {
-            let k = weights.get("decoder.layers.0.self_attn.k_proj.weight")
-                .ok_or_else(|| Error::InvalidInput("Missing decoder.layers.0.self_attn.k_proj.weight".into()))?;
+            let k = weights
+                .get("decoder.layers.0.self_attn.k_proj.weight")
+                .ok_or_else(|| {
+                    Error::InvalidInput("Missing decoder.layers.0.self_attn.k_proj.weight".into())
+                })?;
             k.shape().dims()[0] / 128
         };
 
         let intermediate_size = {
-            let g = weights.get("decoder.layers.0.mlp.gate_proj.weight")
-                .ok_or_else(|| Error::InvalidInput("Missing decoder.layers.0.mlp.gate_proj.weight".into()))?;
+            let g = weights
+                .get("decoder.layers.0.mlp.gate_proj.weight")
+                .ok_or_else(|| {
+                    Error::InvalidInput("Missing decoder.layers.0.mlp.gate_proj.weight".into())
+                })?;
             g.shape().dims()[0]
         };
 
         let in_channels = {
-            let p = weights.get("decoder.proj_in.1.weight")
+            let p = weights
+                .get("decoder.proj_in.1.weight")
                 .ok_or_else(|| Error::InvalidInput("Missing decoder.proj_in.1.weight".into()))?;
             p.shape().dims()[1]
         };
 
         let acoustic_dim = {
-            let p = weights.get("decoder.proj_out.1.weight")
+            let p = weights
+                .get("decoder.proj_out.1.weight")
                 .ok_or_else(|| Error::InvalidInput("Missing decoder.proj_out.1.weight".into()))?;
             p.shape().dims()[1]
         };
 
         let mut num_layers = 0;
-        while weights.contains_key(&format!("decoder.layers.{num_layers}.self_attn.q_proj.weight")) {
+        while weights.contains_key(&format!(
+            "decoder.layers.{num_layers}.self_attn.q_proj.weight"
+        )) {
             num_layers += 1;
         }
 
@@ -189,17 +201,23 @@ impl AceStepLoRAModel {
 
         log::info!(
             "ACE-Step config: hidden={} heads={} kv_heads={} layers={} mlp={} in_ch={} acoustic={}",
-            config.hidden_size, config.num_heads, config.num_kv_heads,
-            config.num_layers, config.intermediate_size, config.in_channels,
+            config.hidden_size,
+            config.num_heads,
+            config.num_kv_heads,
+            config.num_layers,
+            config.intermediate_size,
+            config.in_channels,
             config.acoustic_dim,
         );
 
-        let null_condition_emb = weights.remove("null_condition_emb")
+        let null_condition_emb = weights
+            .remove("null_condition_emb")
             .ok_or_else(|| Error::InvalidInput("Missing null_condition_emb".into()))?
             .to_dtype(DType::BF16)?;
 
         // Convert all decoder weights to BF16, frozen, pre-transpose 2D weights
-        let decoder_keys: Vec<String> = weights.keys()
+        let decoder_keys: Vec<String> = weights
+            .keys()
             .filter(|k| k.starts_with("decoder."))
             .cloned()
             .collect();
@@ -223,14 +241,70 @@ impl AceStepLoRAModel {
             let q_dim = config.num_heads * config.head_dim;
             let kv_dim = config.num_kv_heads * config.head_dim;
             adapters.push(DiTLayerAdapters {
-                self_q: LoRALinear::new(config.hidden_size, q_dim, rank, alpha, device.clone(), seed_base)?,
-                self_k: LoRALinear::new(config.hidden_size, kv_dim, rank, alpha, device.clone(), seed_base + 1)?,
-                self_v: LoRALinear::new(config.hidden_size, kv_dim, rank, alpha, device.clone(), seed_base + 2)?,
-                self_o: LoRALinear::new(config.hidden_size, q_dim, rank, alpha, device.clone(), seed_base + 3)?,
-                cross_q: LoRALinear::new(config.hidden_size, q_dim, rank, alpha, device.clone(), seed_base + 4)?,
-                cross_k: LoRALinear::new(config.hidden_size, kv_dim, rank, alpha, device.clone(), seed_base + 5)?,
-                cross_v: LoRALinear::new(config.hidden_size, kv_dim, rank, alpha, device.clone(), seed_base + 6)?,
-                cross_o: LoRALinear::new(config.hidden_size, q_dim, rank, alpha, device.clone(), seed_base + 7)?,
+                self_q: LoRALinear::new(
+                    config.hidden_size,
+                    q_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base,
+                )?,
+                self_k: LoRALinear::new(
+                    config.hidden_size,
+                    kv_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base + 1,
+                )?,
+                self_v: LoRALinear::new(
+                    config.hidden_size,
+                    kv_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base + 2,
+                )?,
+                self_o: LoRALinear::new(
+                    config.hidden_size,
+                    q_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base + 3,
+                )?,
+                cross_q: LoRALinear::new(
+                    config.hidden_size,
+                    q_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base + 4,
+                )?,
+                cross_k: LoRALinear::new(
+                    config.hidden_size,
+                    kv_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base + 5,
+                )?,
+                cross_v: LoRALinear::new(
+                    config.hidden_size,
+                    kv_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base + 6,
+                )?,
+                cross_o: LoRALinear::new(
+                    config.hidden_size,
+                    q_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed_base + 7,
+                )?,
             });
         }
 
@@ -273,25 +347,24 @@ impl AceStepLoRAModel {
         let q_dim = self.config.num_heads * self.config.head_dim;
         let kv_dim = self.config.num_kv_heads * self.config.head_dim;
 
-        let mut adapters: HashMap<(usize, AceStepLoraTarget), Arc<LycorisLinear>> =
-            HashMap::new();
+        let mut adapters: HashMap<(usize, AceStepLoraTarget), Arc<LycorisLinear>> = HashMap::new();
         for i in 0..self.config.num_layers {
             // (target, in_dim, out_dim) — mirrors the legacy ctor exactly.
             let targets: [(AceStepLoraTarget, usize, usize); 8] = [
-                (AceStepLoraTarget::SelfQ,  h, q_dim),
-                (AceStepLoraTarget::SelfK,  h, kv_dim),
-                (AceStepLoraTarget::SelfV,  h, kv_dim),
-                (AceStepLoraTarget::SelfO,  h, q_dim),
+                (AceStepLoraTarget::SelfQ, h, q_dim),
+                (AceStepLoraTarget::SelfK, h, kv_dim),
+                (AceStepLoraTarget::SelfV, h, kv_dim),
+                (AceStepLoraTarget::SelfO, h, q_dim),
                 (AceStepLoraTarget::CrossQ, h, q_dim),
                 (AceStepLoraTarget::CrossK, h, kv_dim),
                 (AceStepLoraTarget::CrossV, h, kv_dim),
                 (AceStepLoraTarget::CrossO, h, q_dim),
             ];
             for (target, in_dim, out_dim) in targets {
-                let wrapper = build_lycoris_linear(cfg, in_dim, out_dim, device.clone())
-                    .map_err(|e| Error::InvalidInput(format!(
-                        "build_lycoris_linear({:?}): {e}", target,
-                    )))?;
+                let wrapper =
+                    build_lycoris_linear(cfg, in_dim, out_dim, device.clone()).map_err(|e| {
+                        Error::InvalidInput(format!("build_lycoris_linear({:?}): {e}", target,))
+                    })?;
                 adapters.insert((i, target), Arc::new(wrapper));
             }
         }
@@ -324,10 +397,10 @@ impl AceStepLoRAModel {
         if layer_idx < self.adapters.len() {
             let a = &self.adapters[layer_idx];
             let l: &LoRALinear = match target {
-                AceStepLoraTarget::SelfQ  => &a.self_q,
-                AceStepLoraTarget::SelfK  => &a.self_k,
-                AceStepLoraTarget::SelfV  => &a.self_v,
-                AceStepLoraTarget::SelfO  => &a.self_o,
+                AceStepLoraTarget::SelfQ => &a.self_q,
+                AceStepLoraTarget::SelfK => &a.self_k,
+                AceStepLoraTarget::SelfV => &a.self_v,
+                AceStepLoraTarget::SelfO => &a.self_o,
                 AceStepLoraTarget::CrossQ => &a.cross_q,
                 AceStepLoraTarget::CrossK => &a.cross_k,
                 AceStepLoraTarget::CrossV => &a.cross_v,
@@ -370,14 +443,18 @@ impl AceStepLoRAModel {
             let did = adapter
                 .as_ref()
                 .init_perturbed_normal_lokr(base, scale)
-                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
-                    "init_perturbed_normal_lokr({key}): {e}"
-                )))?;
-            if did { applied += 1; } else { skipped += 1; }
+                .map_err(|e| {
+                    flame_core::FlameError::InvalidOperation(format!(
+                        "init_perturbed_normal_lokr({key}): {e}"
+                    ))
+                })?;
+            if did {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
         }
-        log::info!(
-            "[acestep][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
-        );
+        log::info!("[acestep][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}");
         Ok(skipped)
     }
 
@@ -440,13 +517,25 @@ impl AceStepLoRAModel {
             return out;
         }
         let suffixes = [
-            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
-            "cross_attn.q_proj", "cross_attn.k_proj", "cross_attn.v_proj", "cross_attn.o_proj",
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "cross_attn.q_proj",
+            "cross_attn.k_proj",
+            "cross_attn.v_proj",
+            "cross_attn.o_proj",
         ];
         for (i, adapter) in self.adapters.iter().enumerate() {
             let layers = [
-                &adapter.self_q, &adapter.self_k, &adapter.self_v, &adapter.self_o,
-                &adapter.cross_q, &adapter.cross_k, &adapter.cross_v, &adapter.cross_o,
+                &adapter.self_q,
+                &adapter.self_k,
+                &adapter.self_v,
+                &adapter.self_o,
+                &adapter.cross_q,
+                &adapter.cross_k,
+                &adapter.cross_v,
+                &adapter.cross_o,
             ];
             for (sfx, lora) in suffixes.iter().zip(layers.iter()) {
                 let prefix = format!("decoder.layers.{i}.{sfx}");
@@ -476,14 +565,30 @@ impl AceStepLoRAModel {
         }
         for (i, adapter) in self.adapters.iter().enumerate() {
             let prefix = format!("decoder.layers.{i}");
-            adapter.self_q.save_tensors(&format!("{prefix}.self_attn.q_proj"), &mut tensors)?;
-            adapter.self_k.save_tensors(&format!("{prefix}.self_attn.k_proj"), &mut tensors)?;
-            adapter.self_v.save_tensors(&format!("{prefix}.self_attn.v_proj"), &mut tensors)?;
-            adapter.self_o.save_tensors(&format!("{prefix}.self_attn.o_proj"), &mut tensors)?;
-            adapter.cross_q.save_tensors(&format!("{prefix}.cross_attn.q_proj"), &mut tensors)?;
-            adapter.cross_k.save_tensors(&format!("{prefix}.cross_attn.k_proj"), &mut tensors)?;
-            adapter.cross_v.save_tensors(&format!("{prefix}.cross_attn.v_proj"), &mut tensors)?;
-            adapter.cross_o.save_tensors(&format!("{prefix}.cross_attn.o_proj"), &mut tensors)?;
+            adapter
+                .self_q
+                .save_tensors(&format!("{prefix}.self_attn.q_proj"), &mut tensors)?;
+            adapter
+                .self_k
+                .save_tensors(&format!("{prefix}.self_attn.k_proj"), &mut tensors)?;
+            adapter
+                .self_v
+                .save_tensors(&format!("{prefix}.self_attn.v_proj"), &mut tensors)?;
+            adapter
+                .self_o
+                .save_tensors(&format!("{prefix}.self_attn.o_proj"), &mut tensors)?;
+            adapter
+                .cross_q
+                .save_tensors(&format!("{prefix}.cross_attn.q_proj"), &mut tensors)?;
+            adapter
+                .cross_k
+                .save_tensors(&format!("{prefix}.cross_attn.k_proj"), &mut tensors)?;
+            adapter
+                .cross_v
+                .save_tensors(&format!("{prefix}.cross_attn.v_proj"), &mut tensors)?;
+            adapter
+                .cross_o
+                .save_tensors(&format!("{prefix}.cross_attn.o_proj"), &mut tensors)?;
         }
         serialization::save_file(&tensors, path)?;
         Ok(())
@@ -500,13 +605,18 @@ impl AceStepLoRAModel {
 
     #[inline]
     fn w(&self, key: &str) -> flame_core::Result<&Tensor> {
-        self.weights.get(key)
+        self.weights
+            .get(key)
             .ok_or_else(|| Error::InvalidInput(format!("Missing weight: {key}")))
     }
 
-    fn timestep_embedding(&self, t: &Tensor, dim: usize, scale: f32, prefix: &str)
-        -> flame_core::Result<Tensor>
-    {
+    fn timestep_embedding(
+        &self,
+        t: &Tensor,
+        dim: usize,
+        scale: f32,
+        prefix: &str,
+    ) -> flame_core::Result<Tensor> {
         let device = t.device();
         let t_scaled = t.mul_scalar(scale)?;
         let half = dim / 2;
@@ -515,8 +625,11 @@ impl AceStepLoRAModel {
             .collect();
         let freqs = Tensor::from_vec(freqs_data, Shape::from_dims(&[1, half]), device.clone())?;
 
-        let t_2d = t_scaled.to_dtype(DType::F32)?.reshape(&[t.shape().dims()[0], 1])?;
-        let args = t_2d.broadcast_to(&Shape::from_dims(&[t.shape().dims()[0], half]))?
+        let t_2d = t_scaled
+            .to_dtype(DType::F32)?
+            .reshape(&[t.shape().dims()[0], 1])?;
+        let args = t_2d
+            .broadcast_to(&Shape::from_dims(&[t.shape().dims()[0], half]))?
             .mul(&freqs.broadcast_to(&Shape::from_dims(&[t.shape().dims()[0], half]))?)?;
         let cos_args = args.cos()?;
         let sin_args = args.sin()?;
@@ -585,7 +698,11 @@ impl AceStepLoRAModel {
 
         let seq_len = x.shape().dims()[1];
         let ps = self.config.patch_size;
-        let pad_length = if seq_len % ps != 0 { ps - (seq_len % ps) } else { 0 };
+        let pad_length = if seq_len % ps != 0 {
+            ps - (seq_len % ps)
+        } else {
+            0
+        };
         let x = if pad_length > 0 {
             let pad_shape = Shape::from_dims(&[b, pad_length, x.shape().dims()[2]]);
             let pad = Tensor::zeros_dtype(pad_shape, DType::BF16, device.clone())?;
@@ -605,7 +722,8 @@ impl AceStepLoRAModel {
             encoder_hidden_states,
             self.w("decoder.condition_embedder.weight")?,
         )?;
-        let cond_bias = self.w("decoder.condition_embedder.bias")?
+        let cond_bias = self
+            .w("decoder.condition_embedder.bias")?
             .reshape(&[1, 1, h])?
             .broadcast_to(encoder_hs.shape())?;
         let encoder_hs = encoder_hs.add(&cond_bias)?;
@@ -621,11 +739,17 @@ impl AceStepLoRAModel {
         // Output: AdaLN + proj_out
         let out_sst = self.w("decoder.scale_shift_table")?;
         let temb_unsqueeze = temb.reshape(&[b, 1, h])?;
-        let sst_plus_temb = out_sst.broadcast_to(&Shape::from_dims(&[b, 2, h]))?.add(&temb_unsqueeze)?;
+        let sst_plus_temb = out_sst
+            .broadcast_to(&Shape::from_dims(&[b, 2, h]))?
+            .add(&temb_unsqueeze)?;
         let shift = sst_plus_temb.narrow(1, 0, 1)?;
         let scale = sst_plus_temb.narrow(1, 1, 1)?;
 
-        let x_normed = rms_norm(&x, self.w("decoder.norm_out.weight")?, self.config.rms_norm_eps)?;
+        let x_normed = rms_norm(
+            &x,
+            self.w("decoder.norm_out.weight")?,
+            self.config.rms_norm_eps,
+        )?;
         let ones = Tensor::ones_dtype(scale.shape().clone(), DType::BF16, device.clone())?;
         let x = x_normed.mul(&ones.add(&scale)?)?.add(&shift)?;
 
@@ -665,27 +789,38 @@ impl AceStepLoRAModel {
             .collect();
         let freqs = Tensor::from_vec(freqs_data, Shape::from_dims(&[1, half]), device.clone())?;
         let t_2d = t_scaled.to_dtype(DType::F32)?.reshape(&[b, 1])?;
-        let args = t_2d.broadcast_to(&Shape::from_dims(&[b, half]))?
+        let args = t_2d
+            .broadcast_to(&Shape::from_dims(&[b, half]))?
             .mul(&freqs.broadcast_to(&Shape::from_dims(&[b, half]))?)?;
         let embedding = Tensor::cat(&[&args.cos()?, &args.sin()?], 1)?.to_dtype(DType::BF16)?;
 
         let emb_3d = embedding.reshape(&[b, 1, 256])?;
-        let temb = linear3d_bias(&emb_3d, self.w(&format!("{prefix}.linear_1.weight"))?,
-            self.w(&format!("{prefix}.linear_1.bias"))?)?;
+        let temb = linear3d_bias(
+            &emb_3d,
+            self.w(&format!("{prefix}.linear_1.weight"))?,
+            self.w(&format!("{prefix}.linear_1.bias"))?,
+        )?;
         let temb = temb.silu()?;
-        let temb = linear3d_bias(&temb, self.w(&format!("{prefix}.linear_2.weight"))?,
-            self.w(&format!("{prefix}.linear_2.bias"))?)?;
+        let temb = linear3d_bias(
+            &temb,
+            self.w(&format!("{prefix}.linear_2.weight"))?,
+            self.w(&format!("{prefix}.linear_2.bias"))?,
+        )?;
 
-        let proj = linear3d_bias(&temb.silu()?,
+        let proj = linear3d_bias(
+            &temb.silu()?,
             self.w(&format!("{prefix}.time_proj.weight"))?,
-            self.w(&format!("{prefix}.time_proj.bias"))?)?;
+            self.w(&format!("{prefix}.time_proj.bias"))?,
+        )?;
 
         proj.reshape(&[b, 6, h])
     }
 
-    fn compute_rope(&self, seq_len: usize, device: Arc<CudaDevice>)
-        -> flame_core::Result<(Tensor, Tensor)>
-    {
+    fn compute_rope(
+        &self,
+        seq_len: usize,
+        device: Arc<CudaDevice>,
+    ) -> flame_core::Result<(Tensor, Tensor)> {
         let hd = self.config.head_dim;
         let half = hd / 2;
         let theta = self.config.rope_theta;
@@ -719,7 +854,9 @@ impl AceStepLoRAModel {
         let b = hidden_states.shape().dims()[0];
 
         let sst = self.w(&format!("{prefix}.scale_shift_table"))?;
-        let modulation = sst.broadcast_to(&Shape::from_dims(&[b, 6, h]))?.add(timestep_proj)?;
+        let modulation = sst
+            .broadcast_to(&Shape::from_dims(&[b, 6, h]))?
+            .add(timestep_proj)?;
 
         let shift_msa = modulation.narrow(1, 0, 1)?;
         let scale_msa = modulation.narrow(1, 1, 1)?;
@@ -734,7 +871,11 @@ impl AceStepLoRAModel {
             self.w(&format!("{prefix}.self_attn_norm.weight"))?,
             self.config.rms_norm_eps,
         )?;
-        let ones_s = Tensor::ones_dtype(scale_msa.shape().clone(), DType::BF16, hidden_states.device().clone())?;
+        let ones_s = Tensor::ones_dtype(
+            scale_msa.shape().clone(),
+            DType::BF16,
+            hidden_states.device().clone(),
+        )?;
         let norm_hs = x_normed.mul(&ones_s.add(&scale_msa)?)?.add(&shift_msa)?;
 
         let attn_out = self.self_attention_forward(&norm_hs, cos, sin, layer_idx)?;
@@ -747,7 +888,8 @@ impl AceStepLoRAModel {
             self.w(&format!("{prefix}.cross_attn_norm.weight"))?,
             self.config.rms_norm_eps,
         )?;
-        let cross_out = self.cross_attention_forward(&cross_normed, encoder_hidden_states, layer_idx)?;
+        let cross_out =
+            self.cross_attention_forward(&cross_normed, encoder_hidden_states, layer_idx)?;
         let x = x.add(&cross_out)?;
 
         // MLP with AdaLN
@@ -789,15 +931,18 @@ impl AceStepLoRAModel {
         // picks up `lycoris_adapters` entries while the default `--algo lora`
         // path keeps reading the legacy plain `LoRALinear` from `adapters`.
         let q = linear3d_lora(
-            hidden_states, self.w(&format!("{prefix}.q_proj.weight"))?,
+            hidden_states,
+            self.w(&format!("{prefix}.q_proj.weight"))?,
             self.adapter_for(layer_idx, AceStepLoraTarget::SelfQ),
         )?;
         let k = linear3d_lora(
-            hidden_states, self.w(&format!("{prefix}.k_proj.weight"))?,
+            hidden_states,
+            self.w(&format!("{prefix}.k_proj.weight"))?,
             self.adapter_for(layer_idx, AceStepLoraTarget::SelfK),
         )?;
         let v = linear3d_lora(
-            hidden_states, self.w(&format!("{prefix}.v_proj.weight"))?,
+            hidden_states,
+            self.w(&format!("{prefix}.v_proj.weight"))?,
             self.adapter_for(layer_idx, AceStepLoraTarget::SelfV),
         )?;
 
@@ -805,8 +950,16 @@ impl AceStepLoRAModel {
         let k = k.reshape(&[b, s, nkv, hd])?;
         let v = v.reshape(&[b, s, nkv, hd])?;
 
-        let q = rms_norm_per_head(&q, self.w(&format!("{prefix}.q_norm.weight"))?, self.config.rms_norm_eps)?;
-        let k = rms_norm_per_head(&k, self.w(&format!("{prefix}.k_norm.weight"))?, self.config.rms_norm_eps)?;
+        let q = rms_norm_per_head(
+            &q,
+            self.w(&format!("{prefix}.q_norm.weight"))?,
+            self.config.rms_norm_eps,
+        )?;
+        let k = rms_norm_per_head(
+            &k,
+            self.w(&format!("{prefix}.k_norm.weight"))?,
+            self.config.rms_norm_eps,
+        )?;
 
         let q = q.transpose_dims(1, 2)?;
         let k = k.transpose_dims(1, 2)?;
@@ -827,7 +980,8 @@ impl AceStepLoRAModel {
 
         let o_input = out;
         let out = linear3d_lora(
-            &o_input, self.w(&format!("{prefix}.o_proj.weight"))?,
+            &o_input,
+            self.w(&format!("{prefix}.o_proj.weight"))?,
             self.adapter_for(layer_idx, AceStepLoraTarget::SelfO),
         )?;
 
@@ -850,15 +1004,18 @@ impl AceStepLoRAModel {
 
         // Phase 2b: dispatch via `adapter_for` (see `self_attention_forward`).
         let q = linear3d_lora(
-            hidden_states, self.w(&format!("{prefix}.q_proj.weight"))?,
+            hidden_states,
+            self.w(&format!("{prefix}.q_proj.weight"))?,
             self.adapter_for(layer_idx, AceStepLoraTarget::CrossQ),
         )?;
         let k = linear3d_lora(
-            encoder_hidden_states, self.w(&format!("{prefix}.k_proj.weight"))?,
+            encoder_hidden_states,
+            self.w(&format!("{prefix}.k_proj.weight"))?,
             self.adapter_for(layer_idx, AceStepLoraTarget::CrossK),
         )?;
         let v = linear3d_lora(
-            encoder_hidden_states, self.w(&format!("{prefix}.v_proj.weight"))?,
+            encoder_hidden_states,
+            self.w(&format!("{prefix}.v_proj.weight"))?,
             self.adapter_for(layer_idx, AceStepLoraTarget::CrossV),
         )?;
 
@@ -866,8 +1023,16 @@ impl AceStepLoRAModel {
         let k = k.reshape(&[b, s_kv, nkv, hd])?;
         let v = v.reshape(&[b, s_kv, nkv, hd])?;
 
-        let q = rms_norm_per_head(&q, self.w(&format!("{prefix}.q_norm.weight"))?, self.config.rms_norm_eps)?;
-        let k = rms_norm_per_head(&k, self.w(&format!("{prefix}.k_norm.weight"))?, self.config.rms_norm_eps)?;
+        let q = rms_norm_per_head(
+            &q,
+            self.w(&format!("{prefix}.q_norm.weight"))?,
+            self.config.rms_norm_eps,
+        )?;
+        let k = rms_norm_per_head(
+            &k,
+            self.w(&format!("{prefix}.k_norm.weight"))?,
+            self.config.rms_norm_eps,
+        )?;
 
         let q = q.transpose_dims(1, 2)?;
         let k = k.transpose_dims(1, 2)?;
@@ -886,7 +1051,8 @@ impl AceStepLoRAModel {
 
         let o_input = out;
         let out = linear3d_lora(
-            &o_input, self.w(&format!("{prefix}.o_proj.weight"))?,
+            &o_input,
+            self.w(&format!("{prefix}.o_proj.weight"))?,
             self.adapter_for(layer_idx, AceStepLoraTarget::CrossO),
         )?;
 
@@ -929,7 +1095,8 @@ fn linear3d_lora(
 
 fn linear3d_bias(input: &Tensor, weight_t: &Tensor, bias: &Tensor) -> flame_core::Result<Tensor> {
     let out = input.matmul(weight_t)?;
-    let bias_expanded = bias.reshape(&[1, 1, bias.shape().elem_count()])?
+    let bias_expanded = bias
+        .reshape(&[1, 1, bias.shape().elem_count()])?
         .broadcast_to(out.shape())?;
     out.add(&bias_expanded)
 }
@@ -941,7 +1108,8 @@ fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> flame_core::Result<Tensor>
     let mean_sq = sq.mean_dim(&[last_dim], true)?;
     let rsqrt = mean_sq.add_scalar(eps)?.rsqrt()?;
     let normed = x_f32.mul(&rsqrt)?;
-    let w = weight.to_dtype(DType::F32)?
+    let w = weight
+        .to_dtype(DType::F32)?
         .reshape(&[1, 1, weight.shape().elem_count()])?;
     normed.mul(&w)?.to_dtype(DType::BF16)
 }
@@ -956,7 +1124,8 @@ fn rms_norm_per_head(x: &Tensor, weight: &Tensor, eps: f32) -> flame_core::Resul
     let mean_sq = sq.mean_dim(&[last_dim], true)?;
     let rsqrt = mean_sq.add_scalar(eps)?.rsqrt()?;
     let normed = flat_f32.mul(&rsqrt)?;
-    let w = weight.to_dtype(DType::F32)?
+    let w = weight
+        .to_dtype(DType::F32)?
         .reshape(&[1, weight.shape().elem_count()])?;
     let result = normed.mul(&w)?.to_dtype(DType::BF16)?;
     result.reshape(&[b, s, heads, hd])
@@ -985,7 +1154,8 @@ fn repeat_kv(kv: &Tensor, n_rep: usize) -> flame_core::Result<Tensor> {
     }
     let dims = kv.shape().dims().to_vec();
     let (b, kv_heads, s, hd) = (dims[0], dims[1], dims[2], dims[3]);
-    let expanded = kv.reshape(&[b, kv_heads, 1, s, hd])?
+    let expanded = kv
+        .reshape(&[b, kv_heads, 1, s, hd])?
         .broadcast_to(&Shape::from_dims(&[b, kv_heads, n_rep, s, hd]))?;
     expanded.reshape(&[b, kv_heads * n_rep, s, hd])
 }
@@ -1010,8 +1180,7 @@ fn conv1d_forward(
     let x = input.reshape(&[b, t_out, k * c_in])?;
     let w_2d = weight.reshape(&[c_out, k * c_in])?.transpose()?;
     let out = x.matmul(&w_2d)?;
-    let bias_expanded = bias.reshape(&[1, 1, c_out])?
-        .broadcast_to(out.shape())?;
+    let bias_expanded = bias.reshape(&[1, 1, c_out])?.broadcast_to(out.shape())?;
     out.add(&bias_expanded)
 }
 
@@ -1029,13 +1198,15 @@ fn conv_transpose1d_forward(
     let (b, t, _c_in) = (dims[0], dims[1], dims[2]);
     let w_dims = weight.shape().dims().to_vec();
     let (c_in, c_out, k) = (w_dims[0], w_dims[1], w_dims[2]);
-    debug_assert_eq!(stride, k, "conv_transpose1d_forward requires stride == kernel_size");
+    debug_assert_eq!(
+        stride, k,
+        "conv_transpose1d_forward requires stride == kernel_size"
+    );
 
     let w_2d = weight.reshape(&[c_in, k * c_out])?;
     let out = input.matmul(&w_2d)?;
     let out = out.reshape(&[b, t * k, c_out])?;
-    let bias_expanded = bias.reshape(&[1, 1, c_out])?
-        .broadcast_to(out.shape())?;
+    let bias_expanded = bias.reshape(&[1, 1, c_out])?.broadcast_to(out.shape())?;
     out.add(&bias_expanded)
 }
 

@@ -10,9 +10,11 @@ fn test_matmul_autograd() {
 
     // Two weight tensors (trainable)
     let w1 = Tensor::randn(Shape::from_dims(&[64, 32]), 0.0, 0.02, device.clone())
-        .unwrap().requires_grad_(true);
+        .unwrap()
+        .requires_grad_(true);
     let w2 = Tensor::randn(Shape::from_dims(&[32, 64]), 0.0, 0.02, device.clone())
-        .unwrap().requires_grad_(true);
+        .unwrap()
+        .requires_grad_(true);
 
     let input = Tensor::randn(Shape::from_dims(&[2, 32]), 0.0, 1.0, device.clone()).unwrap();
     let target = Tensor::zeros(Shape::from_dims(&[2, 64]), device.clone()).unwrap();
@@ -32,7 +34,11 @@ fn test_matmul_autograd() {
     // Backward
     let grads = loss.backward().unwrap();
     println!("Backward: {} gradients", grads.len());
-    assert!(grads.len() >= 2, "Expected >=2 gradients, got {}", grads.len());
+    assert!(
+        grads.len() >= 2,
+        "Expected >=2 gradients, got {}",
+        grads.len()
+    );
 
     // Check W1 gradient
     let g1 = grads.get(w1.id()).expect("W1 gradient missing");
@@ -57,7 +63,8 @@ fn test_layernorm_autograd() {
 
     // Create tensor that requires grad
     let x = Tensor::randn(Shape::from_dims(&[2, 64]), 0.0, 1.0, device.clone())
-        .unwrap().requires_grad_(true);
+        .unwrap()
+        .requires_grad_(true);
 
     let normed = flame_core::layer_norm::layer_norm(&x, &[64], None, None, 1e-6).unwrap();
     let loss = normed.square().unwrap().mean().unwrap();
@@ -78,7 +85,8 @@ fn test_gelu_autograd() {
     flame_core::config::set_default_dtype(DType::F32);
 
     let x = Tensor::randn(Shape::from_dims(&[2, 64]), 0.0, 1.0, device.clone())
-        .unwrap().requires_grad_(true);
+        .unwrap()
+        .requires_grad_(true);
     let out = x.gelu().unwrap();
     let loss = out.square().unwrap().mean().unwrap();
     let grads = loss.backward().unwrap();
@@ -96,7 +104,8 @@ fn test_silu_autograd() {
     flame_core::config::set_default_dtype(DType::F32);
 
     let x = Tensor::randn(Shape::from_dims(&[2, 64]), 0.0, 1.0, device.clone())
-        .unwrap().requires_grad_(true);
+        .unwrap()
+        .requires_grad_(true);
     let out = x.silu().unwrap();
     let loss = out.square().unwrap().mean().unwrap();
     let grads = loss.backward().unwrap();
@@ -114,15 +123,29 @@ fn test_rope_autograd() {
     flame_core::config::set_default_dtype(DType::F32);
 
     let q = Tensor::randn(Shape::from_dims(&[1, 4, 16, 128]), 0.0, 1.0, device.clone())
-        .unwrap().requires_grad_(true);
+        .unwrap()
+        .requires_grad_(true);
     let k = Tensor::randn(Shape::from_dims(&[1, 4, 16, 128]), 0.0, 1.0, device.clone())
-        .unwrap().requires_grad_(true);
+        .unwrap()
+        .requires_grad_(true);
 
     // Identity RoPE (cos=1, sin=0)
-    let cos = Tensor::ones_dtype(Shape::from_dims(&[1, 1, 16, 64]), DType::F32, device.clone()).unwrap();
-    let sin = Tensor::zeros_dtype(Shape::from_dims(&[1, 1, 16, 64]), DType::F32, device.clone()).unwrap();
+    let cos = Tensor::ones_dtype(
+        Shape::from_dims(&[1, 1, 16, 64]),
+        DType::F32,
+        device.clone(),
+    )
+    .unwrap();
+    let sin = Tensor::zeros_dtype(
+        Shape::from_dims(&[1, 1, 16, 64]),
+        DType::F32,
+        device.clone(),
+    )
+    .unwrap();
 
-    let q_out = flame_core::bf16_ops::rope_fused_bf16(&q.to_dtype(DType::BF16).unwrap(), &cos, &sin).unwrap();
+    let q_out =
+        flame_core::bf16_ops::rope_fused_bf16(&q.to_dtype(DType::BF16).unwrap(), &cos, &sin)
+            .unwrap();
     let loss = q_out.square().unwrap().mean().unwrap();
     let grads = loss.backward().unwrap();
 
@@ -141,7 +164,8 @@ fn test_optimizer_step() {
     flame_core::config::set_default_dtype(DType::F32);
 
     let w = Tensor::randn(Shape::from_dims(&[32, 32]), 0.0, 0.02, device.clone())
-        .unwrap().requires_grad_(true);
+        .unwrap()
+        .requires_grad_(true);
     let w_id = w.id();
     let input = Tensor::ones(Shape::from_dims(&[4, 32]), device.clone()).unwrap();
     let target = Tensor::zeros(Shape::from_dims(&[4, 32]), device.clone()).unwrap();

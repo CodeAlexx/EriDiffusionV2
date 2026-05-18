@@ -61,4 +61,6 @@ pub fn euler_step(x: &Tensor, pred: &Tensor, sigma: f32, sigma_next: f32) -> Res
 /// returned `sigma * 1000`, which combined with the `*1000` inside
 /// `timestep_embedding` produced `sigma * 1e6` in sin/cos arguments —
 /// 1000× out-of-distribution vs trained checkpoint.
-pub fn sigma_to_timestep(sigma: f32) -> f32 { sigma }
+pub fn sigma_to_timestep(sigma: f32) -> f32 {
+    sigma
+}

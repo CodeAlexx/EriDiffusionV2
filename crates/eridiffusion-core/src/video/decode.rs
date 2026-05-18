@@ -64,9 +64,7 @@ pub fn decode_to_tensor(
         .unwrap_or_default();
 
     match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "webp" | "bmp" => {
-            decode_image(path, target_size, device)
-        }
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" => decode_image(path, target_size, device),
         "mp4" | "webm" | "mov" | "mkv" | "avi" => {
             decode_video_via_ffmpeg(path, target_size, num_frames_request, target_fps, device)
         }
@@ -85,7 +83,9 @@ fn decode_image(
     device: Arc<cudarc::driver::CudaDevice>,
 ) -> Result<DecodedClip> {
     let img = image::open(path)
-        .map_err(|e| flame_core::Error::InvalidInput(format!("image::open({}): {e}", path.display())))?
+        .map_err(|e| {
+            flame_core::Error::InvalidInput(format!("image::open({}): {e}", path.display()))
+        })?
         .resize_exact(size as u32, size as u32, FilterType::Lanczos3)
         .to_rgb32f();
     let (w, h) = img.dimensions();
@@ -98,12 +98,8 @@ fn decode_image(
             pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0;
         }
     }
-    let video = Tensor::from_vec(
-        pixels,
-        Shape::from_dims(&[1, 3, 1, hu, wu]),
-        device,
-    )?
-    .to_dtype(DType::BF16)?;
+    let video = Tensor::from_vec(pixels, Shape::from_dims(&[1, 3, 1, hu, wu]), device)?
+        .to_dtype(DType::BF16)?;
     Ok(DecodedClip {
         video,
         num_frames: 1,
@@ -129,9 +125,7 @@ fn decode_video_via_ffmpeg(
     // ffmpeg -loglevel error -i <path> [-r FPS] -vf scale=SxS -frames:v N
     //        -f rawvideo -pix_fmt rgb24 -
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-loglevel", "error"])
-        .arg("-i")
-        .arg(path);
+    cmd.args(["-loglevel", "error"]).arg("-i").arg(path);
     if let Some(fps) = target_fps {
         cmd.args(["-r", &format!("{fps}")]);
     }

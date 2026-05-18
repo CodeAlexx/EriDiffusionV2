@@ -383,7 +383,10 @@ mod tests {
     #[test]
     fn parses_string_variants() {
         for s in ["uniform", "UNIFORM", "  Uniform  "] {
-            assert_eq!(TimestepDistribution::from_str(s).unwrap(), TimestepDistribution::Uniform);
+            assert_eq!(
+                TimestepDistribution::from_str(s).unwrap(),
+                TimestepDistribution::Uniform
+            );
         }
         assert_eq!(
             TimestepDistribution::from_str("logit_normal").unwrap(),
@@ -426,7 +429,11 @@ mod tests {
             assert!((0.4..=0.6).contains(x), "value {} outside clamp", x);
         }
         let m = mean(&xs);
-        assert!((m - 0.5).abs() < 0.05, "clamped uniform mean ≈ 0.5, got {}", m);
+        assert!(
+            (m - 0.5).abs() < 0.05,
+            "clamped uniform mean ≈ 0.5, got {}",
+            m
+        );
     }
 
     /// Sigmoid: weight=0,bias=0 → degenerate sigmoid(0)=0.5 (constant).
@@ -444,13 +451,21 @@ mod tests {
         };
         let xs = sample_n(&cfg0, 3, 256);
         for x in &xs {
-            assert!((x - 0.5).abs() < 1e-6, "weight=0 sigmoid must be exactly 0.5, got {}", x);
+            assert!(
+                (x - 0.5).abs() < 1e-6,
+                "weight=0 sigmoid must be exactly 0.5, got {}",
+                x
+            );
         }
 
         // weight=1.8,bias=0 → symmetric, mean ≈ 0.5
         let cfg_sym = TimestepConfig::zimage_sigmoid_18();
         let m_sym = mean(&sample_n(&cfg_sym, 4, 2048));
-        assert!((m_sym - 0.5).abs() < 0.05, "sym sigmoid mean ≈ 0.5, got {}", m_sym);
+        assert!(
+            (m_sym - 0.5).abs() < 0.05,
+            "sym sigmoid mean ≈ 0.5, got {}",
+            m_sym
+        );
 
         // bias>0 shifts mean upward
         let cfg_pos = TimestepConfig {
@@ -461,7 +476,11 @@ mod tests {
             max_strength: 1.0,
         };
         let m_pos = mean(&sample_n(&cfg_pos, 5, 2048));
-        assert!(m_pos > 0.55, "bias=+1 sigmoid mean shifts up, got {}", m_pos);
+        assert!(
+            m_pos > 0.55,
+            "bias=+1 sigmoid mean shifts up, got {}",
+            m_pos
+        );
     }
 
     /// LogitNormal with bias=0 → sigmoid(scale*N(0,1)) is symmetric around 0.5.
@@ -477,7 +496,11 @@ mod tests {
         };
         let xs = sample_n(&cfg, 6, 2048);
         for x in &xs {
-            assert!(*x > 0.0 && *x < 1.0, "logit_normal must be open-interval, got {}", x);
+            assert!(
+                *x > 0.0 && *x < 1.0,
+                "logit_normal must be open-interval, got {}",
+                x
+            );
         }
         let m = mean(&xs);
         assert!((m - 0.5).abs() < 0.05, "logit_normal mean ≈ 0.5, got {}", m);

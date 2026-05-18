@@ -50,12 +50,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
-use serde::Deserialize;
 use cudarc::driver::CudaDevice;
 use flame_core::{parameter::Parameter, DType, Shape, Tensor};
+use serde::Deserialize;
 
 use lycoris_rs::{
-    algorithms::{full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule},
+    algorithms::{
+        full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule,
+    },
     dora::{apply_weight_decompose, init_magnitude},
     LycorisAdapter, LycorisModule, StorageDtype,
 };
@@ -616,9 +618,8 @@ impl LycorisBundle {
         let w_f32 = w.to_dtype(DType::F32).map_err(|e| {
             anyhow!("DoRA init_magnitude: cast w_orig to F32 for {name} failed: {e}")
         })?;
-        let m = init_magnitude(&w_f32, self.config.dora_wd_on_out, 0.0).map_err(|e| {
-            anyhow!("DoRA init_magnitude({name}): {e}")
-        })?;
+        let m = init_magnitude(&w_f32, self.config.dora_wd_on_out, 0.0)
+            .map_err(|e| anyhow!("DoRA init_magnitude({name}): {e}"))?;
         // Trainable: requires_grad=true so optimizer collects it.
         Ok(Some(m.requires_grad_(true)))
     }
@@ -656,15 +657,14 @@ impl LycorisBundle {
                 dims.len()
             );
         }
-        let w_pt = w.permute(&[3, 2, 0, 1]).map_err(|e| {
-            anyhow!("DoRA: permute w_orig flame→pytorch for {name} failed: {e}")
-        })?;
+        let w_pt = w
+            .permute(&[3, 2, 0, 1])
+            .map_err(|e| anyhow!("DoRA: permute w_orig flame→pytorch for {name} failed: {e}"))?;
         let w_f32 = w_pt.to_dtype(DType::F32).map_err(|e| {
             anyhow!("DoRA init_magnitude: cast w_orig to F32 for {name} failed: {e}")
         })?;
-        let m = init_magnitude(&w_f32, self.config.dora_wd_on_out, 0.0).map_err(|e| {
-            anyhow!("DoRA init_magnitude({name}): {e}")
-        })?;
+        let m = init_magnitude(&w_f32, self.config.dora_wd_on_out, 0.0)
+            .map_err(|e| anyhow!("DoRA init_magnitude({name}): {e}"))?;
         Ok(Some(m.requires_grad_(true)))
     }
 
@@ -849,8 +849,9 @@ impl LycorisBundle {
         // Helper: pull the live tensor out of a `Parameter`. The clone
         // preserves `TensorId` so it stays paired with autograd state.
         let pt = |p: &flame_core::parameter::Parameter| -> anyhow::Result<Tensor> {
-            p.tensor()
-                .map_err(|e| anyhow::anyhow!("collect_adapter_tensors: parameter mutex poisoned: {e}"))
+            p.tensor().map_err(|e| {
+                anyhow::anyhow!("collect_adapter_tensors: parameter mutex poisoned: {e}")
+            })
         };
         match adapter {
             LycorisAdapter::LoCon(m) => {
@@ -931,11 +932,7 @@ impl LycorisBundle {
     /// and produce `[*, out_features]`. Z-Image's training forward feeds
     /// `[B, seq, dim]`; LoCon::forward dispatches via matmul on the last dim,
     /// preserving leading batch / sequence axes.
-    pub fn forward_delta(
-        &self,
-        name: &str,
-        input: &Tensor,
-    ) -> anyhow::Result<Option<Tensor>> {
+    pub fn forward_delta(&self, name: &str, input: &Tensor) -> anyhow::Result<Option<Tensor>> {
         let Some(adapter) = self.get(name) else {
             return Ok(None);
         };
@@ -943,7 +940,11 @@ impl LycorisBundle {
         let input_dt = input.dtype();
         let cast_in = if input_dt != storage_dt {
             input.to_dtype(storage_dt).map_err(|e| {
-                anyhow!("forward_delta({name}): cast input {:?}→{:?}: {e}", input_dt, storage_dt)
+                anyhow!(
+                    "forward_delta({name}): cast input {:?}→{:?}: {e}",
+                    input_dt,
+                    storage_dt
+                )
             })?
         } else {
             input.clone()
@@ -995,14 +996,10 @@ impl LycorisBundle {
     ///
     /// Returns `Ok(None)` when DoRA is off for this name (so callers can use
     /// `.unwrap_or(wp)`-style wiring).
-    pub fn apply_dora(
-        &self,
-        name: &str,
-        wp: &Tensor,
-    ) -> anyhow::Result<Option<Tensor>> {
-        let (_, mag) = self.get_with_dora(name).ok_or_else(|| {
-            anyhow!("apply_dora: no adapter registered for '{name}'")
-        })?;
+    pub fn apply_dora(&self, name: &str, wp: &Tensor) -> anyhow::Result<Option<Tensor>> {
+        let (_, mag) = self
+            .get_with_dora(name)
+            .ok_or_else(|| anyhow!("apply_dora: no adapter registered for '{name}'"))?;
         let Some(m) = mag else { return Ok(None) };
         let result =
             apply_weight_decompose(wp, m, self.config.dora_wd_on_out, self.config.dora_eps)
@@ -1133,7 +1130,11 @@ fn detect_algo_from_keys(
         let Some(rest) = strip(k) else { continue };
         if rest.ends_with(".dora_scale") || rest.ends_with(".magnitude_vector") {
             dora_present = true;
-            adapter_names.insert(rest.rsplit_once('.').map(|(p, _)| p.to_string()).unwrap_or(rest));
+            adapter_names.insert(
+                rest.rsplit_once('.')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or(rest),
+            );
             continue;
         }
         // Remove trailing `.weight` if present, then test suffix.
@@ -1157,11 +1158,7 @@ fn detect_algo_from_keys(
         adapter_names.insert(head.to_string());
     }
 
-    let nz: Vec<_> = counts
-        .iter()
-        .enumerate()
-        .filter(|(_, &c)| c > 0)
-        .collect();
+    let nz: Vec<_> = counts.iter().enumerate().filter(|(_, &c)| c > 0).collect();
     if nz.is_empty() {
         bail!("detect_algo_from_keys: no recognized LyCORIS suffixes under prefix '{prefix}'");
     }
@@ -1381,10 +1378,7 @@ impl AdapterStore {
     /// reflecting any per-target overrides), `Ok(None)` when the preset's
     /// `target_module` filter excludes this name. Returns `Err` only on a
     /// malformed override (e.g. unknown algo string).
-    fn resolve_effective_config(
-        &self,
-        name: &str,
-    ) -> anyhow::Result<Option<LycorisBundleConfig>> {
+    fn resolve_effective_config(&self, name: &str) -> anyhow::Result<Option<LycorisBundleConfig>> {
         let Some(preset) = self.config.preset.as_ref() else {
             return Ok(Some(self.config.clone()));
         };
@@ -1452,9 +1446,7 @@ impl AdapterStore {
         // `apply_preset` semantics).
         let effective_config = self.resolve_effective_config(name)?;
         if effective_config.is_none() {
-            log::debug!(
-                "AdapterStore: name='{name}' filtered out by lycoris_config target_module"
-            );
+            log::debug!("AdapterStore: name='{name}' filtered out by lycoris_config target_module");
             return Ok(());
         }
         let effective_config = effective_config.unwrap();
@@ -1510,7 +1502,12 @@ impl AdapterStore {
                     ),
                     LycorisAlgo::LoHa => LycorisAdapter::LoHa(
                         LoHaModule::new_linear_for_training(
-                            in_features, out_features, self.config.rank, alpha, device, dtype,
+                            in_features,
+                            out_features,
+                            self.config.rank,
+                            alpha,
+                            device,
+                            dtype,
                         )
                         .map_err(|e| anyhow!("LoHa::new_linear_for_training({name}): {e}"))?,
                     ),
@@ -1585,20 +1582,13 @@ impl AdapterStore {
         // Same per-target preset overlay as `build_and_push_linear`.
         let effective_config = self.resolve_effective_config(name)?;
         if effective_config.is_none() {
-            log::debug!(
-                "AdapterStore: name='{name}' filtered out by lycoris_config target_module"
-            );
+            log::debug!("AdapterStore: name='{name}' filtered out by lycoris_config target_module");
             return Ok(());
         }
         let effective_config = effective_config.unwrap();
         let saved_config = std::mem::replace(&mut self.config, effective_config);
-        let result = self.build_and_push_conv2d_inner(
-            name,
-            in_channels,
-            out_channels,
-            kernel_size,
-            w_orig,
-        );
+        let result =
+            self.build_and_push_conv2d_inner(name, in_channels, out_channels, kernel_size, w_orig);
         self.config = saved_config;
         return result;
     }
@@ -1936,6 +1926,9 @@ mod tests {
     #[test]
     fn qualify_handles_empty_prefix() {
         assert_eq!(qualify("", "x.y"), "x.y");
-        assert_eq!(qualify("transformer", "blocks.0.attn"), "transformer.blocks.0.attn");
+        assert_eq!(
+            qualify("transformer", "blocks.0.attn"),
+            "transformer.blocks.0.attn"
+        );
     }
 }

@@ -69,14 +69,15 @@ impl WanVae {
                     return Err(flame_core::Error::InvalidInput(
                         "Wan2.1 VAE multi-frame video path not wired in EDv2 yet \
                          (Wan21VaeEncoder::encode_video_raw is private). Use --num-latent-frames 1 \
-                         or switch to TI2V-5B (Wan2.2 VAE) for multi-frame.".into()
+                         or switch to TI2V-5B (Wan2.2 VAE) for multi-frame."
+                            .into(),
                     ));
                 }
                 let img = video.squeeze(Some(2))?; // [B, 3, H, W]
-                // Wan22VaeEncoder::encode returns NORMALIZED latents
-                // (mean/std baked in). Match that contract here so cache
-                // semantics are uniform across variants — trainer doesn't
-                // need to know which VAE produced the cache.
+                                                   // Wan22VaeEncoder::encode returns NORMALIZED latents
+                                                   // (mean/std baked in). Match that contract here so cache
+                                                   // semantics are uniform across variants — trainer doesn't
+                                                   // need to know which VAE produced the cache.
                 let z = e.encode_image_normalized(&img)?; // [B, 16, H/8, W/8]
                 z.unsqueeze(2) // [B, 16, 1, H/8, W/8]
             }
@@ -86,34 +87,46 @@ impl WanVae {
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] input_dir: PathBuf,
-    #[arg(long)] output_dir: PathBuf,
+    #[arg(long)]
+    input_dir: PathBuf,
+    #[arg(long)]
+    output_dir: PathBuf,
     /// Wan 2.2 VAE for `--variant ti2v_5b`, Wan 2.1 VAE for the 14B variants.
-    #[arg(long)] vae_ckpt: PathBuf,
+    #[arg(long)]
+    vae_ckpt: PathBuf,
     /// UMT5-XXL safetensors (HF `T5EncoderModel` key layout).
-    #[arg(long)] text_ckpt: PathBuf,
+    #[arg(long)]
+    text_ckpt: PathBuf,
     /// UMT5 SentencePiece tokenizer.json.
-    #[arg(long)] tokenizer_path: PathBuf,
+    #[arg(long)]
+    tokenizer_path: PathBuf,
 
     /// Variant: `ti2v_5b` (Wan2.2 VAE 16× / 48 ch) or `t2v_14b`/`i2v_14b`
     /// (Wan2.1 VAE 8× / 16 ch).
-    #[arg(long, default_value = "ti2v_5b")] variant: String,
+    #[arg(long, default_value = "ti2v_5b")]
+    variant: String,
 
     /// Square spatial size in pixels.
-    #[arg(long, default_value = "256")] size: usize,
+    #[arg(long, default_value = "256")]
+    size: usize,
     /// Number of latent frames. For single images, leave at 1. Source frame
     /// count must satisfy `(F_src - 1) % 4 == 0`; we apply
     /// `F_lat = 1 + (F_src - 1) / 4`.
-    #[arg(long, default_value = "1")] num_latent_frames: usize,
+    #[arg(long, default_value = "1")]
+    num_latent_frames: usize,
 
-    #[arg(long, default_value_t = 0)] max_samples: usize,
-    #[arg(long, default_value_t = true)] skip_existing: bool,
+    #[arg(long, default_value_t = 0)]
+    max_samples: usize,
+    #[arg(long, default_value_t = true)]
+    skip_existing: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at this point.
-        unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
+        unsafe {
+            std::env::set_var("FLAME_ALLOC_POOL", "0");
+        }
     }
     env_logger::init();
     let args = Args::parse();
@@ -133,7 +146,10 @@ fn main() -> anyhow::Result<()> {
     if args.size % pixel_step != 0 {
         anyhow::bail!(
             "--size {} must be a multiple of {} for variant {} (VAE stride {} × patch 2)",
-            args.size, pixel_step, args.variant, vae_stride
+            args.size,
+            pixel_step,
+            args.variant,
+            vae_stride
         );
     }
 
@@ -147,7 +163,9 @@ fn main() -> anyhow::Result<()> {
             // Wan21VaeEncoder uses `from_safetensors(path: &str, device)` —
             // legacy entry name, predates the wan22 sibling.
             WanVae::V21(Wan21VaeEncoder::from_safetensors(
-                args.vae_ckpt.to_str().ok_or_else(|| anyhow::anyhow!("--vae-ckpt path is not utf-8"))?,
+                args.vae_ckpt
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("--vae-ckpt path is not utf-8"))?,
                 &device,
             )?)
         }
@@ -240,7 +258,10 @@ fn main() -> anyhow::Result<()> {
         // Save
         let mut tensors = HashMap::new();
         tensors.insert("latent".to_string(), latent.to_dtype(DType::BF16)?);
-        tensors.insert("text_embedding".to_string(), text_embed.to_dtype(DType::BF16)?);
+        tensors.insert(
+            "text_embedding".to_string(),
+            text_embed.to_dtype(DType::BF16)?,
+        );
         tensors.insert("text_mask".to_string(), text_mask);
         tensors.insert("text_real_len".to_string(), text_real_len_t);
         save_file(&tensors, &out_path)?;

@@ -135,7 +135,10 @@ mod tests {
         // t=200, total=1000, m=0.5 → 200 + 0.5*(1000-200) = 600
         assert!(approx(apply_bias(200.0, 1000.0, &cfg), 600.0, 1e-4));
         // m=1.0 fully pulls to total
-        let cfg2 = BiasConfig { multiplier: 1.0, ..cfg };
+        let cfg2 = BiasConfig {
+            multiplier: 1.0,
+            ..cfg
+        };
         assert!(approx(apply_bias(0.0, 1000.0, &cfg2), 1000.0, 1e-4));
     }
 
@@ -148,7 +151,10 @@ mod tests {
         };
         // t=800, m=0.5 → 800*0.5 = 400
         assert!(approx(apply_bias(800.0, 1000.0, &cfg), 400.0, 1e-4));
-        let cfg2 = BiasConfig { multiplier: 1.0, ..cfg };
+        let cfg2 = BiasConfig {
+            multiplier: 1.0,
+            ..cfg
+        };
         assert!(approx(apply_bias(999.0, 1000.0, &cfg2), 0.0, 1e-4));
     }
 

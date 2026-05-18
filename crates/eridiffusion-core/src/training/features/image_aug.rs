@@ -69,8 +69,8 @@ pub fn apply_augs<R: Rng>(
 mod tests {
     use super::*;
     use image::Rgb;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn inactive_is_noop() {
@@ -92,7 +92,16 @@ mod tests {
         // seed ever stops flipping with `flip: true`, search a different seed
         // such that the first `gen_bool(0.5)` returns true.
         let mut rng = StdRng::seed_from_u64(0);
-        apply_augs(&mut img, None, &AugConfig { flip: true, brightness: 0.0, contrast: 0.0 }, &mut rng);
+        apply_augs(
+            &mut img,
+            None,
+            &AugConfig {
+                flip: true,
+                brightness: 0.0,
+                contrast: 0.0,
+            },
+            &mut rng,
+        );
         // 0 ↔ 1 (or no-op) — accept either; the test just needs to not panic.
         let p0 = *img.get_pixel(0, 0);
         let p1 = *img.get_pixel(1, 0);
@@ -104,7 +113,16 @@ mod tests {
     fn brightness_shifts_pixels() {
         let mut img = Rgb32FImage::from_pixel(1, 1, Rgb([0.5, 0.5, 0.5]));
         let mut rng = StdRng::seed_from_u64(123);
-        apply_augs(&mut img, None, &AugConfig { flip: false, brightness: 0.2, contrast: 0.0 }, &mut rng);
+        apply_augs(
+            &mut img,
+            None,
+            &AugConfig {
+                flip: false,
+                brightness: 0.2,
+                contrast: 0.0,
+            },
+            &mut rng,
+        );
         let p = img.get_pixel(0, 0).0[0];
         assert!(p >= 0.3 && p <= 0.7, "expected ~0.5±0.2 got {p}");
     }
@@ -113,7 +131,16 @@ mod tests {
     fn contrast_pivots_around_half() {
         let mut img = Rgb32FImage::from_pixel(1, 1, Rgb([0.5, 0.5, 0.5]));
         let mut rng = StdRng::seed_from_u64(0);
-        apply_augs(&mut img, None, &AugConfig { flip: false, brightness: 0.0, contrast: 0.5 }, &mut rng);
+        apply_augs(
+            &mut img,
+            None,
+            &AugConfig {
+                flip: false,
+                brightness: 0.0,
+                contrast: 0.5,
+            },
+            &mut rng,
+        );
         // Pixel value 0.5 stays at 0.5 under any contrast (pivot point).
         assert!((img.get_pixel(0, 0).0[0] - 0.5).abs() < 1e-6);
     }
@@ -122,7 +149,16 @@ mod tests {
     fn clamps_out_of_range() {
         let mut img = Rgb32FImage::from_pixel(1, 1, Rgb([0.0, 1.0, 0.5]));
         let mut rng = StdRng::seed_from_u64(0);
-        apply_augs(&mut img, None, &AugConfig { flip: false, brightness: 1.0, contrast: 0.0 }, &mut rng);
+        apply_augs(
+            &mut img,
+            None,
+            &AugConfig {
+                flip: false,
+                brightness: 1.0,
+                contrast: 0.0,
+            },
+            &mut rng,
+        );
         let p = img.get_pixel(0, 0).0;
         for v in p.iter() {
             assert!(*v >= 0.0 && *v <= 1.0);

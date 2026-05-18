@@ -56,14 +56,15 @@ use eridiffusion_core::sampler::wan22_sampler::{
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::{
-    ema_advanced::EmaConfig, loss_weight, lr_schedule, timestep_bias,
-    validation::ValidationLoop,
+    ema_advanced::EmaConfig, loss_weight, lr_schedule, timestep_bias, validation::ValidationLoop,
+};
+use eridiffusion_core::training::training_features::timestep_dist::{
+    TimestepConfig, TimestepDistribution,
 };
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
-use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
-use std::str::FromStr as _;
 use flame_core::autograd::AutogradContext;
 use flame_core::{DType, Shape, Tensor};
+use std::str::FromStr as _;
 
 const SEED: u64 = 42;
 const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
@@ -75,17 +76,21 @@ const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] config: PathBuf,
-    #[arg(long)] cache_dir: PathBuf,
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    cache_dir: PathBuf,
 
     // ── Wan 2.2 dual-expert checkpoints ─────────────────────────────────
     /// High-noise expert checkpoint. Used when `t_continuous >=
     /// --noise-boundary`. Required for 14B; ignored for 5B.
-    #[arg(long)] high_noise: Option<PathBuf>,
+    #[arg(long)]
+    high_noise: Option<PathBuf>,
     /// Low-noise expert checkpoint. Used when `t_continuous <
     /// --noise-boundary`. For 5B (single expert) this is the only
     /// checkpoint and must be set.
-    #[arg(long)] low_noise: PathBuf,
+    #[arg(long)]
+    low_noise: PathBuf,
     /// Continuous-`t` boundary for dual-expert dispatch. Default
     /// matches Wan 2.2 T2V-A14B (`0.875 * 1000 = 875` timesteps).
     /// Ignored when `--variant ti2v_5b`.
@@ -96,37 +101,49 @@ struct Args {
     /// `bf16 | fp16 | fp8_scaled`. `fp8_scaled` accepts on-disk FP8
     /// (only meaningful gain is disk space until flame-core grows an
     /// FP8 runtime DType). LoRA params remain F32.
-    #[arg(long, default_value = "bf16")] weight_dtype: String,
+    #[arg(long, default_value = "bf16")]
+    weight_dtype: String,
 
     /// Wan 2.2 variant: `ti2v_5b` (single expert, dim=3072) or
     /// `t2v_14b` (dual expert, dim=5120) or `i2v_14b` (dual, image-
     /// conditioned — out of scope for this port).
-    #[arg(long, default_value = "t2v_14b")] variant: String,
+    #[arg(long, default_value = "t2v_14b")]
+    variant: String,
 
     /// Wan VAE checkpoint path. Used by the sampler/preview path; the
     /// trainer itself consumes pre-cached latents.
-    #[arg(long)] vae: Option<PathBuf>,
+    #[arg(long)]
+    vae: Option<PathBuf>,
 
     // ── Training surface (mirrors Klein/LTX-2) ──────────────────────────
-    #[arg(long, default_value = "2000")] steps: usize,
-    #[arg(long, default_value = "16")] rank: usize,
-    #[arg(long, default_value = "16.0")] lora_alpha: f64,
-    #[arg(long, default_value = "5e-5")] lr: f32,
-    #[arg(long, default_value = "1")] batch_size: usize,
-    #[arg(long, default_value = "output")] output_dir: PathBuf,
+    #[arg(long, default_value = "2000")]
+    steps: usize,
+    #[arg(long, default_value = "16")]
+    rank: usize,
+    #[arg(long, default_value = "16.0")]
+    lora_alpha: f64,
+    #[arg(long, default_value = "5e-5")]
+    lr: f32,
+    #[arg(long, default_value = "1")]
+    batch_size: usize,
+    #[arg(long, default_value = "output")]
+    output_dir: PathBuf,
 
     /// Time-shift (`sample_shift` in the Wan repo). Defaults to TI2V-5B
     /// official 5.0; T2V-A14B reference also uses 5.0.
-    #[arg(long, default_value_t = DEFAULT_SHIFT_TI2V_5B)] shift: f32,
+    #[arg(long, default_value_t = DEFAULT_SHIFT_TI2V_5B)]
+    shift: f32,
 
     /// `sigmoid_scale` for the logit-normal sampler. 1.0 reproduces the
     /// archive default.
-    #[arg(long, default_value_t = 1.0)] sigmoid_scale: f32,
+    #[arg(long, default_value_t = 1.0)]
+    sigmoid_scale: f32,
 
     /// Legacy timestep method: `logit_normal | uniform`. Used only when
     /// `--timestep-distribution=auto` (default). Both go through the wan22
     /// `apply_time_shift(_, shift)` helper after sampling.
-    #[arg(long, default_value = "logit_normal")] timestep_method: String,
+    #[arg(long, default_value = "logit_normal")]
+    timestep_method: String,
     /// Unified OneTrainer timestep distribution. `auto` (default) keeps
     /// the legacy `--timestep-method` path for byte-equivalence with
     /// pre-flag runs. Other choices: `uniform`, `sigmoid`, `logit_normal`,
@@ -134,97 +151,149 @@ struct Args {
     /// chosen distribution samples a base `t ∈ [0, 1]`, then the wan22
     /// `apply_time_shift(_, shift)` is applied on top — matching the
     /// legacy plumbing.
-    #[arg(long, default_value = "auto")] timestep_distribution: String,
+    #[arg(long, default_value = "auto")]
+    timestep_distribution: String,
     /// Distribution-specific weight knob (default 0.0).
-    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    #[arg(long, default_value_t = 0.0)]
+    noising_weight: f32,
     /// Distribution-specific bias knob (default 0.0).
-    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
+    #[arg(long, default_value_t = 0.0)]
+    noising_bias: f32,
 
-    #[arg(long, default_value = "0")] save_every: usize,
-    #[arg(long, default_value = "0")] sample_every: usize,
-    #[arg(long, default_value = "")] sample_prompt: String,
-    #[arg(long, default_value = "256")] sample_size: usize,
-    #[arg(long, default_value = "20")] sample_steps: usize,
-    #[arg(long, default_value = "5.0")] sample_cfg: f32,
-    #[arg(long, default_value = "42")] sample_seed: u64,
+    #[arg(long, default_value = "0")]
+    save_every: usize,
+    #[arg(long, default_value = "0")]
+    sample_every: usize,
+    #[arg(long, default_value = "")]
+    sample_prompt: String,
+    #[arg(long, default_value = "256")]
+    sample_size: usize,
+    #[arg(long, default_value = "20")]
+    sample_steps: usize,
+    #[arg(long, default_value = "5.0")]
+    sample_cfg: f32,
+    #[arg(long, default_value = "42")]
+    sample_seed: u64,
 
     /// Resume training from a previous LoRA checkpoint pair.
-    #[arg(long)] resume_high_lora: Option<PathBuf>,
-    #[arg(long)] resume_low_lora: Option<PathBuf>,
+    #[arg(long)]
+    resume_high_lora: Option<PathBuf>,
+    #[arg(long)]
+    resume_low_lora: Option<PathBuf>,
 
     /// Optimizer family. AdamW8bit explicitly permitted for Wan 2.2
     /// per `feedback_wan22_quant_exception.md`. Phase 1 falls back to
     /// AdamW for unrecognised values.
-    #[arg(long, default_value = "adamw")] optimizer: String,
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
 
     /// Hard upper bound — useful for smoke tests / dry-runs.
-    #[arg(long)] max_steps: Option<usize>,
+    #[arg(long)]
+    max_steps: Option<usize>,
 
     // ── Modern feature surface (mirror Klein) ──────────────────────────
-    #[arg(long)] min_snr_gamma: Option<f32>,
-    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
-    #[arg(long)] null_text_cache: Option<PathBuf>,
-    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
-    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
-    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
-    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
+    #[arg(long)]
+    min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    caption_dropout_probability: f32,
+    #[arg(long)]
+    null_text_cache: Option<PathBuf>,
+    #[arg(long, default_value_t = 1.0)]
+    noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)]
+    gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)]
+    huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lr_min_factor: f32,
     /// Global gradient L2 clip threshold. Default 1.0 matches the prior
     /// hardcoded constant; SimpleTuner's example wan-2.2 configs use 0.1
     /// (steadier convergence on video). 2026-05-09 audit H7.
-    #[arg(long, default_value_t = 1.0)] max_grad_norm: f32,
+    #[arg(long, default_value_t = 1.0)]
+    max_grad_norm: f32,
     /// Run the grad-coverage diagnostic every N steps (and at step 1 and
     /// the final step). Catches the chroma-pattern partial-gradient bug
     /// at step 1 instead of at step 500. Cost: ~50-150 ms per call. 0 to
     /// disable. 2026-05-09 audit H10.
-    #[arg(long, default_value_t = 50)] grad_coverage_every: usize,
+    #[arg(long, default_value_t = 50)]
+    grad_coverage_every: usize,
     /// Warn level for grad-coverage. If the fraction of LoRA params with
     /// non-zero grad is below this, emit `log::warn!`. Default 0.95.
-    #[arg(long, default_value_t = 0.95)] grad_coverage_warn_below: f32,
+    #[arg(long, default_value_t = 0.95)]
+    grad_coverage_warn_below: f32,
     /// Stream block weights from pinned CPU memory to a 2-slot GPU ring
     /// instead of holding all blocks resident. Frees ~num_layers ×
     /// block_bytes of GPU memory at the cost of host-to-device copies
     /// per step (overlapped with compute). Required for fitting 14B+14B
     /// dual-expert on 24 GB once flame-core grows real FP8; useful but
     /// optional for TI2V-5B at image-mode resolutions. 2026-05-09 audit M1.
-    #[arg(long, default_value_t = false)] offload: bool,
-    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
-    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
-    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<PathBuf>,
-    #[arg(long)] validation_prompts_file: Option<PathBuf>,
-    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    #[arg(long, default_value_t = false)]
+    offload: bool,
+    #[arg(long)]
+    validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    validation_every_steps: u64,
+    #[arg(long, num_args = 0..)]
+    multi_backend_weights: Vec<f32>,
+    #[arg(long, num_args = 0..)]
+    multi_backend_cache_dirs: Vec<PathBuf>,
+    #[arg(long)]
+    validation_prompts_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 0.0)]
+    masked_loss_weight: f32,
 
     /// EMA — default-off → byte-identical to no-EMA.
-    #[arg(long, default_value_t = false)] ema: bool,
-    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
-    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
-    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
-    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
-    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
-    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+    #[arg(long, default_value_t = false)]
+    ema: bool,
+    #[arg(long, default_value_t = 1.0)]
+    ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)]
+    ema_power: f32,
+    #[arg(long, default_value_t = 0)]
+    ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)]
+    ema_min_decay: f32,
+    #[arg(long, default_value_t = 0.9999)]
+    ema_max_decay: f32,
+    #[arg(long, default_value_t = false)]
+    ema_validation_swap: bool,
 
     /// Multi-resolution noise — 4D-only helper; Wan latents are 5D
     /// `[B, C, F, H, W]` so this emits a warn-and-skip (kept for CLI
     /// uniformity).
-    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
-    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+    #[arg(long, default_value_t = 0)]
+    multires_noise_iterations: usize,
+    #[arg(long, default_value_t = 0.3)]
+    multires_noise_discount: f32,
 
     /// Timestep biasing — default `none` is byte-identical to no
     /// biasing.
-    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
-    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    #[arg(long, default_value = "none")]
+    timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)]
+    timestep_bias_range_max: f32,
 
-    #[arg(long)] tread_route_pattern: Option<String>,
+    #[arg(long)]
+    tread_route_pattern: Option<String>,
 
-    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
-    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
-    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
-    #[arg(long, default_value_t = false)] cache_invalidate: bool,
-    #[arg(long, default_value = "constant")] lr_scheduler: String,
-    #[arg(long, default_value_t = 0)] warmup_steps: usize,
-    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+    #[arg(long, num_args = 0..)]
+    multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
+    #[arg(long, default_value = "constant")]
+    lr_scheduler: String,
+    #[arg(long, default_value_t = 0)]
+    warmup_steps: usize,
+    #[arg(long, default_value_t = 1.0)]
+    lr_cycles: f32,
 
     // ── LyCORIS algo selection (Phase 2b — dual-net wan22 special case) ──
     //
@@ -240,64 +309,84 @@ struct Args {
     /// | `locon` | `loha` | `lokr` | `full` | `oft`. `full` and `oft` build
     /// successfully but their `forward_delta` errors inside wan22's
     /// `base + delta_on_input` call pattern; Phase 2c wires merge-into-base.
-    #[arg(long, default_value = "lora")] algo_low: String,
+    #[arg(long, default_value = "lora")]
+    algo_low: String,
     /// LyCORIS algo for the HIGH-noise expert (dual-expert variants only).
     /// Same value-set as `--algo_low`. Ignored for `--variant ti2v_5b`.
-    #[arg(long, default_value = "lora")] algo_high: String,
+    #[arg(long, default_value = "lora")]
+    algo_high: String,
     /// LoKr Kronecker split factor (ignored for non-LoKr).
-    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    #[arg(long, default_value_t = 16)]
+    lokr_factor: i32,
     /// OFT/BOFT block size (ignored for non-OFT/BOFT).
-    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    #[arg(long, default_value_t = 32)]
+    oft_block_size: usize,
     /// OFT Cayley-Neumann series term count.
-    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    #[arg(long, default_value_t = 5)]
+    oft_neumann_terms: usize,
     /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
     /// kernels. Wan22 attention projections are linear-only so this is a
     /// no-op for the current target set.
-    #[arg(long, default_value_t = false)] use_tucker: bool,
+    #[arg(long, default_value_t = false)]
+    use_tucker: bool,
     /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
-    #[arg(long, default_value_t = false)] decompose_both: bool,
+    #[arg(long, default_value_t = false)]
+    decompose_both: bool,
     /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr/Full.
-    #[arg(long, default_value_t = false)] dora: bool,
+    #[arg(long, default_value_t = false)]
+    dora: bool,
     /// DoRA magnitude axis (`true` = lycoris-upstream).
-    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
-    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    #[arg(long, default_value_t = true)]
+    dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)]
+    dora_eps: f32,
     /// PEFT/SimpleTuner `--lora_init_type`. Applies to LoCon (the LoRA path)
     /// only. Choices: `default | gaussian | pissa | olora | loftq`. The
     /// PISSA/OLoRA/LoftQ variants parse but error at adapter construction
     /// because flame-core does not yet expose SVD/QR.
-    #[arg(long, default_value = "default")] lora_init_type: String,
+    #[arg(long, default_value = "default")]
+    lora_init_type: String,
     /// SimpleTuner-style `lycoris_config preset.json`. Optional; per-target
     /// `module_algo_map` overrides apply during adapter construction. The
     /// same preset is shared by `low_noise` and `high_noise` experts.
-    #[arg(long)] lycoris_config: Option<PathBuf>,
+    #[arg(long)]
+    lycoris_config: Option<PathBuf>,
     /// SimpleTuner-parity: perturbed-normal LoKr init. Scale `>0` triggers
     /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`. No-op when algo != lokr or
     /// value is 0.0. Phase 2b: per-net base-weight access not yet plumbed
     /// for wan22 (BlockOffloader streams blocks); apply call logs a warning
     /// and returns Ok(()) on LoKr. Phase 2c follow-up.
-    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    #[arg(long, default_value_t = 0.0)]
+    init_lokr_norm: f32,
     /// SimpleTuner / ai-toolkit `network.conv` — per-LyCORIS rank for
     /// CONV-layer targets (separate from linear `--rank`). `0` (default)
     /// = fall back to linear rank. Inert when no conv targets are wired
     /// in the model bundle (current state on all EDv2 trainers).
-    #[arg(long, default_value_t = 0)] conv_rank: usize,
+    #[arg(long, default_value_t = 0)]
+    conv_rank: usize,
     /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
     /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
-    #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
+    #[arg(long, default_value_t = 0.0)]
+    conv_alpha: f32,
     /// Per-element dropout on the adapter delta (training only).
-    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lora_dropout: f32,
     /// Per-rank Bernoulli on the down-projection intermediate.
-    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    rank_dropout: f32,
     /// Per-step Bernoulli on the entire adapter.
-    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    module_dropout: f32,
     /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
-    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
+    #[arg(long, default_value_t = false)]
+    rank_dropout_scale: bool,
 
     // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
     /// Route the backward pass through `AutogradContext::backward_v2`
     /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
-    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
 }
 
 fn parse_weight_dtype(s: &str) -> anyhow::Result<DType> {
@@ -336,8 +425,8 @@ fn main() -> anyhow::Result<()> {
     let device = flame_core::global_cuda_device();
 
     // ── Variant + dual-expert wiring ────────────────────────────────────
-    let variant = Wan22Variant::parse(&args.variant)
-        .map_err(|e| anyhow::anyhow!("--variant: {e}"))?;
+    let variant =
+        Wan22Variant::parse(&args.variant).map_err(|e| anyhow::anyhow!("--variant: {e}"))?;
     let cfg = Wan22Config::for_variant(variant);
     let weight_dtype = parse_weight_dtype(&args.weight_dtype)?;
 
@@ -516,14 +605,9 @@ fn main() -> anyhow::Result<()> {
                 algo_low.as_str(),
             );
         }
-        let new_bundle = Wan22LoraBundle::new_with_config(
-            &cfg,
-            &lyc_config_low,
-            device.clone(),
-            SEED,
-            "low",
-        )
-        .map_err(|e| anyhow::anyhow!("LyCORIS bundle (low) construction: {e}"))?;
+        let new_bundle =
+            Wan22LoraBundle::new_with_config(&cfg, &lyc_config_low, device.clone(), SEED, "low")
+                .map_err(|e| anyhow::anyhow!("LyCORIS bundle (low) construction: {e}"))?;
         log::info!(
             "[wan22:low] LyCORIS algo='{}' adapters={}",
             algo_low.as_str(),
@@ -620,9 +704,7 @@ fn main() -> anyhow::Result<()> {
     // Per `feedback_wan22_quant_exception`, AdamW8bit remains supported.
     let opt_kind = OptimizerKind::parse(&args.optimizer)
         .map_err(|e| anyhow::anyhow!("--optimizer parse: {e}"))?;
-    let make_opt = || -> Optimizer {
-        Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01)
-    };
+    let make_opt = || -> Optimizer { Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01) };
     log::info!("[wan22] optimizer={}", opt_kind.as_str());
     let mut opt_low = make_opt();
     let mut opt_high: Option<Optimizer> = if dual { Some(make_opt()) } else { None };
@@ -642,29 +724,35 @@ fn main() -> anyhow::Result<()> {
     let mut null_text_mask: Option<Tensor> = None;
     let null_text: Option<Tensor> = if effective_caption_dropout_prob > 0.0 {
         match args.null_text_cache.as_ref() {
-            Some(p) => match flame_core::serialization::load_file(p, &device) {
-                Ok(s) => {
-                    let nt = s.get("text_embedding")
-                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
-                        .to_dtype(DType::BF16)?;
-                    // text_mask is best-effort: missing means "no padding mask
-                    // for null text" which is fine — null caption is short and
-                    // the model has seen padded null at training time anyway.
-                    null_text_mask = s.get("text_mask").and_then(|t| t.to_dtype(DType::F32).ok());
-                    log::info!(
+            Some(p) => {
+                match flame_core::serialization::load_file(p, &device) {
+                    Ok(s) => {
+                        let nt = s
+                            .get("text_embedding")
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("--null-text-cache missing 'text_embedding'")
+                            })?
+                            .to_dtype(DType::BF16)?;
+                        // text_mask is best-effort: missing means "no padding mask
+                        // for null text" which is fine — null caption is short and
+                        // the model has seen padded null at training time anyway.
+                        null_text_mask =
+                            s.get("text_mask").and_then(|t| t.to_dtype(DType::F32).ok());
+                        log::info!(
                         "[caption-dropout] WIRED — prob={:.3} (null_text_embedding={:?}, mask={})",
                         effective_caption_dropout_prob,
                         nt.shape().dims(),
                         if null_text_mask.is_some() { "present" } else { "absent" }
                     );
-                    Some(nt)
+                        Some(nt)
+                    }
+                    Err(e) => {
+                        log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — feature disabled", p.display());
+                        effective_caption_dropout_prob = 0.0;
+                        None
+                    }
                 }
-                Err(e) => {
-                    log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — feature disabled", p.display());
-                    effective_caption_dropout_prob = 0.0;
-                    None
-                }
-            },
+            }
             None => {
                 log::warn!(
                     "caption_dropout_probability={:.3} requested but --null-text-cache not provided — feature disabled",
@@ -688,29 +776,31 @@ fn main() -> anyhow::Result<()> {
     };
     let mut ema_low: Option<ParameterEma> = if args.ema {
         let _g = AutogradContext::no_grad();
-        Some(ParameterEma::new(&params_low, args.ema_max_decay)
-            .map_err(|e| anyhow::anyhow!("EMA-low construction: {e}"))?)
+        Some(
+            ParameterEma::new(&params_low, args.ema_max_decay)
+                .map_err(|e| anyhow::anyhow!("EMA-low construction: {e}"))?,
+        )
     } else {
         None
     };
     let mut ema_high: Option<ParameterEma> = if args.ema && dual {
         let _g = AutogradContext::no_grad();
-        Some(ParameterEma::new(&params_high, args.ema_max_decay)
-            .map_err(|e| anyhow::anyhow!("EMA-high construction: {e}"))?)
+        Some(
+            ParameterEma::new(&params_high, args.ema_max_decay)
+                .map_err(|e| anyhow::anyhow!("EMA-high construction: {e}"))?,
+        )
     } else {
         None
     };
     if let Some(ref e) = ema_low {
         log::info!(
             "[ema:low] WIRED — {} shadow tensors, validation_swap={}",
-            e.len(), args.ema_validation_swap
+            e.len(),
+            args.ema_validation_swap
         );
     }
     if let Some(ref e) = ema_high {
-        log::info!(
-            "[ema:high] WIRED — {} shadow tensors",
-            e.len()
-        );
+        log::info!("[ema:high] WIRED — {} shadow tensors", e.len());
     }
 
     if args.multires_noise_iterations > 0 {
@@ -732,7 +822,10 @@ fn main() -> anyhow::Result<()> {
         if strategy != timestep_bias::Strategy::None {
             log::info!(
                 "[timestep-bias] strategy={} multiplier={} range=[{},{}]",
-                strategy.as_str(), cfg.multiplier, cfg.range_min, cfg.range_max
+                strategy.as_str(),
+                cfg.multiplier,
+                cfg.range_min,
+                cfg.range_max
             );
         }
         cfg
@@ -749,25 +842,32 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!(
         "Found {} cached samples (batch_size={})",
-        cache_files.len(), args.batch_size
+        cache_files.len(),
+        args.batch_size
     );
 
     // ── Validation harness ──────────────────────────────────────────────
-    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
-        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
-    {
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) = (
+        args.validation_dataset_dir.as_ref(),
+        args.validation_every_steps,
+    ) {
         if n > 0 {
             let v = ValidationLoop::new(dir, n)?;
             log::info!("[validation] {} held-out, every {} steps", v.len(), n);
             Some(v)
-        } else { None }
-    } else { None };
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let _ = validation_loop; // wired but eval pass below is a stub until forward lands
 
     // ── Per-step state ──────────────────────────────────────────────────
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
     let board = BoardWriter::open(&args.output_dir, BoardWriter::new_session_id(), None)
-        .map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+        .map_err(|e| log::warn!("board.db open failed: {e}"))
+        .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
     }
@@ -776,25 +876,23 @@ fn main() -> anyhow::Result<()> {
     let sched: LrScheduler = lr_schedule::parse_cli_scheduler(&args.lr_scheduler);
 
     let timestep_method = args.timestep_method.to_ascii_lowercase();
-    let use_logit_normal = matches!(
-        timestep_method.as_str(),
-        "logit_normal" | "logitnormal"
-    );
+    let use_logit_normal = matches!(timestep_method.as_str(), "logit_normal" | "logitnormal");
     // Unified OneTrainer timestep distribution dispatch (optional override).
     // `auto` keeps the legacy `--timestep-method` path for byte-equivalence.
-    let unified_timestep_cfg: Option<TimestepConfig> = if args.timestep_distribution.eq_ignore_ascii_case("auto") {
-        None
-    } else {
-        let dist = TimestepDistribution::from_str(&args.timestep_distribution)
-            .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
-        Some(TimestepConfig {
-            distribution: dist,
-            noising_weight: args.noising_weight,
-            noising_bias: args.noising_bias,
-            min_strength: 0.0,
-            max_strength: 1.0,
-        })
-    };
+    let unified_timestep_cfg: Option<TimestepConfig> =
+        if args.timestep_distribution.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            let dist = TimestepDistribution::from_str(&args.timestep_distribution)
+                .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+            Some(TimestepConfig {
+                distribution: dist,
+                noising_weight: args.noising_weight,
+                noising_bias: args.noising_bias,
+                min_strength: 0.0,
+                max_strength: 1.0,
+            })
+        };
 
     // ── Training loop ───────────────────────────────────────────────────
     log::info!("[wan22] starting training: {} steps", steps);
@@ -808,10 +906,12 @@ fn main() -> anyhow::Result<()> {
         for bi in 0..args.batch_size {
             let cache_idx = (step * args.batch_size + bi) % cache_files.len();
             let sample = flame_core::serialization::load_file(&cache_files[cache_idx], &device)?;
-            let latent = sample.get("latent")
+            let latent = sample
+                .get("latent")
                 .ok_or_else(|| anyhow::anyhow!("cached sample missing 'latent'"))?
                 .to_dtype(DType::BF16)?;
-            let txt = sample.get("text_embedding")
+            let txt = sample
+                .get("text_embedding")
                 .ok_or_else(|| anyhow::anyhow!("cached sample missing 'text_embedding'"))?
                 .to_dtype(DType::BF16)?;
             // Validate Wan video latent: 5D, H/W even (patch_size=(1,2,2)).
@@ -819,17 +919,22 @@ fn main() -> anyhow::Result<()> {
             if dims.len() != 5 {
                 anyhow::bail!(
                     "Wan22 latent must be 5D [B, C, F, H, W], got {:?} from {}",
-                    dims, cache_files[cache_idx].display()
+                    dims,
+                    cache_files[cache_idx].display()
                 );
             }
             if dims[3] % 2 != 0 || dims[4] % 2 != 0 {
                 anyhow::bail!(
                     "Wan22 latent H/W must be even (patch_size=(1,2,2)), got H={}, W={} from {}",
-                    dims[3], dims[4], cache_files[cache_idx].display()
+                    dims[3],
+                    dims[4],
+                    cache_files[cache_idx].display()
                 );
             }
             // Read optional text_mask (audit H1). Missing in old caches.
-            let txt_mask = sample.get("text_mask").and_then(|t| t.to_dtype(DType::F32).ok());
+            let txt_mask = sample
+                .get("text_mask")
+                .and_then(|t| t.to_dtype(DType::F32).ok());
             // Caption dropout: swap to null embedding (and its mask) when fired.
             let dropout_fired = if let Some(_) = null_text {
                 use rand::Rng;
@@ -838,10 +943,7 @@ fn main() -> anyhow::Result<()> {
                 false
             };
             let (txt, txt_mask) = if dropout_fired {
-                (
-                    null_text.as_ref().unwrap().clone(),
-                    null_text_mask.clone(),
-                )
+                (null_text.as_ref().unwrap().clone(), null_text_mask.clone())
             } else {
                 (txt, txt_mask)
             };
@@ -885,11 +987,8 @@ fn main() -> anyhow::Result<()> {
             };
             // timestep_bias works in 1000-step space.
             let t_in_steps = raw_t * NUM_TRAIN_TIMESTEPS;
-            let t_biased = timestep_bias::apply_bias(
-                t_in_steps,
-                NUM_TRAIN_TIMESTEPS,
-                &timestep_bias_cfg,
-            );
+            let t_biased =
+                timestep_bias::apply_bias(t_in_steps, NUM_TRAIN_TIMESTEPS, &timestep_bias_cfg);
             t_continuous.push((t_biased / NUM_TRAIN_TIMESTEPS).clamp(1.0e-4, 1.0 - 1.0e-4));
         }
 
@@ -913,8 +1012,9 @@ fn main() -> anyhow::Result<()> {
         // to randn_seeded with a derived per-step seed makes the run
         // bit-identical across re-launches.)
         let noise_seed = SEED.wrapping_add((step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let noise = Tensor::randn_seeded(latent.shape().clone(), 0.0, 1.0, noise_seed, device.clone())?
-            .to_dtype(DType::BF16)?;
+        let noise =
+            Tensor::randn_seeded(latent.shape().clone(), 0.0, 1.0, noise_seed, device.clone())?
+                .to_dtype(DType::BF16)?;
         let (noisy, target) = if args.batch_size == 1 {
             let t = t_continuous[0];
             let noisy_5d = noise.mul_scalar(t)?.add(&latent.mul_scalar(1.0 - t)?)?;
@@ -929,7 +1029,8 @@ fn main() -> anyhow::Result<()> {
                 t_continuous.clone(),
                 Shape::from_dims(&[args.batch_size, 1, 1, 1, 1]),
                 device.clone(),
-            )?.to_dtype(DType::BF16)?;
+            )?
+            .to_dtype(DType::BF16)?;
             let one_minus_t = t_tensor.mul_scalar(-1.0)?.add_scalar(1.0)?;
             let noisy = noise.mul(&t_tensor)?.add(&latent.mul(&one_minus_t)?)?;
             let target = noise.sub(&latent)?;
@@ -937,7 +1038,10 @@ fn main() -> anyhow::Result<()> {
         };
 
         // Wan timestep tensor: t * 1000 (matches archive prepare_inputs).
-        let t_scaled: Vec<f32> = t_continuous.iter().map(|t| t * NUM_TRAIN_TIMESTEPS).collect();
+        let t_scaled: Vec<f32> = t_continuous
+            .iter()
+            .map(|t| t * NUM_TRAIN_TIMESTEPS)
+            .collect();
         let timestep = Tensor::from_vec(
             t_scaled,
             Shape::from_dims(&[args.batch_size]),
@@ -947,7 +1051,10 @@ fn main() -> anyhow::Result<()> {
         if step == 0 {
             log::info!(
                 "step 0 | latent={:?} text={:?} t={:.4} expert={:?}",
-                latent.shape().dims(), txt.shape().dims(), t_continuous[0], chosen
+                latent.shape().dims(),
+                txt.shape().dims(),
+                t_continuous[0],
+                chosen
             );
         }
 
@@ -970,7 +1077,8 @@ fn main() -> anyhow::Result<()> {
         if pred.shape().dims() != target.shape().dims() {
             anyhow::bail!(
                 "predicted shape {:?} != target {:?}",
-                pred.shape().dims(), target.shape().dims()
+                pred.shape().dims(),
+                target.shape().dims()
             );
         }
 
@@ -978,7 +1086,8 @@ fn main() -> anyhow::Result<()> {
         let pred_f32 = pred.to_dtype(DType::F32)?;
         let target_f32 = target.to_dtype(DType::F32)?;
         let raw_loss = loss_weight::combined_loss(
-            &pred_f32, &target_f32,
+            &pred_f32,
+            &target_f32,
             config.mse_strength as f32,
             config.mae_strength as f32,
             args.huber_strength,
@@ -1030,13 +1139,15 @@ fn main() -> anyhow::Result<()> {
                     None => ("wan22-low", low_model.lora.named_parameters()),
                 },
             };
-            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = named
-                .iter()
-                .map(|(n, p)| (n.as_str(), p))
-                .collect();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
             let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
             if report.is_clean() {
-                log::info!("[grad-flow] step 2 clean ({}: {} params)", label, report.ok_count);
+                log::info!(
+                    "[grad-flow] step 2 clean ({}: {} params)",
+                    label,
+                    report.ok_count
+                );
             } else {
                 log::warn!("[grad-flow] {}: {}", label, report.summary());
             }
@@ -1050,19 +1161,23 @@ fn main() -> anyhow::Result<()> {
         if do_grad_coverage {
             let active_for_cov = match chosen {
                 Expert::High => &params_high,
-                Expert::Low  => &params_low,
+                Expert::Low => &params_low,
             };
-            let label = match chosen { Expert::High => "wan22-high", Expert::Low => "wan22-low" };
+            let label = match chosen {
+                Expert::High => "wan22-high",
+                Expert::Low => "wan22-low",
+            };
             match eridiffusion_core::training::grad_coverage::GradCoverage::measure(
-                active_for_cov, &grads,
+                active_for_cov,
+                &grads,
             ) {
                 Ok(cov) => cov.report_warn_below(args.grad_coverage_warn_below, label),
-                Err(e)  => log::warn!("[grad-coverage] measure failed at step {step}: {e}"),
+                Err(e) => log::warn!("[grad-coverage] measure failed at step {step}: {e}"),
             }
         }
         let active_params = match chosen {
             Expert::High => &params_high,
-            Expert::Low  => &params_low,
+            Expert::Low => &params_low,
         };
         let grad_refs: Vec<&flame_core::Tensor> = active_params
             .iter()
@@ -1074,16 +1189,29 @@ fn main() -> anyhow::Result<()> {
             flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32
         };
         // 2026-05-09 audit H7: --max-grad-norm now CLI-configurable.
-        let scale = if total_norm > args.max_grad_norm { args.max_grad_norm / total_norm } else { 1.0 };
+        let scale = if total_norm > args.max_grad_norm {
+            args.max_grad_norm / total_norm
+        } else {
+            1.0
+        };
         for param in active_params {
             if let Some(g) = grads.get(param.id()) {
-                let g_scaled = if scale < 1.0 { g.mul_scalar(scale)? } else { g.clone() };
+                let g_scaled = if scale < 1.0 {
+                    g.mul_scalar(scale)?
+                } else {
+                    g.clone()
+                };
                 param.set_grad(g_scaled)?;
             }
         }
         let cur_lr = lr_schedule::dispatch_lr(
-            &sched, args.lr, step, steps,
-            args.warmup_steps, args.lr_min_factor, args.lr_cycles,
+            &sched,
+            args.lr,
+            step,
+            steps,
+            args.warmup_steps,
+            args.lr_min_factor,
+            args.lr_cycles,
         );
         {
             let _g = AutogradContext::no_grad();
@@ -1098,7 +1226,9 @@ fn main() -> anyhow::Result<()> {
                         e.update_with_schedule(&params_high, &ema_cfg, (step + 1) as u64)
                             .map_err(|err| anyhow::anyhow!("EMA-high update {step}: {err}"))?;
                     }
-                    if let Some(ref hm) = high_model { hm.refresh_lora_cache(); }
+                    if let Some(ref hm) = high_model {
+                        hm.refresh_lora_cache();
+                    }
                 }
                 Expert::Low => {
                     opt_low.set_lr(cur_lr);
@@ -1116,22 +1246,33 @@ fn main() -> anyhow::Result<()> {
 
         eridiffusion_core::training::progress::log_step(
             "Wan2.2-lora",
-            step, steps, cache_files.len(), args.batch_size.max(1),
-            loss_val, total_norm, cur_lr, t_start, board.as_ref(),
+            step,
+            steps,
+            cache_files.len(),
+            args.batch_size.max(1),
+            loss_val,
+            total_norm,
+            cur_lr,
+            t_start,
+            board.as_ref(),
         );
 
         // --- 8. Periodic save
         let step_num = step + 1;
         let save_fires = args.save_every > 0 && step_num % args.save_every == 0 && step_num < steps;
         if save_fires {
-            let p_low = args.output_dir.join(format!("wan22_low_lora_step{step_num}.safetensors"));
+            let p_low = args
+                .output_dir
+                .join(format!("wan22_low_lora_step{step_num}.safetensors"));
             if let Err(e) = low_model.save_weights(&p_low) {
                 log::warn!("[mid-save low @ {step_num}] {e}");
             } else {
                 log::info!("[mid-save low @ {step_num}] {}", p_low.display());
             }
             if let Some(ref hm) = high_model {
-                let p_hi = args.output_dir.join(format!("wan22_high_lora_step{step_num}.safetensors"));
+                let p_hi = args
+                    .output_dir
+                    .join(format!("wan22_high_lora_step{step_num}.safetensors"));
                 if let Err(e) = hm.save_weights(&p_hi) {
                     log::warn!("[mid-save high @ {step_num}] {e}");
                 } else {
@@ -1141,18 +1282,32 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let avg_loss = if steps > 0 { total_loss / steps as f32 } else { 0.0 };
-    log::info!("Training complete: {} steps, avg loss={:.4}", steps, avg_loss);
-    if let Some(b) = &board { b.set_status("completed"); }
+    let avg_loss = if steps > 0 {
+        total_loss / steps as f32
+    } else {
+        0.0
+    };
+    log::info!(
+        "Training complete: {} steps, avg loss={:.4}",
+        steps,
+        avg_loss
+    );
+    if let Some(b) = &board {
+        b.set_status("completed");
+    }
 
-    let final_low = args.output_dir.join(format!("wan22_low_lora_{}steps.safetensors", steps));
+    let final_low = args
+        .output_dir
+        .join(format!("wan22_low_lora_{}steps.safetensors", steps));
     if let Err(e) = low_model.save_weights(&final_low) {
         log::warn!("save_weights low: {e}");
     } else {
         log::info!("Saved {}", final_low.display());
     }
     if let Some(ref hm) = high_model {
-        let final_hi = args.output_dir.join(format!("wan22_high_lora_{}steps.safetensors", steps));
+        let final_hi = args
+            .output_dir
+            .join(format!("wan22_high_lora_{}steps.safetensors", steps));
         if let Err(e) = hm.save_weights(&final_hi) {
             log::warn!("save_weights high: {e}");
         } else {
@@ -1170,10 +1325,17 @@ fn rehydrate_bundle(
 ) -> anyhow::Result<()> {
     // 2026-05-09 audit H5: now delegates to `Wan22LoraBundle::rehydrate`,
     // which is shared with `sample_wan22 --low-lora/--high-lora`.
-    let (hits, total) = model.lora.rehydrate(map)
+    let (hits, total) = model
+        .lora
+        .rehydrate(map)
         .map_err(|e| anyhow::anyhow!("rehydrate: {e}"))?;
     let misses = total.saturating_sub(hits);
-    log::info!("[wan22:{}] rehydrated {} adapters ({} missing)", model.expert_label, hits, misses);
+    log::info!(
+        "[wan22:{}] rehydrated {} adapters ({} missing)",
+        model.expert_label,
+        hits,
+        misses
+    );
     if hits == 0 {
         anyhow::bail!("no LoRA adapters matched in resume file (key prefix mismatch)");
     }

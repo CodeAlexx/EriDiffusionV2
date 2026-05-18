@@ -64,14 +64,16 @@
 //!
 //! NOT on: distilled_guidance_layer, x_embedder, context_embedder, proj_out (top-level).
 
-use flame_core::autograd::AutogradContext;
-use flame_core::{parameter::Parameter, DType, Result, Tensor};
 use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::lora::LoRALinear;
 use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
-use crate::training::block_offload::{BlockOffloader, BlockFacilitator};
+use crate::training::block_offload::{BlockFacilitator, BlockOffloader};
+use flame_core::autograd::AutogradContext;
+use flame_core::{parameter::Parameter, DType, Result, Tensor};
 use lycoris_rs::{
-    algorithms::{full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule},
+    algorithms::{
+        full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule,
+    },
     dora::init_magnitude,
     LycorisAdapter, LycorisModule, StorageDtype,
 };
@@ -117,16 +119,27 @@ pub const NORM_EPS: f32 = 1e-6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DoubleLoraTarget {
-    ImgQ, ImgK, ImgV, ImgOut,
-    TxtQ, TxtK, TxtV, TxtOut,
-    ImgFfnGate, ImgFfnOut,
-    TxtFfnGate, TxtFfnOut,
+    ImgQ,
+    ImgK,
+    ImgV,
+    ImgOut,
+    TxtQ,
+    TxtK,
+    TxtV,
+    TxtOut,
+    ImgFfnGate,
+    ImgFfnOut,
+    TxtFfnGate,
+    TxtFfnOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SingleLoraTarget {
-    Q, K, V,
-    ProjMlp, ProjOut,
+    Q,
+    K,
+    V,
+    ProjMlp,
+    ProjOut,
 }
 
 // ---------------------------------------------------------------------------
@@ -456,10 +469,18 @@ impl ChromaLoraBundle {
                 skipped += 1;
                 return Ok(());
             };
-            let did = adapter.init_perturbed_normal_lokr(base, scale).map_err(|e| {
-                flame_core::Error::InvalidInput(format!("init_perturbed_normal_lokr({prefix}): {e}"))
-            })?;
-            if did { applied += 1; } else { skipped += 1; }
+            let did = adapter
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| {
+                    flame_core::Error::InvalidInput(format!(
+                        "init_perturbed_normal_lokr({prefix}): {e}"
+                    ))
+                })?;
+            if did {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
             Ok(())
         };
         for (&(block_idx, target), adapter) in &self.double_adapters {
@@ -472,9 +493,7 @@ impl ChromaLoraBundle {
             let prefix = format!("single_transformer_blocks.{block_idx}.{suffix}");
             try_one(&prefix, adapter.as_ref())?;
         }
-        log::info!(
-            "[chroma][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
-        );
+        log::info!("[chroma][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}");
         Ok(skipped)
     }
 
@@ -532,7 +551,9 @@ pub(crate) fn build_lycoris_linear(
                 device.clone(),
                 dtype,
             )
-            .map_err(|e| flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}")))?,
+            .map_err(|e| {
+                flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}"))
+            })?,
         ),
         LycorisAlgo::LoHa => LycorisAdapter::LoHa(
             LoHaModule::new_linear_for_training(
@@ -543,7 +564,9 @@ pub(crate) fn build_lycoris_linear(
                 device.clone(),
                 dtype,
             )
-            .map_err(|e| flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}")))?,
+            .map_err(|e| {
+                flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}"))
+            })?,
         ),
         LycorisAlgo::LoKr => LycorisAdapter::LoKr(
             LoKrModule::new_linear(
@@ -603,11 +626,7 @@ pub(crate) fn build_lycoris_linear(
         } else {
             flame_core::Shape::from_dims(&[1, in_features])
         };
-        let ones = Tensor::from_vec(
-            vec![1.0_f32; shape.elem_count()],
-            shape,
-            device.clone(),
-        )?;
+        let ones = Tensor::from_vec(vec![1.0_f32; shape.elem_count()], shape, device.clone())?;
         // Round-trip through init_magnitude to keep parity with non-identity
         // future paths and to set requires_grad consistently.
         let m = init_magnitude(&ones, config.dora_wd_on_out, 0.0)
@@ -768,14 +787,23 @@ impl ChromaTrainingModel {
         device: Arc<cudarc::driver::CudaDevice>,
         seed: u64,
     ) -> Result<Self> {
-        log::info!("[chroma-trainer] loading Chroma from {} (mode={})", model_path.display(), mode);
+        log::info!(
+            "[chroma-trainer] loading Chroma from {} (mode={})",
+            model_path.display(),
+            mode
+        );
 
         let all_weights = Self::load_weights(model_path, &device)?;
-        log::info!("[chroma-trainer] loaded {} weight tensors", all_weights.len());
+        log::info!(
+            "[chroma-trainer] loaded {} weight tensors",
+            all_weights.len()
+        );
 
         let mut resident = HashMap::new();
-        let mut double_blocks: Vec<HashMap<String, Tensor>> = (0..NUM_DOUBLE_BLOCKS).map(|_| HashMap::new()).collect();
-        let mut single_blocks: Vec<HashMap<String, Tensor>> = (0..NUM_SINGLE_BLOCKS).map(|_| HashMap::new()).collect();
+        let mut double_blocks: Vec<HashMap<String, Tensor>> =
+            (0..NUM_DOUBLE_BLOCKS).map(|_| HashMap::new()).collect();
+        let mut single_blocks: Vec<HashMap<String, Tensor>> =
+            (0..NUM_SINGLE_BLOCKS).map(|_| HashMap::new()).collect();
 
         for (key, tensor) in &all_weights {
             if let Some(rest) = key.strip_prefix("transformer_blocks.") {
@@ -804,13 +832,19 @@ impl ChromaTrainingModel {
 
         log::info!(
             "[chroma-trainer] {} resident, {} double block maps, {} single block maps",
-            resident.len(), double_blocks.len(), single_blocks.len()
+            resident.len(),
+            double_blocks.len(),
+            single_blocks.len()
         );
 
         let is_fft = mode == "full";
         let bundle = if !is_fft {
             let b = ChromaLoraBundle::new(lora_rank, lora_alpha, device.clone(), seed)?;
-            log::info!("[chroma-trainer] {} LoRA adapters (rank={})", b.num_adapters(), lora_rank);
+            log::info!(
+                "[chroma-trainer] {} LoRA adapters (rank={})",
+                b.num_adapters(),
+                lora_rank
+            );
             Some(b)
         } else {
             None
@@ -825,7 +859,10 @@ impl ChromaTrainingModel {
                     params.push(p);
                 }
             }
-            log::info!("[chroma-trainer] FFT mode: {} trainable parameters", params.len());
+            log::info!(
+                "[chroma-trainer] FFT mode: {} trainable parameters",
+                params.len()
+            );
             Some(params)
         } else {
             None
@@ -896,15 +933,23 @@ impl ChromaTrainingModel {
         shard_paths.sort();
 
         if shard_paths.is_empty() {
-            return Err(flame_core::Error::InvalidInput(
-                format!("no safetensors files found in {}", dir.display()),
-            ));
+            return Err(flame_core::Error::InvalidInput(format!(
+                "no safetensors files found in {}",
+                dir.display()
+            )));
         }
 
-        log::info!("[chroma-trainer] loading {} shards from {}", shard_paths.len(), dir.display());
+        log::info!(
+            "[chroma-trainer] loading {} shards from {}",
+            shard_paths.len(),
+            dir.display()
+        );
         let mut all_weights = HashMap::new();
         for shard in &shard_paths {
-            log::info!("[chroma-trainer]   loading shard: {}", shard.file_name().unwrap().to_string_lossy());
+            log::info!(
+                "[chroma-trainer]   loading shard: {}",
+                shard.file_name().unwrap().to_string_lossy()
+            );
             let shard_weights = flame_core::serialization::load_file(shard, device)?;
             for (k, v) in shard_weights {
                 all_weights.insert(k, v);
@@ -923,7 +968,10 @@ impl ChromaTrainingModel {
         device: Arc<cudarc::driver::CudaDevice>,
         seed: u64,
     ) -> Result<Self> {
-        log::info!("[chroma-trainer] loading Chroma with BlockOffloader from {}", model_path.display());
+        log::info!(
+            "[chroma-trainer] loading Chroma with BlockOffloader from {}",
+            model_path.display()
+        );
 
         // Discover shard paths
         let shard_paths = if model_path.is_dir() {
@@ -944,9 +992,10 @@ impl ChromaTrainingModel {
         };
 
         if shard_paths.is_empty() {
-            return Err(flame_core::Error::InvalidInput(
-                format!("no safetensors files found at {}", model_path.display()),
-            ));
+            return Err(flame_core::Error::InvalidInput(format!(
+                "no safetensors files found at {}",
+                model_path.display()
+            )));
         }
 
         let path_refs: Vec<&str> = shard_paths.iter().map(|s| s.as_str()).collect();
@@ -977,14 +1026,11 @@ impl ChromaTrainingModel {
         // Load ONLY shared (non-block) weights to GPU
         let mut resident = HashMap::new();
         for shard_path in &shard_paths {
-            let shard_weights = flame_core::serialization::load_file_filtered(
-                shard_path,
-                &device,
-                |key| {
+            let shard_weights =
+                flame_core::serialization::load_file_filtered(shard_path, &device, |key| {
                     !key.starts_with("transformer_blocks.")
                         && !key.starts_with("single_transformer_blocks.")
-                },
-            )?;
+                })?;
             for (k, v) in shard_weights {
                 resident.insert(k, v);
             }
@@ -992,14 +1038,19 @@ impl ChromaTrainingModel {
 
         log::info!(
             "[chroma-trainer] offloader: {} shared weights on GPU, {} blocks in {:.1} MB pinned",
-            resident.len(), NUM_TOTAL_BLOCKS,
+            resident.len(),
+            NUM_TOTAL_BLOCKS,
             offloader.pinned_bytes() as f64 / (1024.0 * 1024.0),
         );
 
         let is_fft = mode == "full";
         let bundle = if !is_fft {
             let b = ChromaLoraBundle::new(lora_rank, lora_alpha, device.clone(), seed)?;
-            log::info!("[chroma-trainer] {} LoRA adapters (rank={})", b.num_adapters(), lora_rank);
+            log::info!(
+                "[chroma-trainer] {} LoRA adapters (rank={})",
+                b.num_adapters(),
+                lora_rank
+            );
             Some(b)
         } else {
             None
@@ -1043,7 +1094,11 @@ impl ChromaTrainingModel {
         } else {
             // FFT: save all block weights
             let mut tensors = HashMap::new();
-            for block_map in self.double_block_weights.iter().chain(self.single_block_weights.iter()) {
+            for block_map in self
+                .double_block_weights
+                .iter()
+                .chain(self.single_block_weights.iter())
+            {
                 for (key, tensor) in block_map {
                     tensors.insert(key.clone(), tensor.clone());
                 }
@@ -1064,7 +1119,8 @@ impl ChromaTrainingModel {
     // -----------------------------------------------------------------------
 
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.resident_weights.get(key)
+        self.resident_weights
+            .get(key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing weight: {key}")))
     }
 
@@ -1079,36 +1135,50 @@ impl ChromaTrainingModel {
 
     fn dw(&self, block_idx: usize, key: &str) -> Result<&Tensor> {
         let full_key = format!("transformer_blocks.{block_idx}.{key}");
-        self.double_block_weights[block_idx].get(&full_key)
+        self.double_block_weights[block_idx]
+            .get(&full_key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {full_key}")))
     }
 
     fn sw(&self, block_idx: usize, key: &str) -> Result<&Tensor> {
         let full_key = format!("single_transformer_blocks.{block_idx}.{key}");
-        self.single_block_weights[block_idx].get(&full_key)
+        self.single_block_weights[block_idx]
+            .get(&full_key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {full_key}")))
     }
 
     /// Look up a double-block weight, using external map (BlockOffloader) if provided, else stored.
-    fn dw_or<'a>(&'a self, ext: Option<&'a HashMap<String, Tensor>>, block_idx: usize, key: &str) -> Result<&'a Tensor> {
+    fn dw_or<'a>(
+        &'a self,
+        ext: Option<&'a HashMap<String, Tensor>>,
+        block_idx: usize,
+        key: &str,
+    ) -> Result<&'a Tensor> {
         let full_key = format!("transformer_blocks.{block_idx}.{key}");
         if let Some(w) = ext {
             w.get(&full_key)
                 .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {full_key}")))
         } else {
-            self.double_block_weights[block_idx].get(&full_key)
+            self.double_block_weights[block_idx]
+                .get(&full_key)
                 .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {full_key}")))
         }
     }
 
     /// Look up a single-block weight, using external map (BlockOffloader) if provided, else stored.
-    fn sw_or<'a>(&'a self, ext: Option<&'a HashMap<String, Tensor>>, block_idx: usize, key: &str) -> Result<&'a Tensor> {
+    fn sw_or<'a>(
+        &'a self,
+        ext: Option<&'a HashMap<String, Tensor>>,
+        block_idx: usize,
+        key: &str,
+    ) -> Result<&'a Tensor> {
         let full_key = format!("single_transformer_blocks.{block_idx}.{key}");
         if let Some(w) = ext {
             w.get(&full_key)
                 .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {full_key}")))
         } else {
-            self.single_block_weights[block_idx].get(&full_key)
+            self.single_block_weights[block_idx]
+                .get(&full_key)
                 .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {full_key}")))
         }
     }
@@ -1132,7 +1202,12 @@ impl ChromaTrainingModel {
         out_2d.reshape(&out_shape)
     }
 
-    fn block_linear_no_bias(&self, x: &Tensor, weight: &Tensor, pre_transposed: bool) -> Result<Tensor> {
+    fn block_linear_no_bias(
+        &self,
+        x: &Tensor,
+        weight: &Tensor,
+        pre_transposed: bool,
+    ) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let in_feat = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
@@ -1152,12 +1227,24 @@ impl ChromaTrainingModel {
         out_2d.reshape(&out_shape)
     }
 
-    fn block_linear_bias(&self, x: &Tensor, weight: &Tensor, bias: &Tensor, pre_transposed: bool) -> Result<Tensor> {
+    fn block_linear_bias(
+        &self,
+        x: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        pre_transposed: bool,
+    ) -> Result<Tensor> {
         let out = self.block_linear_no_bias(x, weight, pre_transposed)?;
         out.add(bias)
     }
 
-    fn add_double_lora_delta(&self, base: Tensor, input: &Tensor, block_idx: usize, target: DoubleLoraTarget) -> Result<Tensor> {
+    fn add_double_lora_delta(
+        &self,
+        base: Tensor,
+        input: &Tensor,
+        block_idx: usize,
+        target: DoubleLoraTarget,
+    ) -> Result<Tensor> {
         if let Some(ref bundle) = self.bundle {
             if let Some(lora) = bundle.double_adapters.get(&(block_idx, target)) {
                 if lora.is_input_rotation() {
@@ -1183,7 +1270,13 @@ impl ChromaTrainingModel {
         Ok(base)
     }
 
-    fn add_single_lora_delta(&self, base: Tensor, input: &Tensor, block_idx: usize, target: SingleLoraTarget) -> Result<Tensor> {
+    fn add_single_lora_delta(
+        &self,
+        base: Tensor,
+        input: &Tensor,
+        block_idx: usize,
+        target: SingleLoraTarget,
+    ) -> Result<Tensor> {
         if let Some(ref bundle) = self.bundle {
             if let Some(lora) = bundle.single_adapters.get(&(block_idx, target)) {
                 if lora.is_input_rotation() {
@@ -1191,7 +1284,8 @@ impl ChromaTrainingModel {
                     let rx = lora.apply_input(&in3d)?;
                     let delta_x = rx.sub(&in3d)?;
                     let suffix = single_lora_suffix(target);
-                    let weight_key = format!("single_transformer_blocks.{block_idx}.{suffix}.weight");
+                    let weight_key =
+                        format!("single_transformer_blocks.{block_idx}.{suffix}.weight");
                     let weight = self.w(&weight_key)?;
                     let delta = self.block_linear_no_bias(&delta_x, weight, false)?;
                     return base.add(&delta);
@@ -1255,9 +1349,21 @@ impl ChromaTrainingModel {
     /// Returns: [B, N_img, 64] BF16 (predicted velocity in patch space)
     pub fn forward(
         &self,
-        latent: &Tensor,      // [B, 16, H_lat, W_lat]
-        txt: &Tensor,         // [B, N_txt, 4096]
-        timesteps: &Tensor,   // [B]
+        latent: &Tensor,    // [B, 16, H_lat, W_lat]
+        txt: &Tensor,       // [B, N_txt, 4096]
+        timesteps: &Tensor, // [B]
+    ) -> Result<Tensor> {
+        self.forward_with_attention_mask(latent, txt, timesteps, None)
+    }
+
+    /// Same as `forward`, with an optional binary keep-mask for joint
+    /// text+image attention. Shape must broadcast to `[B, H, Q, K]`.
+    pub fn forward_with_attention_mask(
+        &self,
+        latent: &Tensor,    // [B, 16, H_lat, W_lat]
+        txt: &Tensor,       // [B, N_txt, 4096]
+        timesteps: &Tensor, // [B]
+        attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let lat_dims = latent.shape().dims().to_vec();
         let (b, _c, h_lat, w_lat) = (lat_dims[0], lat_dims[1], lat_dims[2], lat_dims[3]);
@@ -1272,17 +1378,20 @@ impl ChromaTrainingModel {
         let img = self.linear_bias_resident(&img_packed, "x_embedder.weight", "x_embedder.bias")?;
 
         // context_embedder: [B, N_txt, 4096] → [B, N_txt, 3072]
-        let txt_emb = self.linear_bias_resident(txt, "context_embedder.weight", "context_embedder.bias")?;
+        let txt_emb =
+            self.linear_bias_resident(txt, "context_embedder.weight", "context_embedder.bias")?;
 
         // Build img_ids and txt_ids for RoPE
-        let (img_ids, txt_ids) = Self::build_position_ids(h_tok, w_tok, txt.shape().dims()[1], &self.device)?;
+        let (img_ids, txt_ids) =
+            Self::build_position_ids(h_tok, w_tok, txt.shape().dims()[1], &self.device)?;
 
         // Phase timing — only when CHROMA_TIMING=1 (no-swap path only).
         let timing_setup = std::env::var("CHROMA_TIMING").is_ok();
         let dev_for_sync = self.device.clone();
         let sync_setup = || -> Result<()> {
             if timing_setup {
-                dev_for_sync.synchronize()
+                dev_for_sync
+                    .synchronize()
                     .map_err(|e| flame_core::Error::Cuda(format!("sync: {e:?}")))?;
             }
             Ok(())
@@ -1304,7 +1413,9 @@ impl ChromaTrainingModel {
         // calls forward twice per step against the same shape).
         let n_txt_for_cache = txt.shape().dims()[1];
         let cached_rope: Option<(Tensor, Tensor)> = {
-            let guard = self.rope_cache.lock()
+            let guard = self
+                .rope_cache
+                .lock()
                 .map_err(|e| flame_core::Error::InvalidInput(format!("rope_cache lock: {e}")))?;
             guard.as_ref().and_then(|c| {
                 if c.h_tok == h_tok && c.w_tok == w_tok && c.n_txt == n_txt_for_cache {
@@ -1319,7 +1430,9 @@ impl ChromaTrainingModel {
             pair
         } else {
             let (cos, sin) = self.build_rope(&img_ids, &txt_ids)?;
-            let mut guard = self.rope_cache.lock()
+            let mut guard = self
+                .rope_cache
+                .lock()
                 .map_err(|e| flame_core::Error::InvalidInput(format!("rope_cache lock: {e}")))?;
             *guard = Some(RopeCacheEntry {
                 h_tok,
@@ -1345,6 +1458,7 @@ impl ChromaTrainingModel {
         let n_txt = txt.shape().dims()[1];
         let mut img_h = img;
         let mut txt_h = txt_emb;
+        let attn_mask_owned = attention_mask.cloned();
 
         if let Some(ref offloader_mtx) = self.block_offloader {
             // ── BlockOffloader path with checkpoint_offload ──
@@ -1364,18 +1478,24 @@ impl ChromaTrainingModel {
                 let bc = bundle_arc.clone();
                 let dev_c = self.device.clone();
                 let off_c = offloader_mtx.clone();
+                let attn_c = attn_mask_owned.clone();
                 let bi = i;
                 let nt = n_txt;
 
                 let block_out = AutogradContext::checkpoint_offload(
                     &[img_c.clone(), txt_c.clone()],
                     move || {
-                        if let Some(ref b) = bc { b.refresh_caches(); }
-                        let w = off_c.lock().unwrap().ensure_block(bi)
+                        if let Some(ref b) = bc {
+                            b.refresh_caches();
+                        }
+                        let w = off_c
+                            .lock()
+                            .unwrap()
+                            .ensure_block(bi)
                             .map_err(|e| flame_core::Error::InvalidInput(format!("{e}")))?;
                         let (ni, nt_out) = double_block_fwd(
-                            &img_c, &txt_c, &temb_c, &cos_c, &sin_c,
-                            bi, &w, &rw_c, &bc, &dev_c,
+                            &img_c, &txt_c, &temb_c, &cos_c, &sin_c, bi, &w, &rw_c, &bc, &dev_c,
+                            attn_c.as_ref(),
                         )?;
                         Tensor::cat(&[&ni, &nt_out], 1)
                     },
@@ -1410,21 +1530,32 @@ impl ChromaTrainingModel {
                 let bc = bundle_arc.clone();
                 let dev_c = self.device.clone();
                 let off_c = offloader_mtx.clone();
+                let attn_c = attn_mask_owned.clone();
                 let bi = i;
 
-                h = AutogradContext::checkpoint_offload(
-                    &[h_c.clone()],
-                    move || {
-                        if let Some(ref b) = bc { b.refresh_caches(); }
-                        let swap_idx = NUM_DOUBLE_BLOCKS + bi;
-                        let w = off_c.lock().unwrap().ensure_block(swap_idx)
-                            .map_err(|e| flame_core::Error::InvalidInput(format!("{e}")))?;
-                        single_block_fwd(
-                            &h_c, &temb_c, &cos_c, &sin_c,
-                            bi, &w, &rw_c, &bc, &dev_c,
-                        )
-                    },
-                )?;
+                h = AutogradContext::checkpoint_offload(&[h_c.clone()], move || {
+                    if let Some(ref b) = bc {
+                        b.refresh_caches();
+                    }
+                    let swap_idx = NUM_DOUBLE_BLOCKS + bi;
+                    let w = off_c
+                        .lock()
+                        .unwrap()
+                        .ensure_block(swap_idx)
+                        .map_err(|e| flame_core::Error::InvalidInput(format!("{e}")))?;
+                    single_block_fwd(
+                        &h_c,
+                        &temb_c,
+                        &cos_c,
+                        &sin_c,
+                        bi,
+                        &w,
+                        &rw_c,
+                        &bc,
+                        &dev_c,
+                        attn_c.as_ref(),
+                    )
+                })?;
                 log::debug!("[fwd] single block {i}/{} done", self.num_single_blocks);
             }
 
@@ -1439,7 +1570,8 @@ impl ChromaTrainingModel {
             let timing = std::env::var("CHROMA_TIMING").is_ok();
             let sync_dev = || -> Result<()> {
                 if timing {
-                    self.device.synchronize()
+                    self.device
+                        .synchronize()
                         .map_err(|e| flame_core::Error::Cuda(format!("sync: {e:?}")))?;
                 }
                 Ok(())
@@ -1448,7 +1580,15 @@ impl ChromaTrainingModel {
             let t_double = std::time::Instant::now();
             for i in 0..self.num_double_blocks {
                 let (new_img, new_txt) = self.double_block(
-                    &img_h, &txt_h, &pooled_temb, &pe_cos, &pe_sin, i, n_txt, None,
+                    &img_h,
+                    &txt_h,
+                    &pooled_temb,
+                    &pe_cos,
+                    &pe_sin,
+                    i,
+                    n_txt,
+                    None,
+                    attention_mask,
                 )?;
                 img_h = new_img;
                 txt_h = new_txt;
@@ -1461,7 +1601,15 @@ impl ChromaTrainingModel {
             sync_dev()?;
             let t_single = std::time::Instant::now();
             for i in 0..self.num_single_blocks {
-                h = self.single_block(&h, &pooled_temb, &pe_cos, &pe_sin, i, None)?;
+                h = self.single_block(
+                    &h,
+                    &pooled_temb,
+                    &pe_cos,
+                    &pe_sin,
+                    i,
+                    None,
+                    attention_mask,
+                )?;
             }
             sync_dev()?;
             let dt_single = t_single.elapsed();
@@ -1485,8 +1633,12 @@ impl ChromaTrainingModel {
         // img_h now holds the extracted image tokens from whichever path.
         // Final norm + proj
         let final_mod_start = 3 * NUM_SINGLE_BLOCKS + 2 * 6 * NUM_DOUBLE_BLOCKS;
-        let shift = pooled_temb.narrow(1, final_mod_start, 1)?.squeeze(Some(1))?;
-        let scale = pooled_temb.narrow(1, final_mod_start + 1, 1)?.squeeze(Some(1))?;
+        let shift = pooled_temb
+            .narrow(1, final_mod_start, 1)?
+            .squeeze(Some(1))?;
+        let scale = pooled_temb
+            .narrow(1, final_mod_start + 1, 1)?
+            .squeeze(Some(1))?;
         let img_mod = Self::modulate_pre_autograd(&img_h, &shift, &scale)?;
 
         let proj_w = self.w("proj_out.weight")?;
@@ -1507,7 +1659,10 @@ impl ChromaTrainingModel {
         let num_channels = 16; // approximator_in_channels / 4
 
         // Sinusoidal timestep embedding
-        let t_scaled = timesteps.to_dtype(DType::F32)?.mul_scalar(1000.0)?.to_dtype(DType::BF16)?;
+        let t_scaled = timesteps
+            .to_dtype(DType::F32)?
+            .mul_scalar(1000.0)?
+            .to_dtype(DType::BF16)?;
         let t_proj = sinusoidal_embedding(&t_scaled, num_channels)?; // [B, 2*num_channels]
         let zeros = Tensor::zeros_dtype(
             flame_core::Shape::from_dims(&[batch_size]),
@@ -1519,13 +1674,17 @@ impl ChromaTrainingModel {
         // Concatenate timestep + guidance projections — matches diffusers/inference:
         //   conditioning = cat([timestep_proj, guidance_proj]) → [B, 2*num_channels]
         let conditioning = Tensor::cat(&[&t_proj, &g_proj], 1)?;
-        let cond_exp = conditioning.unsqueeze(1)?
-            .expand(&[batch_size, mod_index_length, 2 * num_channels])?;
+        let cond_exp =
+            conditioning
+                .unsqueeze(1)?
+                .expand(&[batch_size, mod_index_length, 2 * num_channels])?;
 
         // Build mod_proj buffer: position encoding per mod index
         let mod_proj = build_mod_proj(mod_index_length, num_channels, &self.device)?;
-        let mp_exp = mod_proj.unsqueeze(0)?
-            .expand(&[batch_size, mod_index_length, 2 * num_channels])?;
+        let mp_exp =
+            mod_proj
+                .unsqueeze(0)?
+                .expand(&[batch_size, mod_index_length, 2 * num_channels])?;
 
         // Cat conditioning + mod_proj → [B, mod_index_length, 4*num_channels]
         let input_vec = Tensor::cat(&[&cond_exp, &mp_exp], 2)?;
@@ -1538,10 +1697,18 @@ impl ChromaTrainingModel {
         // Residual blocks
         for i in 0..5 {
             let norm_w = self.w(&format!("distilled_guidance_layer.norms.{i}.weight"))?;
-            let l1_w = self.w(&format!("distilled_guidance_layer.layers.{i}.linear_1.weight"))?;
-            let l1_b = self.w(&format!("distilled_guidance_layer.layers.{i}.linear_1.bias"))?;
-            let l2_w = self.w(&format!("distilled_guidance_layer.layers.{i}.linear_2.weight"))?;
-            let l2_b = self.w(&format!("distilled_guidance_layer.layers.{i}.linear_2.bias"))?;
+            let l1_w = self.w(&format!(
+                "distilled_guidance_layer.layers.{i}.linear_1.weight"
+            ))?;
+            let l1_b = self.w(&format!(
+                "distilled_guidance_layer.layers.{i}.linear_1.bias"
+            ))?;
+            let l2_w = self.w(&format!(
+                "distilled_guidance_layer.layers.{i}.linear_2.weight"
+            ))?;
+            let l2_b = self.w(&format!(
+                "distilled_guidance_layer.layers.{i}.linear_2.bias"
+            ))?;
 
             let n = rms_norm_with_weight(&x, norm_w, NORM_EPS)?;
             let h = self.block_linear_bias(&n, l1_w, l1_b, false)?;
@@ -1569,9 +1736,10 @@ impl ChromaTrainingModel {
         block_idx: usize,
         _n_txt: usize,
         ext_weights: Option<&HashMap<String, Tensor>>,
+        attn_mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
         let pt = ext_weights.is_some(); // pre_transposed flag for block linear ops
-        // Modulation slicing
+                                        // Modulation slicing
         let img_mod_start = 3 * NUM_SINGLE_BLOCKS + 6 * block_idx;
         let txt_mod_start = 3 * NUM_SINGLE_BLOCKS + 6 * NUM_DOUBLE_BLOCKS + 6 * block_idx;
 
@@ -1650,20 +1818,44 @@ impl ChromaTrainingModel {
         txt_v = self.add_double_lora_delta(txt_v, &txt_norm, block_idx, DoubleLoraTarget::TxtV)?;
 
         // Reshape to [B, S, H, D] then [B, H, S, D]
-        let img_q = img_q.reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let img_k = img_k.reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let img_v = img_v.reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+        let img_q = img_q
+            .reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let img_k = img_k
+            .reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let img_v = img_v
+            .reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
 
         let n_t = txt.shape().dims()[1];
-        let txt_q = txt_q.reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let txt_k = txt_k.reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let txt_v = txt_v.reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+        let txt_q = txt_q
+            .reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let txt_k = txt_k
+            .reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let txt_v = txt_v
+            .reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
 
         // QK norms
-        let img_q = Self::rms_norm_per_head(&img_q, self.dw_or(ext_weights, block_idx, "attn.norm_q.weight")?)?;
-        let img_k = Self::rms_norm_per_head(&img_k, self.dw_or(ext_weights, block_idx, "attn.norm_k.weight")?)?;
-        let txt_q = Self::rms_norm_per_head(&txt_q, self.dw_or(ext_weights, block_idx, "attn.norm_added_q.weight")?)?;
-        let txt_k = Self::rms_norm_per_head(&txt_k, self.dw_or(ext_weights, block_idx, "attn.norm_added_k.weight")?)?;
+        let img_q = Self::rms_norm_per_head(
+            &img_q,
+            self.dw_or(ext_weights, block_idx, "attn.norm_q.weight")?,
+        )?;
+        let img_k = Self::rms_norm_per_head(
+            &img_k,
+            self.dw_or(ext_weights, block_idx, "attn.norm_k.weight")?,
+        )?;
+        let txt_q = Self::rms_norm_per_head(
+            &txt_q,
+            self.dw_or(ext_weights, block_idx, "attn.norm_added_q.weight")?,
+        )?;
+        let txt_k = Self::rms_norm_per_head(
+            &txt_k,
+            self.dw_or(ext_weights, block_idx, "attn.norm_added_k.weight")?,
+        )?;
 
         // Concat QKV for joint attention: [B, H, N_txt+N_img, D]
         let q = Tensor::cat(&[&txt_q, &img_q], 2)?;
@@ -1676,7 +1868,7 @@ impl ChromaTrainingModel {
         let k = rope_with_grad(&k, pe_cos, pe_sin)?;
 
         // SDPA
-        let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+        let attn_out = flame_core::attention::sdpa(&q, &k, &v, attn_mask)?;
 
         // Split attn_out [B,H,N_total,D] back into txt and img.
         // Inference path: fused kernel (no autograd needed).
@@ -1691,7 +1883,8 @@ impl ChromaTrainingModel {
             self.dw_or(ext_weights, block_idx, "attn.to_out.0.bias")?,
             pt,
         )?;
-        img_out = self.add_double_lora_delta(img_out, &img_attn, block_idx, DoubleLoraTarget::ImgOut)?;
+        img_out =
+            self.add_double_lora_delta(img_out, &img_attn, block_idx, DoubleLoraTarget::ImgOut)?;
 
         let mut txt_out = self.block_linear_bias(
             &txt_attn,
@@ -1699,7 +1892,8 @@ impl ChromaTrainingModel {
             self.dw_or(ext_weights, block_idx, "attn.to_add_out.bias")?,
             pt,
         )?;
-        txt_out = self.add_double_lora_delta(txt_out, &txt_attn, block_idx, DoubleLoraTarget::TxtOut)?;
+        txt_out =
+            self.add_double_lora_delta(txt_out, &txt_attn, block_idx, DoubleLoraTarget::TxtOut)?;
 
         // Gate + residual for attention.
         // Inference path: fused kernel. Training: falls back to elementwise.
@@ -1724,7 +1918,12 @@ impl ChromaTrainingModel {
             self.dw_or(ext_weights, block_idx, "ff.net.0.proj.bias")?,
             pt,
         )?;
-        img_ffn_h = self.add_double_lora_delta(img_ffn_h, &img_ffn_norm, block_idx, DoubleLoraTarget::ImgFfnGate)?;
+        img_ffn_h = self.add_double_lora_delta(
+            img_ffn_h,
+            &img_ffn_norm,
+            block_idx,
+            DoubleLoraTarget::ImgFfnGate,
+        )?;
         let img_ffn_h = img_ffn_h.gelu()?;
         let mut img_ffn_out = self.block_linear_bias(
             &img_ffn_h,
@@ -1732,7 +1931,12 @@ impl ChromaTrainingModel {
             self.dw_or(ext_weights, block_idx, "ff.net.2.bias")?,
             pt,
         )?;
-        img_ffn_out = self.add_double_lora_delta(img_ffn_out, &img_ffn_h, block_idx, DoubleLoraTarget::ImgFfnOut)?;
+        img_ffn_out = self.add_double_lora_delta(
+            img_ffn_out,
+            &img_ffn_h,
+            block_idx,
+            DoubleLoraTarget::ImgFfnOut,
+        )?;
 
         let img_final = if is_inference {
             flame_core::bf16_ops::gate_residual_fused_bf16(&img_r, &img_gate2, &img_ffn_out)?
@@ -1749,7 +1953,12 @@ impl ChromaTrainingModel {
             self.dw_or(ext_weights, block_idx, "ff_context.net.0.proj.bias")?,
             pt,
         )?;
-        txt_ffn_h = self.add_double_lora_delta(txt_ffn_h, &txt_ffn_norm, block_idx, DoubleLoraTarget::TxtFfnGate)?;
+        txt_ffn_h = self.add_double_lora_delta(
+            txt_ffn_h,
+            &txt_ffn_norm,
+            block_idx,
+            DoubleLoraTarget::TxtFfnGate,
+        )?;
         let txt_ffn_h = txt_ffn_h.gelu()?;
         let mut txt_ffn_out = self.block_linear_bias(
             &txt_ffn_h,
@@ -1757,7 +1966,12 @@ impl ChromaTrainingModel {
             self.dw_or(ext_weights, block_idx, "ff_context.net.2.bias")?,
             pt,
         )?;
-        txt_ffn_out = self.add_double_lora_delta(txt_ffn_out, &txt_ffn_h, block_idx, DoubleLoraTarget::TxtFfnOut)?;
+        txt_ffn_out = self.add_double_lora_delta(
+            txt_ffn_out,
+            &txt_ffn_h,
+            block_idx,
+            DoubleLoraTarget::TxtFfnOut,
+        )?;
 
         let txt_final = if is_inference {
             flame_core::bf16_ops::gate_residual_fused_bf16(&txt_r, &txt_gate2, &txt_ffn_out)?
@@ -1781,6 +1995,7 @@ impl ChromaTrainingModel {
         pe_sin: &Tensor,
         block_idx: usize,
         ext_weights: Option<&HashMap<String, Tensor>>,
+        attn_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let pt = ext_weights.is_some(); // pre_transposed flag for block linear ops
 
@@ -1831,19 +2046,31 @@ impl ChromaTrainingModel {
         let mlp_h = mlp_h.gelu()?;
 
         // Attention
-        let q = q.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+        let q = q
+            .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let k = k
+            .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let v = v
+            .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
 
         // QK norms
-        let q = Self::rms_norm_per_head(&q, self.sw_or(ext_weights, block_idx, "attn.norm_q.weight")?)?;
-        let k = Self::rms_norm_per_head(&k, self.sw_or(ext_weights, block_idx, "attn.norm_k.weight")?)?;
+        let q = Self::rms_norm_per_head(
+            &q,
+            self.sw_or(ext_weights, block_idx, "attn.norm_q.weight")?,
+        )?;
+        let k = Self::rms_norm_per_head(
+            &k,
+            self.sw_or(ext_weights, block_idx, "attn.norm_k.weight")?,
+        )?;
 
         // RoPE — use autograd-recording wrapper
         let q = rope_with_grad(&q, pe_cos, pe_sin)?;
         let k = rope_with_grad(&k, pe_cos, pe_sin)?;
 
-        let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+        let attn_out = flame_core::attention::sdpa(&q, &k, &v, attn_mask)?;
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?;
         let attn_flat = attn_out.reshape(&[b, seq, DIM])?;
 
@@ -1887,7 +2114,7 @@ impl ChromaTrainingModel {
         let dims = x.shape().dims().to_vec();
         let b = dims[0];
         let c = 16; // latent channels
-        // [B, N, 64] → [B, h_tok, w_tok, 16, 2, 2]
+                    // [B, N, 64] → [B, h_tok, w_tok, 16, 2, 2]
         let x_r = x.reshape(&[b, h_tok, w_tok, c, 2, 2])?;
         // → [B, 16, h_tok, 2, w_tok, 2]
         let x_p = x_r.permute(&[0, 3, 1, 4, 2, 5])?;
@@ -1932,11 +2159,7 @@ impl ChromaTrainingModel {
         Ok((img_ids, txt_ids))
     }
 
-    fn build_rope(
-        &self,
-        img_ids: &Tensor,
-        txt_ids: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
+    fn build_rope(&self, img_ids: &Tensor, txt_ids: &Tensor) -> Result<(Tensor, Tensor)> {
         let axes_dims = [16usize, 56, 56]; // FLUX/Chroma RoPE axes
         let rope_theta: f64 = 10000.0;
 
@@ -1989,7 +2212,8 @@ fn ensure_3d(x: &Tensor) -> Result<Tensor> {
         2 => x.unsqueeze(0),
         3 => Ok(x.clone()),
         _ => Err(flame_core::Error::InvalidInput(format!(
-            "expected 2D or 3D tensor, got {}D", dims.len()
+            "expected 2D or 3D tensor, got {}D",
+            dims.len()
         ))),
     }
 }
@@ -2116,16 +2340,25 @@ fn rope_with_grad(x: &Tensor, pe_cos: &Tensor, pe_sin: &Tensor) -> Result<Tensor
     Ok(output)
 }
 
-fn get_w<'a>(weights: &'a HashMap<String, Tensor>, prefix: &str, block_idx: usize, key: &str) -> Result<&'a Tensor> {
+fn get_w<'a>(
+    weights: &'a HashMap<String, Tensor>,
+    prefix: &str,
+    block_idx: usize,
+    key: &str,
+) -> Result<&'a Tensor> {
     let full_key = format!("{prefix}.{block_idx}.{key}");
-    weights.get(&full_key)
+    weights
+        .get(&full_key)
         .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {full_key}")))
 }
 
 fn add_lora_delta_double(
-    base: Tensor, input: &Tensor, bundle: &Option<Arc<ChromaLoraBundle>>,
+    base: Tensor,
+    input: &Tensor,
+    bundle: &Option<Arc<ChromaLoraBundle>>,
     weights: &HashMap<String, Tensor>,
-    block_idx: usize, target: DoubleLoraTarget,
+    block_idx: usize,
+    target: DoubleLoraTarget,
 ) -> Result<Tensor> {
     if let Some(ref b) = bundle {
         if let Some(lora) = b.double_adapters.get(&(block_idx, target)) {
@@ -2149,9 +2382,12 @@ fn add_lora_delta_double(
 }
 
 fn add_lora_delta_single(
-    base: Tensor, input: &Tensor, bundle: &Option<Arc<ChromaLoraBundle>>,
+    base: Tensor,
+    input: &Tensor,
+    bundle: &Option<Arc<ChromaLoraBundle>>,
     weights: &HashMap<String, Tensor>,
-    block_idx: usize, target: SingleLoraTarget,
+    block_idx: usize,
+    target: SingleLoraTarget,
 ) -> Result<Tensor> {
     if let Some(ref b) = bundle {
         if let Some(lora) = b.single_adapters.get(&(block_idx, target)) {
@@ -2204,6 +2440,7 @@ fn double_block_fwd(
     _resident: &HashMap<String, Tensor>,
     bundle: &Option<Arc<ChromaLoraBundle>>,
     _device: &Arc<cudarc::driver::CudaDevice>,
+    attn_mask: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
     let pt = true; // swap weights are pre-transposed
     let pfx = "transformer_blocks";
@@ -2232,34 +2469,130 @@ fn double_block_fwd(
     let b = img.shape().dims()[0];
     let n_img = img.shape().dims()[1];
 
-    let mut img_q = linear_bias_pt(&img_norm, get_w(weights, pfx, block_idx, "attn.to_q.weight")?, get_w(weights, pfx, block_idx, "attn.to_q.bias")?, pt)?;
-    img_q = add_lora_delta_double(img_q, &img_norm, bundle, weights, block_idx, DoubleLoraTarget::ImgQ)?;
-    let mut img_k = linear_bias_pt(&img_norm, get_w(weights, pfx, block_idx, "attn.to_k.weight")?, get_w(weights, pfx, block_idx, "attn.to_k.bias")?, pt)?;
-    img_k = add_lora_delta_double(img_k, &img_norm, bundle, weights, block_idx, DoubleLoraTarget::ImgK)?;
-    let mut img_v = linear_bias_pt(&img_norm, get_w(weights, pfx, block_idx, "attn.to_v.weight")?, get_w(weights, pfx, block_idx, "attn.to_v.bias")?, pt)?;
-    img_v = add_lora_delta_double(img_v, &img_norm, bundle, weights, block_idx, DoubleLoraTarget::ImgV)?;
+    let mut img_q = linear_bias_pt(
+        &img_norm,
+        get_w(weights, pfx, block_idx, "attn.to_q.weight")?,
+        get_w(weights, pfx, block_idx, "attn.to_q.bias")?,
+        pt,
+    )?;
+    img_q = add_lora_delta_double(
+        img_q,
+        &img_norm,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::ImgQ,
+    )?;
+    let mut img_k = linear_bias_pt(
+        &img_norm,
+        get_w(weights, pfx, block_idx, "attn.to_k.weight")?,
+        get_w(weights, pfx, block_idx, "attn.to_k.bias")?,
+        pt,
+    )?;
+    img_k = add_lora_delta_double(
+        img_k,
+        &img_norm,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::ImgK,
+    )?;
+    let mut img_v = linear_bias_pt(
+        &img_norm,
+        get_w(weights, pfx, block_idx, "attn.to_v.weight")?,
+        get_w(weights, pfx, block_idx, "attn.to_v.bias")?,
+        pt,
+    )?;
+    img_v = add_lora_delta_double(
+        img_v,
+        &img_norm,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::ImgV,
+    )?;
 
     let txt_norm = modulate_pre(txt, &txt_shift1, &txt_scale1)?;
     let n_t = txt.shape().dims()[1];
 
-    let mut txt_q = linear_bias_pt(&txt_norm, get_w(weights, pfx, block_idx, "attn.add_q_proj.weight")?, get_w(weights, pfx, block_idx, "attn.add_q_proj.bias")?, pt)?;
-    txt_q = add_lora_delta_double(txt_q, &txt_norm, bundle, weights, block_idx, DoubleLoraTarget::TxtQ)?;
-    let mut txt_k = linear_bias_pt(&txt_norm, get_w(weights, pfx, block_idx, "attn.add_k_proj.weight")?, get_w(weights, pfx, block_idx, "attn.add_k_proj.bias")?, pt)?;
-    txt_k = add_lora_delta_double(txt_k, &txt_norm, bundle, weights, block_idx, DoubleLoraTarget::TxtK)?;
-    let mut txt_v = linear_bias_pt(&txt_norm, get_w(weights, pfx, block_idx, "attn.add_v_proj.weight")?, get_w(weights, pfx, block_idx, "attn.add_v_proj.bias")?, pt)?;
-    txt_v = add_lora_delta_double(txt_v, &txt_norm, bundle, weights, block_idx, DoubleLoraTarget::TxtV)?;
+    let mut txt_q = linear_bias_pt(
+        &txt_norm,
+        get_w(weights, pfx, block_idx, "attn.add_q_proj.weight")?,
+        get_w(weights, pfx, block_idx, "attn.add_q_proj.bias")?,
+        pt,
+    )?;
+    txt_q = add_lora_delta_double(
+        txt_q,
+        &txt_norm,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::TxtQ,
+    )?;
+    let mut txt_k = linear_bias_pt(
+        &txt_norm,
+        get_w(weights, pfx, block_idx, "attn.add_k_proj.weight")?,
+        get_w(weights, pfx, block_idx, "attn.add_k_proj.bias")?,
+        pt,
+    )?;
+    txt_k = add_lora_delta_double(
+        txt_k,
+        &txt_norm,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::TxtK,
+    )?;
+    let mut txt_v = linear_bias_pt(
+        &txt_norm,
+        get_w(weights, pfx, block_idx, "attn.add_v_proj.weight")?,
+        get_w(weights, pfx, block_idx, "attn.add_v_proj.bias")?,
+        pt,
+    )?;
+    txt_v = add_lora_delta_double(
+        txt_v,
+        &txt_norm,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::TxtV,
+    )?;
 
-    let img_q = img_q.reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let img_k = img_k.reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let img_v = img_v.reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let txt_q = txt_q.reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let txt_k = txt_k.reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let txt_v = txt_v.reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+    let img_q = img_q
+        .reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let img_k = img_k
+        .reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let img_v = img_v
+        .reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let txt_q = txt_q
+        .reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let txt_k = txt_k
+        .reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let txt_v = txt_v
+        .reshape(&[b, n_t, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
 
-    let img_q = rms_norm_head(&img_q, get_w(weights, pfx, block_idx, "attn.norm_q.weight")?)?;
-    let img_k = rms_norm_head(&img_k, get_w(weights, pfx, block_idx, "attn.norm_k.weight")?)?;
-    let txt_q = rms_norm_head(&txt_q, get_w(weights, pfx, block_idx, "attn.norm_added_q.weight")?)?;
-    let txt_k = rms_norm_head(&txt_k, get_w(weights, pfx, block_idx, "attn.norm_added_k.weight")?)?;
+    let img_q = rms_norm_head(
+        &img_q,
+        get_w(weights, pfx, block_idx, "attn.norm_q.weight")?,
+    )?;
+    let img_k = rms_norm_head(
+        &img_k,
+        get_w(weights, pfx, block_idx, "attn.norm_k.weight")?,
+    )?;
+    let txt_q = rms_norm_head(
+        &txt_q,
+        get_w(weights, pfx, block_idx, "attn.norm_added_q.weight")?,
+    )?;
+    let txt_k = rms_norm_head(
+        &txt_k,
+        get_w(weights, pfx, block_idx, "attn.norm_added_k.weight")?,
+    )?;
 
     let q = Tensor::cat(&[&txt_q, &img_q], 2)?;
     let k = Tensor::cat(&[&txt_k, &img_k], 2)?;
@@ -2269,7 +2602,7 @@ fn double_block_fwd(
     let q = rope_with_grad(&q, pe_cos, pe_sin)?;
     let k = rope_with_grad(&k, pe_cos, pe_sin)?;
 
-    let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    let attn_out = flame_core::attention::sdpa(&q, &k, &v, attn_mask)?;
 
     // 2026-05-09 fix: inline the narrow+permute+reshape split.
     // `attn_split_txt_img_bf16`'s "autograd-aware" branch turned out to leave
@@ -2288,10 +2621,34 @@ fn double_block_fwd(
         .contiguous()?
         .reshape(&[b, n_img, NUM_HEADS * HEAD_DIM])?;
 
-    let mut img_out = linear_bias_pt(&img_attn, get_w(weights, pfx, block_idx, "attn.to_out.0.weight")?, get_w(weights, pfx, block_idx, "attn.to_out.0.bias")?, pt)?;
-    img_out = add_lora_delta_double(img_out, &img_attn, bundle, weights, block_idx, DoubleLoraTarget::ImgOut)?;
-    let mut txt_out = linear_bias_pt(&txt_attn, get_w(weights, pfx, block_idx, "attn.to_add_out.weight")?, get_w(weights, pfx, block_idx, "attn.to_add_out.bias")?, pt)?;
-    txt_out = add_lora_delta_double(txt_out, &txt_attn, bundle, weights, block_idx, DoubleLoraTarget::TxtOut)?;
+    let mut img_out = linear_bias_pt(
+        &img_attn,
+        get_w(weights, pfx, block_idx, "attn.to_out.0.weight")?,
+        get_w(weights, pfx, block_idx, "attn.to_out.0.bias")?,
+        pt,
+    )?;
+    img_out = add_lora_delta_double(
+        img_out,
+        &img_attn,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::ImgOut,
+    )?;
+    let mut txt_out = linear_bias_pt(
+        &txt_attn,
+        get_w(weights, pfx, block_idx, "attn.to_add_out.weight")?,
+        get_w(weights, pfx, block_idx, "attn.to_add_out.bias")?,
+        pt,
+    )?;
+    txt_out = add_lora_delta_double(
+        txt_out,
+        &txt_attn,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::TxtOut,
+    )?;
 
     // gate_residual_fused_bf16 records autograd (2026-04 fix); safe for training.
     let img_r = flame_core::bf16_ops::gate_residual_fused_bf16(img, &img_gate1, &img_out)?;
@@ -2299,21 +2656,71 @@ fn double_block_fwd(
 
     // FFN img
     let img_ffn_norm = modulate_pre(&img_r, &img_shift2, &img_scale2)?;
-    let mut img_ffn_h = linear_bias_pt(&img_ffn_norm, get_w(weights, pfx, block_idx, "ff.net.0.proj.weight")?, get_w(weights, pfx, block_idx, "ff.net.0.proj.bias")?, pt)?;
-    img_ffn_h = add_lora_delta_double(img_ffn_h, &img_ffn_norm, bundle, weights, block_idx, DoubleLoraTarget::ImgFfnGate)?;
+    let mut img_ffn_h = linear_bias_pt(
+        &img_ffn_norm,
+        get_w(weights, pfx, block_idx, "ff.net.0.proj.weight")?,
+        get_w(weights, pfx, block_idx, "ff.net.0.proj.bias")?,
+        pt,
+    )?;
+    img_ffn_h = add_lora_delta_double(
+        img_ffn_h,
+        &img_ffn_norm,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::ImgFfnGate,
+    )?;
     let img_ffn_h = img_ffn_h.gelu()?;
-    let mut img_ffn_out = linear_bias_pt(&img_ffn_h, get_w(weights, pfx, block_idx, "ff.net.2.weight")?, get_w(weights, pfx, block_idx, "ff.net.2.bias")?, pt)?;
-    img_ffn_out = add_lora_delta_double(img_ffn_out, &img_ffn_h, bundle, weights, block_idx, DoubleLoraTarget::ImgFfnOut)?;
-    let img_final = flame_core::bf16_ops::gate_residual_fused_bf16(&img_r, &img_gate2, &img_ffn_out)?;
+    let mut img_ffn_out = linear_bias_pt(
+        &img_ffn_h,
+        get_w(weights, pfx, block_idx, "ff.net.2.weight")?,
+        get_w(weights, pfx, block_idx, "ff.net.2.bias")?,
+        pt,
+    )?;
+    img_ffn_out = add_lora_delta_double(
+        img_ffn_out,
+        &img_ffn_h,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::ImgFfnOut,
+    )?;
+    let img_final =
+        flame_core::bf16_ops::gate_residual_fused_bf16(&img_r, &img_gate2, &img_ffn_out)?;
 
     // FFN txt
     let txt_ffn_norm = modulate_pre(&txt_r, &txt_shift2, &txt_scale2)?;
-    let mut txt_ffn_h = linear_bias_pt(&txt_ffn_norm, get_w(weights, pfx, block_idx, "ff_context.net.0.proj.weight")?, get_w(weights, pfx, block_idx, "ff_context.net.0.proj.bias")?, pt)?;
-    txt_ffn_h = add_lora_delta_double(txt_ffn_h, &txt_ffn_norm, bundle, weights, block_idx, DoubleLoraTarget::TxtFfnGate)?;
+    let mut txt_ffn_h = linear_bias_pt(
+        &txt_ffn_norm,
+        get_w(weights, pfx, block_idx, "ff_context.net.0.proj.weight")?,
+        get_w(weights, pfx, block_idx, "ff_context.net.0.proj.bias")?,
+        pt,
+    )?;
+    txt_ffn_h = add_lora_delta_double(
+        txt_ffn_h,
+        &txt_ffn_norm,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::TxtFfnGate,
+    )?;
     let txt_ffn_h = txt_ffn_h.gelu()?;
-    let mut txt_ffn_out = linear_bias_pt(&txt_ffn_h, get_w(weights, pfx, block_idx, "ff_context.net.2.weight")?, get_w(weights, pfx, block_idx, "ff_context.net.2.bias")?, pt)?;
-    txt_ffn_out = add_lora_delta_double(txt_ffn_out, &txt_ffn_h, bundle, weights, block_idx, DoubleLoraTarget::TxtFfnOut)?;
-    let txt_final = flame_core::bf16_ops::gate_residual_fused_bf16(&txt_r, &txt_gate2, &txt_ffn_out)?;
+    let mut txt_ffn_out = linear_bias_pt(
+        &txt_ffn_h,
+        get_w(weights, pfx, block_idx, "ff_context.net.2.weight")?,
+        get_w(weights, pfx, block_idx, "ff_context.net.2.bias")?,
+        pt,
+    )?;
+    txt_ffn_out = add_lora_delta_double(
+        txt_ffn_out,
+        &txt_ffn_h,
+        bundle,
+        weights,
+        block_idx,
+        DoubleLoraTarget::TxtFfnOut,
+    )?;
+    let txt_final =
+        flame_core::bf16_ops::gate_residual_fused_bf16(&txt_r, &txt_gate2, &txt_ffn_out)?;
 
     Ok((img_final, txt_final))
 }
@@ -2329,6 +2736,7 @@ fn single_block_fwd(
     _resident: &HashMap<String, Tensor>,
     bundle: &Option<Arc<ChromaLoraBundle>>,
     _device: &Arc<cudarc::driver::CudaDevice>,
+    attn_mask: Option<&Tensor>,
 ) -> Result<Tensor> {
     let pt = true;
     let pfx = "single_transformer_blocks";
@@ -2343,20 +2751,53 @@ fn single_block_fwd(
     let b = x.shape().dims()[0];
     let seq = x.shape().dims()[1];
 
-    let mut q = linear_bias_pt(&x_norm, get_w(weights, pfx, block_idx, "attn.to_q.weight")?, get_w(weights, pfx, block_idx, "attn.to_q.bias")?, pt)?;
+    let mut q = linear_bias_pt(
+        &x_norm,
+        get_w(weights, pfx, block_idx, "attn.to_q.weight")?,
+        get_w(weights, pfx, block_idx, "attn.to_q.bias")?,
+        pt,
+    )?;
     q = add_lora_delta_single(q, &x_norm, bundle, weights, block_idx, SingleLoraTarget::Q)?;
-    let mut k = linear_bias_pt(&x_norm, get_w(weights, pfx, block_idx, "attn.to_k.weight")?, get_w(weights, pfx, block_idx, "attn.to_k.bias")?, pt)?;
+    let mut k = linear_bias_pt(
+        &x_norm,
+        get_w(weights, pfx, block_idx, "attn.to_k.weight")?,
+        get_w(weights, pfx, block_idx, "attn.to_k.bias")?,
+        pt,
+    )?;
     k = add_lora_delta_single(k, &x_norm, bundle, weights, block_idx, SingleLoraTarget::K)?;
-    let mut v = linear_bias_pt(&x_norm, get_w(weights, pfx, block_idx, "attn.to_v.weight")?, get_w(weights, pfx, block_idx, "attn.to_v.bias")?, pt)?;
+    let mut v = linear_bias_pt(
+        &x_norm,
+        get_w(weights, pfx, block_idx, "attn.to_v.weight")?,
+        get_w(weights, pfx, block_idx, "attn.to_v.bias")?,
+        pt,
+    )?;
     v = add_lora_delta_single(v, &x_norm, bundle, weights, block_idx, SingleLoraTarget::V)?;
 
-    let mut mlp_h = linear_bias_pt(&x_norm, get_w(weights, pfx, block_idx, "proj_mlp.weight")?, get_w(weights, pfx, block_idx, "proj_mlp.bias")?, pt)?;
-    mlp_h = add_lora_delta_single(mlp_h, &x_norm, bundle, weights, block_idx, SingleLoraTarget::ProjMlp)?;
+    let mut mlp_h = linear_bias_pt(
+        &x_norm,
+        get_w(weights, pfx, block_idx, "proj_mlp.weight")?,
+        get_w(weights, pfx, block_idx, "proj_mlp.bias")?,
+        pt,
+    )?;
+    mlp_h = add_lora_delta_single(
+        mlp_h,
+        &x_norm,
+        bundle,
+        weights,
+        block_idx,
+        SingleLoraTarget::ProjMlp,
+    )?;
     let mlp_h = mlp_h.gelu()?;
 
-    let q = q.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let k = k.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let v = v.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+    let q = q
+        .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let k = k
+        .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let v = v
+        .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
 
     let q = rms_norm_head(&q, get_w(weights, pfx, block_idx, "attn.norm_q.weight")?)?;
     let k = rms_norm_head(&k, get_w(weights, pfx, block_idx, "attn.norm_k.weight")?)?;
@@ -2365,13 +2806,25 @@ fn single_block_fwd(
     let q = rope_with_grad(&q, pe_cos, pe_sin)?;
     let k = rope_with_grad(&k, pe_cos, pe_sin)?;
 
-    let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    let attn_out = flame_core::attention::sdpa(&q, &k, &v, attn_mask)?;
     let attn_out = attn_out.permute(&[0, 2, 1, 3])?;
     let attn_flat = attn_out.reshape(&[b, seq, DIM])?;
 
     let combined = Tensor::cat(&[&attn_flat, &mlp_h], 2)?;
-    let mut proj = linear_bias_pt(&combined, get_w(weights, pfx, block_idx, "proj_out.weight")?, get_w(weights, pfx, block_idx, "proj_out.bias")?, pt)?;
-    proj = add_lora_delta_single(proj, &combined, bundle, weights, block_idx, SingleLoraTarget::ProjOut)?;
+    let mut proj = linear_bias_pt(
+        &combined,
+        get_w(weights, pfx, block_idx, "proj_out.weight")?,
+        get_w(weights, pfx, block_idx, "proj_out.bias")?,
+        pt,
+    )?;
+    proj = add_lora_delta_single(
+        proj,
+        &combined,
+        bundle,
+        weights,
+        block_idx,
+        SingleLoraTarget::ProjOut,
+    )?;
 
     // gate_residual_fused_bf16 records autograd — safe for training.
     flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate, &proj)

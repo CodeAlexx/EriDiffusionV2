@@ -31,13 +31,15 @@
 //!
 //! NOT on noise_refiner, context_refiner, or adaLN_modulation.
 
-use flame_core::autograd::AutogradContext;
-use flame_core::{parameter::Parameter, DType, Result, Shape, Tensor, TensorId};
 use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::lora::LoRALinear;
 use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use flame_core::autograd::AutogradContext;
+use flame_core::{parameter::Parameter, DType, Result, Shape, Tensor, TensorId};
 use lycoris_rs::{
-    algorithms::{full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule},
+    algorithms::{
+        full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule,
+    },
     dora::init_magnitude,
     LycorisAdapter,
 };
@@ -120,7 +122,15 @@ impl ZImageLoraBundle {
         let mut adapters = HashMap::new();
         for i in 0..num_layers {
             for &(target, in_dim, out_dim) in ZIMAGE_TARGETS {
-                let lora = LoRALinear::new(in_dim, out_dim, rank, alpha, device.clone(), seed + i as u64).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora new: {e}")))?;
+                let lora = LoRALinear::new(
+                    in_dim,
+                    out_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed + i as u64,
+                )
+                .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora new: {e}")))?;
                 adapters.insert((i, target), lora);
             }
         }
@@ -151,8 +161,7 @@ impl ZImageLoraBundle {
         if config.algo == LycorisAlgo::None {
             return Self::new(NUM_LAYERS, config.rank, config.alpha, device, seed);
         }
-        let mut lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>> =
-            HashMap::new();
+        let mut lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>> = HashMap::new();
         for i in 0..NUM_LAYERS {
             for &(target, in_dim, out_dim) in ZIMAGE_TARGETS {
                 let wrapper = build_lycoris_linear(config, in_dim, out_dim, device.clone())?;
@@ -235,16 +244,14 @@ impl ZImageLoraBundle {
                         if chunks.len() != 3 {
                             log::warn!(
                                 "[zimage][init_lokr_norm] expected 3 qkv chunks from \
-                                 `{qkv_key}`, got {}", chunks.len()
+                                 `{qkv_key}`, got {}",
+                                chunks.len()
                             );
                             skipped += 1;
                             continue;
                         }
-                        let arr: [Tensor; 3] = [
-                            chunks[0].clone(),
-                            chunks[1].clone(),
-                            chunks[2].clone(),
-                        ];
+                        let arr: [Tensor; 3] =
+                            [chunks[0].clone(), chunks[1].clone(), chunks[2].clone()];
                         qkv_slice_cache.insert(block_idx, arr);
                     }
                     let slice_idx = match target {
@@ -253,7 +260,9 @@ impl ZImageLoraBundle {
                         LoraTarget::AttnV => 2,
                         _ => unreachable!(),
                     };
-                    qkv_slice_cache.get(&block_idx).map(|arr| arr[slice_idx].clone())
+                    qkv_slice_cache
+                        .get(&block_idx)
+                        .map(|arr| arr[slice_idx].clone())
                 }
                 LoraTarget::AttnOut => {
                     let key = format!("layers.{block_idx}.attention.out.weight");
@@ -274,22 +283,29 @@ impl ZImageLoraBundle {
             let Some(base) = base_owned else {
                 log::warn!(
                     "[zimage][init_lokr_norm] base lookup failed for \
-                     (block={block_idx}, target={:?}) — skipping", target
+                     (block={block_idx}, target={:?}) — skipping",
+                    target
                 );
                 skipped += 1;
                 continue;
             };
 
-            let did = adapter.as_ref().init_perturbed_normal_lokr(&base, scale)
-                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
-                    "init_perturbed_normal_lokr(block={block_idx}, target={:?}): {e}",
-                    target
-                )))?;
-            if did { applied += 1; } else { skipped += 1; }
+            let did = adapter
+                .as_ref()
+                .init_perturbed_normal_lokr(&base, scale)
+                .map_err(|e| {
+                    flame_core::FlameError::InvalidOperation(format!(
+                        "init_perturbed_normal_lokr(block={block_idx}, target={:?}): {e}",
+                        target
+                    ))
+                })?;
+            if did {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
         }
-        log::info!(
-            "[zimage][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
-        );
+        log::info!("[zimage][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}");
         Ok(skipped)
     }
 
@@ -297,11 +313,7 @@ impl ZImageLoraBundle {
     /// `lycoris_adapters` first (Phase 2b active path) then falls back to
     /// the legacy `adapters` map. Returns `None` when no adapter exists for
     /// `(block_idx, target)` (shouldn't happen on a fully-populated bundle).
-    pub fn adapter_for(
-        &self,
-        block_idx: usize,
-        target: LoraTarget,
-    ) -> Option<&dyn AdapterModule> {
+    pub fn adapter_for(&self, block_idx: usize, target: LoraTarget) -> Option<&dyn AdapterModule> {
         if let Some(lyc) = self.lycoris_adapters.get(&(block_idx, target)) {
             return Some(lyc.as_ref());
         }
@@ -351,8 +363,7 @@ impl ZImageLoraBundle {
         // `dora_scale` last when DoRA is on — see
         // `LycorisLinear::named_tensors`). Without this branch a `--algo
         // lokr` (or any non-`lora` algo) save silently writes 0 keys.
-        let mut lyc_keys: Vec<&(usize, LoraTarget)> =
-            self.lycoris_adapters.keys().collect();
+        let mut lyc_keys: Vec<&(usize, LoraTarget)> = self.lycoris_adapters.keys().collect();
         lyc_keys.sort_by_key(|(b, t)| (*b, *t as usize));
         for &(block_idx, target) in lyc_keys {
             let adapter = &self.lycoris_adapters[&(block_idx, target)];
@@ -443,7 +454,11 @@ impl ZImageLoraBundle {
     /// (`layers.{i}.<...>.lora_A`) for back-compat with previously-saved
     /// checkpoints. `attention.out` (legacy) is also accepted as an alias
     /// for `attention.to_out.0` (ai-toolkit) on load.
-    pub fn load(&self, path: &std::path::Path, device: &Arc<cudarc::driver::CudaDevice>) -> Result<()> {
+    pub fn load(
+        &self,
+        path: &std::path::Path,
+        device: &Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<()> {
         let tensors = flame_core::serialization::load_file(path, device)?;
         for (&(block_idx, target), lora) in &self.adapters {
             let suffix = Self::ai_toolkit_suffix(target);
@@ -452,7 +467,11 @@ impl ZImageLoraBundle {
             let a_key = format!("{new_prefix}.lora_A.weight");
             let b_key = format!("{new_prefix}.lora_B.weight");
             if tensors.contains_key(&a_key) && tensors.contains_key(&b_key) {
-                lora.load_tensors(&new_prefix, &tensors_with_weight_alias(&tensors, &new_prefix)).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora load: {e}")))?;
+                lora.load_tensors(
+                    &new_prefix,
+                    &tensors_with_weight_alias(&tensors, &new_prefix),
+                )
+                .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora load: {e}")))?;
                 continue;
             }
             // Legacy trainer format: `layers.{i}.<legacy_suffix>.lora_A` / `.lora_B`.
@@ -461,7 +480,8 @@ impl ZImageLoraBundle {
                 _ => suffix,
             };
             let legacy_prefix = format!("layers.{block_idx}.{legacy_suffix}");
-            lora.load_tensors(&legacy_prefix, &tensors).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora load: {e}")))?;
+            lora.load_tensors(&legacy_prefix, &tensors)
+                .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora load: {e}")))?;
         }
         for lora in self.adapters.values() {
             lora.refresh_cache();
@@ -520,7 +540,9 @@ fn build_lycoris_linear(
                 device.clone(),
                 dtype,
             )
-            .map_err(|e| flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}")))?,
+            .map_err(|e| {
+                flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}"))
+            })?,
         ),
         LycorisAlgo::LoHa => LycorisAdapter::LoHa(
             LoHaModule::new_linear_for_training(
@@ -531,7 +553,9 @@ fn build_lycoris_linear(
                 device.clone(),
                 dtype,
             )
-            .map_err(|e| flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}")))?,
+            .map_err(|e| {
+                flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}"))
+            })?,
         ),
         LycorisAlgo::LoKr => LycorisAdapter::LoKr(
             LoKrModule::new_linear(
@@ -588,11 +612,7 @@ fn build_lycoris_linear(
         } else {
             Shape::from_dims(&[1, in_features])
         };
-        let ones = Tensor::from_vec(
-            vec![1.0_f32; shape.elem_count()],
-            shape,
-            device.clone(),
-        )?;
+        let ones = Tensor::from_vec(vec![1.0_f32; shape.elem_count()], shape, device.clone())?;
         let m = init_magnitude(&ones, config.dora_wd_on_out, 0.0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("init_magnitude: {e}")))?;
         Some(m.requires_grad_(true))
@@ -646,15 +666,22 @@ impl ZImageModel {
         seed: u64,
         full_finetune: bool,
     ) -> Result<Self> {
-        log::info!("[zimage-trainer] loading Z-Image from {}", model_path.display());
+        log::info!(
+            "[zimage-trainer] loading Z-Image from {}",
+            model_path.display()
+        );
 
         // Load ALL weights at once (Z-Image is ~12 GB BF16, fits in 24 GB VRAM)
         let all_weights = flame_core::serialization::load_file(model_path, &device)?;
-        log::info!("[zimage-trainer] loaded {} weight tensors", all_weights.len());
+        log::info!(
+            "[zimage-trainer] loaded {} weight tensors",
+            all_weights.len()
+        );
 
         // Separate resident (shared) vs block weights
         let mut resident = HashMap::new();
-        let mut per_block: Vec<HashMap<String, Tensor>> = (0..NUM_LAYERS).map(|_| HashMap::new()).collect();
+        let mut per_block: Vec<HashMap<String, Tensor>> =
+            (0..NUM_LAYERS).map(|_| HashMap::new()).collect();
 
         for (key, tensor) in &all_weights {
             let is_block = key.starts_with("layers.");
@@ -675,11 +702,20 @@ impl ZImageModel {
         }
         drop(all_weights);
 
-        log::info!("[zimage-trainer] {} resident keys, {} block maps", resident.len(), per_block.len());
+        log::info!(
+            "[zimage-trainer] {} resident keys, {} block maps",
+            resident.len(),
+            per_block.len()
+        );
 
-        let bundle = ZImageLoraBundle::new(NUM_LAYERS, lora_rank, lora_alpha, device.clone(), seed)?;
+        let bundle =
+            ZImageLoraBundle::new(NUM_LAYERS, lora_rank, lora_alpha, device.clone(), seed)?;
         if !full_finetune {
-            log::info!("[zimage-trainer] {} LoRA adapters (rank={})", bundle.num_adapters(), lora_rank);
+            log::info!(
+                "[zimage-trainer] {} LoRA adapters (rank={})",
+                bundle.num_adapters(),
+                lora_rank
+            );
         }
 
         // FFT mode: build F32 master Parameters. Forward casts each F32
@@ -692,16 +728,23 @@ impl ZImageModel {
         let fft_params = if full_finetune {
             let mut params = HashMap::new();
             for (key, tensor) in &resident {
-                let t = tensor.to_dtype(flame_core::DType::F32)?.requires_grad_(true);
+                let t = tensor
+                    .to_dtype(flame_core::DType::F32)?
+                    .requires_grad_(true);
                 params.insert(key.clone(), Parameter::new(t));
             }
             for (_block_idx, block_map) in per_block.iter().enumerate() {
                 for (key, tensor) in block_map {
-                    let t = tensor.to_dtype(flame_core::DType::F32)?.requires_grad_(true);
+                    let t = tensor
+                        .to_dtype(flame_core::DType::F32)?
+                        .requires_grad_(true);
                     params.insert(key.clone(), Parameter::new(t));
                 }
             }
-            log::info!("[zimage-trainer] FFT mode: {} trainable parameters", params.len());
+            log::info!(
+                "[zimage-trainer] FFT mode: {} trainable parameters",
+                params.len()
+            );
             Some(params)
         } else {
             None
@@ -749,11 +792,10 @@ impl ZImageModel {
         if self.is_full_finetune {
             return Ok(());
         }
-        let block_data = flame_core::serialization::load_file_filtered(
-            &self.model_path,
-            &self.device,
-            |key| key.starts_with("layers."),
-        )?;
+        let block_data =
+            flame_core::serialization::load_file_filtered(&self.model_path, &self.device, |key| {
+                key.starts_with("layers.")
+            })?;
         for block in self.block_weights.iter_mut() {
             block.clear();
         }
@@ -832,7 +874,8 @@ impl ZImageModel {
                 return p.tensor()?.to_dtype(DType::BF16);
             }
         }
-        self.resident_weights.get(key)
+        self.resident_weights
+            .get(key)
             .cloned()
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing weight: {key}")))
     }
@@ -845,9 +888,12 @@ impl ZImageModel {
                 return p.tensor()?.to_dtype(DType::BF16);
             }
         }
-        self.block_weights[block_idx].get(&full_key)
+        self.block_weights[block_idx]
+            .get(&full_key)
             .cloned()
-            .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing block weight: {full_key}")))
+            .ok_or_else(|| {
+                flame_core::Error::InvalidInput(format!("missing block weight: {full_key}"))
+            })
     }
 
     /// Build the BF16-cast weight map for block `idx`, used to feed
@@ -900,7 +946,10 @@ impl ZImageModel {
         let x_patched = self.patchify(x, h, w)?;
         // x_embedder: Linear(64, 3840)
         let mut x_emb = self.linear_bias(&x_patched, "x_embedder.weight", "x_embedder.bias")?;
-        if let Some(ref d) = std::env::var("FLAME_ZIMAGE_DUMP_DIR").ok().map(std::path::PathBuf::from) {
+        if let Some(ref d) = std::env::var("FLAME_ZIMAGE_DUMP_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+        {
             zimage_dump(&d, "x_patched", &x_patched)?;
         }
 
@@ -910,7 +959,8 @@ impl ZImageModel {
         // musubi parity checks. Matches the key names used by
         // `output/zimage_parity_dump_musubi.py`.
         let dump_dir: Option<std::path::PathBuf> = std::env::var("FLAME_ZIMAGE_DUMP_DIR")
-            .ok().map(std::path::PathBuf::from);
+            .ok()
+            .map(std::path::PathBuf::from);
         if let Some(ref d) = dump_dir {
             std::fs::create_dir_all(d).ok();
             zimage_dump(d, "t_emb", &adaln_input)?;
@@ -923,16 +973,22 @@ impl ZImageModel {
         let (cap_cos, cap_sin) = self.build_rope_caption(cap_seq)?;
 
         // Debug: dump RoPE values
-        {
-        }
+        {}
         // Debug: dump after patchify+embed
-        {
-        }
+        {}
 
         // Noise refiner (2 blocks, no LoRA, with modulation)
         for ri in 0..2 {
-            x_emb = self.refiner_block(&x_emb, &img_cos, &img_sin, Some(&adaln_input), &format!("noise_refiner.{ri}"))?;
-            if let Some(ref d) = dump_dir { zimage_dump(d, &format!("noise_refiner_{ri}"), &x_emb)?; }
+            x_emb = self.refiner_block(
+                &x_emb,
+                &img_cos,
+                &img_sin,
+                Some(&adaln_input),
+                &format!("noise_refiner.{ri}"),
+            )?;
+            if let Some(ref d) = dump_dir {
+                zimage_dump(d, &format!("noise_refiner_{ri}"), &x_emb)?;
+            }
         }
 
         // Caption embedding: RMSNorm(.0) → Linear(.1).
@@ -944,8 +1000,11 @@ impl ZImageModel {
         // F32-internal primitive RMSNorm. Same fix as everywhere else —
         // fused kernel backward has BF16-accumulation precision bug.
         let cap_norm = primitive_rms_norm(cap_feats, &self.w("cap_embedder.0.weight")?, NORM_EPS)?;
-        let mut cap_emb = self.linear_bias(&cap_norm, "cap_embedder.1.weight", "cap_embedder.1.bias")?;
-        if let Some(ref d) = dump_dir { zimage_dump(d, "cap_embed", &cap_emb)?; }
+        let mut cap_emb =
+            self.linear_bias(&cap_norm, "cap_embedder.1.weight", "cap_embedder.1.bias")?;
+        if let Some(ref d) = dump_dir {
+            zimage_dump(d, "cap_embed", &cap_emb)?;
+        }
 
         log::debug!("cap_emb after embedder: {:?}", cap_emb.shape().dims());
 
@@ -968,22 +1027,36 @@ impl ZImageModel {
             // m is [B, seq] BF16 — broadcast-mul against [B, seq, DIM].
             let m_3d = m.unsqueeze(2)?; // [B, seq, 1]
             let inv_3d = m_3d.mul_scalar(-1.0)?.add_scalar(1.0)?; // [B, seq, 1] = (1 - mask)
-            let kept = cap_emb.mul(&m_3d)?;          // [B, seq, DIM]
-            let pad_contrib = pad_3d.mul(&inv_3d)?;  // [B, seq, DIM] (broadcast)
+            let kept = cap_emb.mul(&m_3d)?; // [B, seq, DIM]
+            let pad_contrib = pad_3d.mul(&inv_3d)?; // [B, seq, DIM] (broadcast)
             cap_emb = kept.add(&pad_contrib)?;
-            log::debug!("applied cap_pad_token at {} pad positions", m.shape().dims()[1]);
+            log::debug!(
+                "applied cap_pad_token at {} pad positions",
+                m.shape().dims()[1]
+            );
         }
 
         // Context refiner (2 blocks, no LoRA, no modulation)
         for ri in 0..2 {
-            cap_emb = self.refiner_block(&cap_emb, &cap_cos, &cap_sin, None, &format!("context_refiner.{ri}"))?;
-            if let Some(ref d) = dump_dir { zimage_dump(d, &format!("context_refiner_{ri}"), &cap_emb)?; }
-            log::debug!("cap_emb after context_refiner.{}: {:?}", ri, cap_emb.shape().dims());
+            cap_emb = self.refiner_block(
+                &cap_emb,
+                &cap_cos,
+                &cap_sin,
+                None,
+                &format!("context_refiner.{ri}"),
+            )?;
+            if let Some(ref d) = dump_dir {
+                zimage_dump(d, &format!("context_refiner_{ri}"), &cap_emb)?;
+            }
+            log::debug!(
+                "cap_emb after context_refiner.{}: {:?}",
+                ri,
+                cap_emb.shape().dims()
+            );
         }
 
         // Debug: dump pre-concat stats
-        {
-        }
+        {}
 
         // Concatenate: [B, N_img + N_cap, dim] — image first, caption
         // second. Matches musubi's `torch.cat([x, cap_feats], dim=1)` at
@@ -1007,10 +1080,14 @@ impl ZImageModel {
             .map(|n| n.min(NUM_LAYERS))
             .unwrap_or(NUM_LAYERS);
         if n_blocks != NUM_LAYERS {
-            log::warn!("[zimage-trainer] ZIMAGE_MAX_BLOCKS={n_blocks} (debug — forward stops early)");
+            log::warn!(
+                "[zimage-trainer] ZIMAGE_MAX_BLOCKS={n_blocks} (debug — forward stops early)"
+            );
         }
         let use_checkpoint = std::env::var("FLAME_CHECKPOINT")
-            .ok().map(|v| v != "0").unwrap_or(true);
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
         // When autograd is not recording (inference / sample_image call) we
         // bypass the checkpoint machinery entirely and use the fused-kernel
@@ -1022,11 +1099,14 @@ impl ZImageModel {
         let mut h_state = unified;
         // FLAME_RETAIN_BLOCK_GRADS=1 records block-boundary tensor IDs to
         // a global so callers can call retain_intermediate_grads on them.
-        let retain_block_grads = std::env::var("FLAME_RETAIN_BLOCK_GRADS")
-            .ok().as_deref() == Some("1");
+        let retain_block_grads =
+            std::env::var("FLAME_RETAIN_BLOCK_GRADS").ok().as_deref() == Some("1");
         if retain_block_grads {
             block_grad_ids().lock().unwrap().clear();
-            block_grad_ids().lock().unwrap().push(("unified".to_string(), h_state.id()));
+            block_grad_ids()
+                .lock()
+                .unwrap()
+                .push(("unified".to_string(), h_state.id()));
         }
         for i in 0..n_blocks {
             if is_inference {
@@ -1037,8 +1117,14 @@ impl ZImageModel {
                 let block_w = self.fft_block_cast(i)?;
                 self.bundle.refresh_caches();
                 h_state = block_forward_iflame(
-                    &h_state, &unified_cos, &unified_sin, &adaln_input, i,
-                    &self.bundle, None, &block_w,
+                    &h_state,
+                    &unified_cos,
+                    &unified_sin,
+                    &adaln_input,
+                    i,
+                    &self.bundle,
+                    None,
+                    &block_w,
                 )?;
             } else if use_checkpoint {
                 let h_c = h_state.clone();
@@ -1059,18 +1145,17 @@ impl ZImageModel {
                 // With the pool installed by `train_zimage.rs`, saved
                 // activations live on CPU instead of being recomputed,
                 // eliminating ~1.5 s/step of recompute overhead per block.
-                h_state = AutogradContext::checkpoint_offload(
-                    &[h_c.clone()],
-                    move || {
-                        bundle_c.refresh_caches();
-                        block_forward_standalone(
-                            &h_c, &cos_c, &sin_c, &adaln_c, i,
-                            &bundle_c, None, &block_w_c,
-                        )
-                    },
-                )?;
+                h_state = AutogradContext::checkpoint_offload(&[h_c.clone()], move || {
+                    bundle_c.refresh_caches();
+                    block_forward_standalone(
+                        &h_c, &cos_c, &sin_c, &adaln_c, i, &bundle_c, None, &block_w_c,
+                    )
+                })?;
                 if retain_block_grads {
-                    block_grad_ids().lock().unwrap().push((format!("block_{i}_out"), h_state.id()));
+                    block_grad_ids()
+                        .lock()
+                        .unwrap()
+                        .push((format!("block_{i}_out"), h_state.id()));
                 }
             } else {
                 // Use the same standalone forward as the checkpoint path so
@@ -1083,8 +1168,14 @@ impl ZImageModel {
                 let block_w = self.fft_block_cast(i)?;
                 self.bundle.refresh_caches();
                 h_state = block_forward_standalone(
-                    &h_state, &unified_cos, &unified_sin, &adaln_input, i,
-                    &self.bundle, None, &block_w,
+                    &h_state,
+                    &unified_cos,
+                    &unified_sin,
+                    &adaln_input,
+                    i,
+                    &self.bundle,
+                    None,
+                    &block_w,
                 )?;
             }
             if let Some(ref d) = dump_dir {
@@ -1097,22 +1188,35 @@ impl ZImageModel {
         let _ = cap_seq;
         let img_out = h_state.narrow(1, 0, n_img)?;
         if retain_block_grads {
-            block_grad_ids().lock().unwrap().push(("img_out".to_string(), img_out.id()));
+            block_grad_ids()
+                .lock()
+                .unwrap()
+                .push(("img_out".to_string(), img_out.id()));
         }
 
         // Final layer: adaln modulation + layer norm + linear
         let final_out = self.final_layer(&img_out, &adaln_input)?;
         if retain_block_grads {
-            block_grad_ids().lock().unwrap().push(("final_out".to_string(), final_out.id()));
+            block_grad_ids()
+                .lock()
+                .unwrap()
+                .push(("final_out".to_string(), final_out.id()));
         }
-        if let Some(ref d) = dump_dir { zimage_dump(d, "final_out", &final_out)?; }
+        if let Some(ref d) = dump_dir {
+            zimage_dump(d, "final_out", &final_out)?;
+        }
 
         // Unpatchify: [B, N_img, patch_dim] → [B, C, H, W]
         let pred = self.unpatchify(&final_out, h_tok, w_tok)?;
         if retain_block_grads {
-            block_grad_ids().lock().unwrap().push(("pred".to_string(), pred.id()));
+            block_grad_ids()
+                .lock()
+                .unwrap()
+                .push(("pred".to_string(), pred.id()));
         }
-        if let Some(ref d) = dump_dir { zimage_dump(d, "pred", &pred)?; }
+        if let Some(ref d) = dump_dir {
+            zimage_dump(d, "pred", &pred)?;
+        }
         Ok(pred)
     }
 
@@ -1120,7 +1224,11 @@ impl ZImageModel {
         // musubi-tuner zimage_model.py: TimestepEmbedder
         // Sinusoidal embedding (256 channels) → MLP(256 → 1024 → 256)
         let freq_embed = sinusoidal_embedding(t, ADALN_EMBED_DIM)?;
-        let h = self.linear_bias(&freq_embed, "t_embedder.mlp.0.weight", "t_embedder.mlp.0.bias")?;
+        let h = self.linear_bias(
+            &freq_embed,
+            "t_embedder.mlp.0.weight",
+            "t_embedder.mlp.0.bias",
+        )?;
         let h = h.silu()?;
         self.linear_bias(&h, "t_embedder.mlp.2.weight", "t_embedder.mlp.2.bias")
     }
@@ -1131,17 +1239,19 @@ impl ZImageModel {
         // 2026-04-28). Safe to use on the training path; perf benefit
         // of the fused cuBLASLt kernel is preserved.
         let weight = self.w(weight_key)?;
-        flame_core::ops::fused_inference::fused_linear3d_native(
-            &ensure_3d(x)?, &weight, None,
-        ).map(|t| squeeze_if_needed(t, x.shape().dims().len()))
+        flame_core::ops::fused_inference::fused_linear3d_native(&ensure_3d(x)?, &weight, None)
+            .map(|t| squeeze_if_needed(t, x.shape().dims().len()))
     }
 
     fn linear_bias(&self, x: &Tensor, weight_key: &str, bias_key: &str) -> Result<Tensor> {
         let weight = self.w(weight_key)?;
         let bias = self.w(bias_key)?;
         flame_core::ops::fused_inference::fused_linear3d_native(
-            &ensure_3d(x)?, &weight, Some(&bias),
-        ).map(|t| squeeze_if_needed(t, x.shape().dims().len()))
+            &ensure_3d(x)?,
+            &weight,
+            Some(&bias),
+        )
+        .map(|t| squeeze_if_needed(t, x.shape().dims().len()))
     }
 
     /// Block linear using autograd-aware matmul so LoRA gradients flow.
@@ -1150,29 +1260,43 @@ impl ZImageModel {
         let weight = self.bw(block_idx, suffix)?;
         let dims = x.shape().dims().to_vec();
         let in_feat = *dims.last().unwrap();
-        let batch: usize = dims[..dims.len()-1].iter().product();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
         let out_feat = weight.shape().dims()[0];
         let x_2d = x.reshape(&[batch, in_feat])?;
         let wt = weight.transpose()?;
         let out_2d = x_2d.matmul(&wt)?;
-        let mut out_shape = dims[..dims.len()-1].to_vec();
+        let mut out_shape = dims[..dims.len() - 1].to_vec();
         out_shape.push(out_feat);
         out_2d.reshape(&out_shape)
     }
 
-    fn block_linear_bias(&self, x: &Tensor, block_idx: usize, suffix_w: &str, suffix_b: &str) -> Result<Tensor> {
+    fn block_linear_bias(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        suffix_w: &str,
+        suffix_b: &str,
+    ) -> Result<Tensor> {
         let out = self.block_linear_no_bias(x, block_idx, suffix_w)?;
         let bias = self.bw(block_idx, suffix_b)?;
         out.add(&bias)
     }
 
-    fn add_lora_delta(&self, base: Tensor, input: &Tensor, block_idx: usize, target: LoraTarget) -> Result<Tensor> {
+    fn add_lora_delta(
+        &self,
+        base: Tensor,
+        input: &Tensor,
+        block_idx: usize,
+        target: LoraTarget,
+    ) -> Result<Tensor> {
         // Dispatch via `adapter_for` so `--algo locon`/etc populate
         // `lycoris_adapters` and the legacy `adapters` map can be empty —
         // fixes the silent-skip pitfall that would otherwise train the
         // LoRA to noise.
         if let Some(lora) = self.bundle.adapter_for(block_idx, target) {
-            let delta = lora.forward_delta(&ensure_3d(input)?).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
+            let delta = lora
+                .forward_delta(&ensure_3d(input)?)
+                .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
             base.add(&delta)
         } else {
             Ok(base)
@@ -1189,12 +1313,15 @@ impl ZImageModel {
     ) -> Result<Tensor> {
         // musubi-tuner zimage_model.py:260-287
         let has_mod = adaln_input.is_some()
-            && self.resident_weights.contains_key(&format!("{prefix}.adaLN_modulation.0.weight"));
+            && self
+                .resident_weights
+                .contains_key(&format!("{prefix}.adaLN_modulation.0.weight"));
 
         if has_mod {
             let adaln = adaln_input.unwrap();
             // adaLN_modulation is ModuleList([Linear]) — NO SiLU here
-            let mod_out = self.linear_bias(adaln,
+            let mod_out = self.linear_bias(
+                adaln,
                 &format!("{prefix}.adaLN_modulation.0.weight"),
                 &format!("{prefix}.adaLN_modulation.0.bias"),
             )?;
@@ -1211,8 +1338,7 @@ impl ZImageModel {
 
             // Attention
             let x_norm = self.resident_rms_norm(x, &format!("{prefix}.attention_norm1.weight"))?;
-            if prefix == "noise_refiner.0" {
-            }
+            if prefix == "noise_refiner.0" {}
             if prefix == "noise_refiner.0" {
                 // Verify the weight keys are present; tensors themselves
                 // aren't needed here.
@@ -1222,21 +1348,20 @@ impl ZImageModel {
                 let _ = self.w(&bkey)?;
             }
             let x_mod = x_norm.mul(&scale_msa)?;
-            if prefix == "noise_refiner.0" {
-            }
+            if prefix == "noise_refiner.0" {}
             let attn_out = self.refiner_attention(&x_mod, cos, sin, prefix)?;
-            if prefix == "noise_refiner.0" {
-            }
-            let attn_post = self.resident_rms_norm(&attn_out, &format!("{prefix}.attention_norm2.weight"))?;
+            if prefix == "noise_refiner.0" {}
+            let attn_post =
+                self.resident_rms_norm(&attn_out, &format!("{prefix}.attention_norm2.weight"))?;
             let x = x.add(&gate_msa.mul(&attn_post)?)?;
-            if prefix == "noise_refiner.0" {
-            }
+            if prefix == "noise_refiner.0" {}
 
             // FFN
             let ffn_norm = self.resident_rms_norm(&x, &format!("{prefix}.ffn_norm1.weight"))?;
             let ffn_mod = ffn_norm.mul(&scale_mlp)?;
             let ffn_out = self.refiner_ffn(&ffn_mod, prefix)?;
-            let ffn_post = self.resident_rms_norm(&ffn_out, &format!("{prefix}.ffn_norm2.weight"))?;
+            let ffn_post =
+                self.resident_rms_norm(&ffn_out, &format!("{prefix}.ffn_norm2.weight"))?;
             x.add(&gate_mlp.mul(&ffn_post)?)
         } else {
             // No modulation (context refiner)
@@ -1245,8 +1370,12 @@ impl ZImageModel {
             log::debug!("[refiner {prefix}] x_norm: {:?}", x_norm.shape().dims());
             let attn_out = self.refiner_attention(&x_norm, cos, sin, prefix)?;
             log::debug!("[refiner {prefix}] attn_out: {:?}", attn_out.shape().dims());
-            let attn_post = self.resident_rms_norm(&attn_out, &format!("{prefix}.attention_norm2.weight"))?;
-            log::debug!("[refiner {prefix}] attn_post: {:?}", attn_post.shape().dims());
+            let attn_post =
+                self.resident_rms_norm(&attn_out, &format!("{prefix}.attention_norm2.weight"))?;
+            log::debug!(
+                "[refiner {prefix}] attn_post: {:?}",
+                attn_post.shape().dims()
+            );
             let x = x.add(&attn_post)?;
             log::debug!("[refiner {prefix}] after SA: {:?}", x.shape().dims());
 
@@ -1254,28 +1383,47 @@ impl ZImageModel {
             log::debug!("[refiner {prefix}] ffn_norm: {:?}", ffn_norm.shape().dims());
             let ffn_out = self.refiner_ffn(&ffn_norm, prefix)?;
             log::debug!("[refiner {prefix}] ffn_out: {:?}", ffn_out.shape().dims());
-            let ffn_post = self.resident_rms_norm(&ffn_out, &format!("{prefix}.ffn_norm2.weight"))?;
+            let ffn_post =
+                self.resident_rms_norm(&ffn_out, &format!("{prefix}.ffn_norm2.weight"))?;
             log::debug!("[refiner {prefix}] ffn_post: {:?}", ffn_post.shape().dims());
             x.add(&ffn_post)
         }
     }
 
-    fn refiner_attention(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, prefix: &str) -> Result<Tensor> {
+    fn refiner_attention(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        prefix: &str,
+    ) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (b, seq) = (dims[0], dims[1]);
 
         // Fused QKV then split (checkpoint stores fused qkv.weight)
         let qkv = self.linear_no_bias(x, &format!("{prefix}.attention.qkv.weight"))?;
         let qkv_chunks = qkv.chunk(3, 2)?;
-        let (q, k, v) = (qkv_chunks[0].clone(), qkv_chunks[1].clone(), qkv_chunks[2].clone());
+        let (q, k, v) = (
+            qkv_chunks[0].clone(),
+            qkv_chunks[1].clone(),
+            qkv_chunks[2].clone(),
+        );
 
-        let q = self.resident_rms_norm_per_head(&q, &format!("{prefix}.attention.q_norm.weight"))?;
-        let k = self.resident_rms_norm_per_head(&k, &format!("{prefix}.attention.k_norm.weight"))?;
+        let q =
+            self.resident_rms_norm_per_head(&q, &format!("{prefix}.attention.q_norm.weight"))?;
+        let k =
+            self.resident_rms_norm_per_head(&k, &format!("{prefix}.attention.k_norm.weight"))?;
 
         // RoPE + SDPA
-        let q = q.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+        let q = q
+            .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let k = k
+            .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
+        let v = v
+            .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+            .permute(&[0, 2, 1, 3])?;
 
         let q = apply_rope_complex(&q, cos, sin)?;
         let k = apply_rope_complex(&k, cos, sin)?;
@@ -1302,8 +1450,12 @@ impl ZImageModel {
     ) -> Result<Tensor> {
         // musubi-tuner zimage_model.py:266-281
         // adaLN_modulation is ModuleList([Linear]) — NO SiLU
-        let mod_out = self.block_linear_bias(adaln_input, block_idx,
-            "adaLN_modulation.0.weight", "adaLN_modulation.0.bias")?;
+        let mod_out = self.block_linear_bias(
+            adaln_input,
+            block_idx,
+            "adaLN_modulation.0.weight",
+            "adaLN_modulation.0.bias",
+        )?;
         // Squeeze back to 2D if ensure_3d added a dim, then unsqueeze for broadcast
         let mod_2d = if mod_out.shape().dims().len() == 3 && mod_out.shape().dims()[0] == 1 {
             mod_out.squeeze(Some(0))?
@@ -1343,10 +1495,8 @@ impl ZImageModel {
         let k = k.reshape(&[b * seq * NUM_HEADS, HEAD_DIM])?;
         let q_w = self.bw(block_idx, "attention.q_norm.weight")?;
         let k_w = self.bw(block_idx, "attention.k_norm.weight")?;
-        let q = primitive_rms_norm(&q, &q_w, NORM_EPS)?
-            .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?;
-        let k = primitive_rms_norm(&k, &k_w, NORM_EPS)?
-            .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?;
+        let q = primitive_rms_norm(&q, &q_w, NORM_EPS)?.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?;
+        let k = primitive_rms_norm(&k, &k_w, NORM_EPS)?.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?;
         let v = v.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?;
 
         // Permute to [B, heads, seq, head_dim] for attention
@@ -1363,7 +1513,9 @@ impl ZImageModel {
         // Output projection with LoRA
         let attn_out = self.add_lora_delta(
             self.block_linear_no_bias(&out, block_idx, "attention.out.weight")?,
-            &out, block_idx, LoraTarget::AttnOut,
+            &out,
+            block_idx,
+            LoraTarget::AttnOut,
         )?;
         let attn_post = self.block_rms_norm(&attn_out, block_idx, "attention_norm2.weight")?;
         let x = x.add(&gate_msa.mul(&attn_post)?)?;
@@ -1374,16 +1526,22 @@ impl ZImageModel {
 
         let w1 = self.add_lora_delta(
             self.block_linear_no_bias(&ffn_mod, block_idx, "feed_forward.w1.weight")?,
-            &ffn_mod, block_idx, LoraTarget::FfnW1,
+            &ffn_mod,
+            block_idx,
+            LoraTarget::FfnW1,
         )?;
         let w3 = self.add_lora_delta(
             self.block_linear_no_bias(&ffn_mod, block_idx, "feed_forward.w3.weight")?,
-            &ffn_mod, block_idx, LoraTarget::FfnW3,
+            &ffn_mod,
+            block_idx,
+            LoraTarget::FfnW3,
         )?;
         let h = w1.swiglu(&w3)?;
         let ffn_out = self.add_lora_delta(
             self.block_linear_no_bias(&h, block_idx, "feed_forward.w2.weight")?,
-            &h, block_idx, LoraTarget::FfnW2,
+            &h,
+            block_idx,
+            LoraTarget::FfnW2,
         )?;
 
         let ffn_post = self.block_rms_norm(&ffn_out, block_idx, "ffn_norm2.weight")?;
@@ -1394,9 +1552,11 @@ impl ZImageModel {
         // musubi-tuner zimage_model.py:315-318
         // Checkpoint: adaLN_modulation.0 = SiLU (no weights), .1 = Linear
         let mod_silu = adaln_input.silu()?;
-        let scale = self.linear_bias(&mod_silu,
+        let scale = self.linear_bias(
+            &mod_silu,
             "final_layer.adaLN_modulation.1.weight",
-            "final_layer.adaLN_modulation.1.bias")?;
+            "final_layer.adaLN_modulation.1.bias",
+        )?;
         let scale = scale.add_scalar(1.0)?.unsqueeze(1)?;
 
         let _hidden = x.shape().dims()[2];
@@ -1415,13 +1575,13 @@ impl ZImageModel {
         let w = self.w("final_layer.linear.weight")?;
         let b = self.w("final_layer.linear.bias")?;
         let dims = x_scaled.shape().dims().to_vec();
-        let batch: usize = dims[..dims.len()-1].iter().product();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
         let in_feat = *dims.last().unwrap();
         let out_feat = w.shape().dims()[0];
         let x_2d = x_scaled.reshape(&[batch, in_feat])?;
         let wt = w.transpose()?.contiguous()?;
         let out_2d = x_2d.matmul(&wt)?.add(&b)?;
-        let mut out_shape = dims[..dims.len()-1].to_vec();
+        let mut out_shape = dims[..dims.len() - 1].to_vec();
         out_shape.push(out_feat);
         out_2d.reshape(&out_shape)
     }
@@ -1451,7 +1611,12 @@ impl ZImageModel {
         x.reshape(&[b, c, h_tok * p, w_tok * p])
     }
 
-    fn build_rope_image(&self, h_tok: usize, w_tok: usize, cap_seq: usize) -> Result<(Tensor, Tensor)> {
+    fn build_rope_image(
+        &self,
+        h_tok: usize,
+        w_tok: usize,
+        cap_seq: usize,
+    ) -> Result<(Tensor, Tensor)> {
         // musubi-tuner zimage_model.py:662
         // Position IDs: (cap_seq + 1 + 0, h_idx, w_idx) for image tokens (F=1)
         build_3d_rope(1, h_tok, w_tok, cap_seq + 1, &self.device)
@@ -1495,32 +1660,52 @@ impl ZImageModel {
         flame_core::norm::rms_norm(x, &[hidden], Some(&w), NORM_EPS)
     }
 
-    fn block_rms_norm_per_head(&self, x: &Tensor, block_idx: usize, suffix: &str) -> Result<Tensor> {
+    fn block_rms_norm_per_head(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        suffix: &str,
+    ) -> Result<Tensor> {
         let w = self.bw(block_idx, suffix)?;
         let dims = x.shape().dims().to_vec();
-        let (batch, hidden) = (dims[..dims.len()-1].iter().product::<usize>(), *dims.last().unwrap());
+        let (batch, hidden) = (
+            dims[..dims.len() - 1].iter().product::<usize>(),
+            *dims.last().unwrap(),
+        );
         let flat = x.reshape(&[batch, hidden])?;
-        let normed = flame_core::norm::rms_norm(&flat.unsqueeze(0)?, &[hidden], Some(&w), NORM_EPS)?;
+        let normed =
+            flame_core::norm::rms_norm(&flat.unsqueeze(0)?, &[hidden], Some(&w), NORM_EPS)?;
         normed.reshape(&dims)
     }
 }
 
 fn ensure_3d(x: &Tensor) -> Result<Tensor> {
     let dims = x.shape().dims();
-    if dims.len() == 3 { return Ok(x.clone()); }
-    if dims.len() == 2 { return x.unsqueeze(0); }
-    if dims.len() == 1 { return x.unsqueeze(0)?.unsqueeze(0); }
+    if dims.len() == 3 {
+        return Ok(x.clone());
+    }
+    if dims.len() == 2 {
+        return x.unsqueeze(0);
+    }
+    if dims.len() == 1 {
+        return x.unsqueeze(0)?.unsqueeze(0);
+    }
     if dims.len() > 3 {
         log::error!("ensure_3d got {}D tensor: {:?}", dims.len(), dims);
         return Err(flame_core::Error::InvalidInput(format!(
-            "ensure_3d: expected <=3D, got {:?}", dims
+            "ensure_3d: expected <=3D, got {:?}",
+            dims
         )));
     }
     Ok(x.clone())
 }
 
 fn squeeze_if_needed(t: Tensor, orig_rank: usize) -> Tensor {
-    if orig_rank == 2 { t.squeeze(Some(0)).unwrap_or(t) } else { t }
+    if orig_rank == 2 {
+        t.squeeze(Some(0)).unwrap_or(t)
+    } else {
+        t
+    }
 }
 
 /// Build 3D RoPE cos/sin tables for image tokens.
@@ -1541,16 +1726,28 @@ fn build_3d_rope(
     // Wait — Z-Image uses complex RoPE, not split-half. The axes_dims are
     // [32, 48, 48] and sum to 128 = head_dim. Each axis contributes
     // half its dims as complex pairs: 16, 24, 24 = 64 complex pairs total.
-    let mut cos_host = vec![0.0f32; seq * (ROPE_AXES_DIMS[0] + ROPE_AXES_DIMS[1] + ROPE_AXES_DIMS[2]) / 2];
-    let mut sin_host = vec![0.0f32; seq * (ROPE_AXES_DIMS[0] + ROPE_AXES_DIMS[1] + ROPE_AXES_DIMS[2]) / 2];
+    let mut cos_host =
+        vec![0.0f32; seq * (ROPE_AXES_DIMS[0] + ROPE_AXES_DIMS[1] + ROPE_AXES_DIMS[2]) / 2];
+    let mut sin_host =
+        vec![0.0f32; seq * (ROPE_AXES_DIMS[0] + ROPE_AXES_DIMS[1] + ROPE_AXES_DIMS[2]) / 2];
     let total_half = (ROPE_AXES_DIMS[0] + ROPE_AXES_DIMS[1] + ROPE_AXES_DIMS[2]) / 2;
 
     let freqs_for_axis = |dim: usize| -> Vec<f64> {
         let half = dim / 2;
-        (0..half).map(|i| 1.0 / ROPE_THETA.powf(2.0 * i as f64 / dim as f64)).collect()
+        (0..half)
+            .map(|i| 1.0 / ROPE_THETA.powf(2.0 * i as f64 / dim as f64))
+            .collect()
     };
-    let fq = [freqs_for_axis(ROPE_AXES_DIMS[0]), freqs_for_axis(ROPE_AXES_DIMS[1]), freqs_for_axis(ROPE_AXES_DIMS[2])];
-    let half_per_axis = [ROPE_AXES_DIMS[0] / 2, ROPE_AXES_DIMS[1] / 2, ROPE_AXES_DIMS[2] / 2];
+    let fq = [
+        freqs_for_axis(ROPE_AXES_DIMS[0]),
+        freqs_for_axis(ROPE_AXES_DIMS[1]),
+        freqs_for_axis(ROPE_AXES_DIMS[2]),
+    ];
+    let half_per_axis = [
+        ROPE_AXES_DIMS[0] / 2,
+        ROPE_AXES_DIMS[1] / 2,
+        ROPE_AXES_DIMS[2] / 2,
+    ];
 
     for fi in 0..f_tok {
         for hi in 0..h_tok {
@@ -1571,14 +1768,25 @@ fn build_3d_rope(
         }
     }
 
-    let cos = Tensor::from_vec(cos_host, flame_core::Shape::from_dims(&[1, seq, total_half]), device.clone())?
-        .to_dtype(DType::BF16)?;
-    let sin = Tensor::from_vec(sin_host, flame_core::Shape::from_dims(&[1, seq, total_half]), device.clone())?
-        .to_dtype(DType::BF16)?;
+    let cos = Tensor::from_vec(
+        cos_host,
+        flame_core::Shape::from_dims(&[1, seq, total_half]),
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
+    let sin = Tensor::from_vec(
+        sin_host,
+        flame_core::Shape::from_dims(&[1, seq, total_half]),
+        device.clone(),
+    )?
+    .to_dtype(DType::BF16)?;
     Ok((cos, sin))
 }
 
-fn build_1d_rope(cap_seq: usize, device: &Arc<cudarc::driver::CudaDevice>) -> Result<(Tensor, Tensor)> {
+fn build_1d_rope(
+    cap_seq: usize,
+    device: &Arc<cudarc::driver::CudaDevice>,
+) -> Result<(Tensor, Tensor)> {
     // Caption positions: (i+1, 0, 0)
     build_3d_rope(cap_seq, 1, 1, 1, device)
 }
@@ -1632,7 +1840,11 @@ fn primitive_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
 /// matching this primitive chain.
 fn primitive_layer_norm(x: &Tensor, eps: f32) -> Result<Tensor> {
     let out_dtype = x.dtype();
-    let x_f32 = if out_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
+    let x_f32 = if out_dtype == DType::F32 {
+        x.clone()
+    } else {
+        x.to_dtype(DType::F32)?
+    };
     let dims = x_f32.shape().dims().to_vec();
     let last = dims.len() - 1;
     let n = dims[last] as f32;
@@ -1714,7 +1926,8 @@ fn block_forward_standalone(
 ) -> Result<Tensor> {
     let bw = |suffix: &str| -> Result<&Tensor> {
         let key = format!("layers.{block_idx}.{suffix}");
-        block_weights.get(&key)
+        block_weights
+            .get(&key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
     };
 
@@ -1730,11 +1943,8 @@ fn block_forward_standalone(
     let linear_no_bias = |x: &Tensor, suffix: &str| -> Result<Tensor> {
         let weight = bw(suffix)?;
         let orig_rank = x.shape().dims().len();
-        let out_3d = flame_core::ops::fused_inference::fused_linear3d_native(
-            &ensure_3d(x)?,
-            weight,
-            None,
-        )?;
+        let out_3d =
+            flame_core::ops::fused_inference::fused_linear3d_native(&ensure_3d(x)?, weight, None)?;
         Ok(squeeze_if_needed(out_3d, orig_rank))
     };
 
@@ -1786,7 +1996,9 @@ fn block_forward_standalone(
         // bundle is honored (the legacy `adapters` map is empty when LyCORIS
         // is the active path).  Fixes the silent-skip pitfall.
         if let Some(lora) = bundle.adapter_for(block_idx, target) {
-            let delta = lora.forward_delta(&ensure_3d(input)?).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
+            let delta = lora
+                .forward_delta(&ensure_3d(input)?)
+                .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
             base.add(&delta)
         } else {
             Ok(base)
@@ -1794,10 +2006,16 @@ fn block_forward_standalone(
     };
 
     // AdaLN modulation
-    let mod_out = linear_bias(adaln_input, "adaLN_modulation.0.weight", "adaLN_modulation.0.bias")?;
+    let mod_out = linear_bias(
+        adaln_input,
+        "adaLN_modulation.0.weight",
+        "adaLN_modulation.0.bias",
+    )?;
     let mod_2d = if mod_out.shape().dims().len() == 3 && mod_out.shape().dims()[0] == 1 {
         mod_out.squeeze(Some(0))?
-    } else { mod_out };
+    } else {
+        mod_out
+    };
     let chunks = mod_2d.unsqueeze(1)?.chunk(4, 2)?;
     let scale_msa = chunks[0].add_scalar(1.0)?;
     let gate_msa = chunks[1].tanh()?;
@@ -1819,9 +2037,15 @@ fn block_forward_standalone(
     let q = rms_norm_per_head(&q, "attention.q_norm.weight")?;
     let k = rms_norm_per_head(&k, "attention.k_norm.weight")?;
 
-    let q = q.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let k = k.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
-    let v = v.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+    let q = q
+        .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let k = k
+        .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
+    let v = v
+        .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?
+        .permute(&[0, 2, 1, 3])?;
 
     let q = apply_rope_complex(&q, cos, sin)?;
     let k = apply_rope_complex(&k, cos, sin)?;
@@ -1829,17 +2053,33 @@ fn block_forward_standalone(
     let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
     let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq, DIM])?;
 
-    let attn_out = add_lora(linear_no_bias(&out, "attention.out.weight")?, &out, LoraTarget::AttnOut)?;
+    let attn_out = add_lora(
+        linear_no_bias(&out, "attention.out.weight")?,
+        &out,
+        LoraTarget::AttnOut,
+    )?;
     let attn_post = rms_norm(&attn_out, "attention_norm2.weight")?;
     let x = x.add(&gate_msa.mul(&attn_post)?)?;
 
     // FFN with LoRA (SwiGLU)
     let ffn_norm = rms_norm(&x, "ffn_norm1.weight")?;
     let ffn_mod = ffn_norm.mul(&scale_mlp)?;
-    let w1 = add_lora(linear_no_bias(&ffn_mod, "feed_forward.w1.weight")?, &ffn_mod, LoraTarget::FfnW1)?;
-    let w3 = add_lora(linear_no_bias(&ffn_mod, "feed_forward.w3.weight")?, &ffn_mod, LoraTarget::FfnW3)?;
+    let w1 = add_lora(
+        linear_no_bias(&ffn_mod, "feed_forward.w1.weight")?,
+        &ffn_mod,
+        LoraTarget::FfnW1,
+    )?;
+    let w3 = add_lora(
+        linear_no_bias(&ffn_mod, "feed_forward.w3.weight")?,
+        &ffn_mod,
+        LoraTarget::FfnW3,
+    )?;
     let h = w1.swiglu(&w3)?;
-    let ffn_out = add_lora(linear_no_bias(&h, "feed_forward.w2.weight")?, &h, LoraTarget::FfnW2)?;
+    let ffn_out = add_lora(
+        linear_no_bias(&h, "feed_forward.w2.weight")?,
+        &h,
+        LoraTarget::FfnW2,
+    )?;
     let ffn_post = rms_norm(&ffn_out, "ffn_norm2.weight")?;
     x.add(&gate_mlp.mul(&ffn_post)?)
 }
@@ -1874,13 +2114,14 @@ fn block_forward_iflame(
     lycoris: Option<&Arc<crate::lycoris::LycorisBundle>>,
     block_weights: &HashMap<String, Tensor>,
 ) -> Result<Tensor> {
-    use flame_core::ops::fused_inference::fused_rms_norm;
     use flame_core::bf16_ops::{gate_residual_fused_bf16, swiglu_fused_bf16};
+    use flame_core::ops::fused_inference::fused_rms_norm;
 
     // Weight accessor: `layers.{block_idx}.{suffix}`
     let bw = |suffix: &str| -> Result<&Tensor> {
         let key = format!("layers.{block_idx}.{suffix}");
-        block_weights.get(&key)
+        block_weights
+            .get(&key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
     };
 
@@ -1923,9 +2164,9 @@ fn block_forward_iflame(
         // Dispatch via `adapter_for` to honour `--algo locon`/etc on the
         // model's own bundle (legacy `adapters` map is empty under LyCORIS).
         if let Some(lora) = bundle.adapter_for(block_idx, target) {
-            let delta = lora.forward_delta(&ensure_3d(input)?)
-                .map_err(|e| flame_core::FlameError::InvalidInput(
-                    format!("lora delta: {e}")))?;
+            let delta = lora
+                .forward_delta(&ensure_3d(input)?)
+                .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
             base.add(&delta)
         } else {
             Ok(base)
@@ -1935,7 +2176,11 @@ fn block_forward_iflame(
     // --- AdaLN modulation ---------------------------------------------------
     // adaLN_modulation is ModuleList([Linear]) — NO SiLU, matching
     // musubi-tuner `zimage_model.py:266`.
-    let mod_out = linear_3d_bias(adaln_input, "adaLN_modulation.0.weight", "adaLN_modulation.0.bias")?;
+    let mod_out = linear_3d_bias(
+        adaln_input,
+        "adaLN_modulation.0.weight",
+        "adaLN_modulation.0.bias",
+    )?;
     // mod_out shape: [B, 4*DIM] (2-D) or [1, B, 4*DIM] (3-D from ensure_3d).
     // Squeeze batch-dim if ensure_3d added one so chunk splits on the right dim.
     let mod_2d = if mod_out.shape().dims().len() == 3 && mod_out.shape().dims()[0] == 1 {
@@ -1946,9 +2191,9 @@ fn block_forward_iflame(
     // Broadcast shape: [B, 1, 4*DIM] → chunk(4, 2) → each [B, 1, DIM].
     let chunks = mod_2d.unsqueeze(1)?.chunk(4, 2)?;
     let scale_msa = chunks[0].add_scalar(1.0)?;
-    let gate_msa  = chunks[1].tanh()?;
+    let gate_msa = chunks[1].tanh()?;
     let scale_mlp = chunks[2].add_scalar(1.0)?;
-    let gate_mlp  = chunks[3].tanh()?;
+    let gate_mlp = chunks[3].tanh()?;
 
     // --- Attention branch ----------------------------------------------------
     let dims = x.shape().dims().to_vec();
@@ -1956,7 +2201,7 @@ fn block_forward_iflame(
 
     // Pre-attn norm + scale modulation
     let x_norm = fused_rms_norm(x, bw("attention_norm1.weight")?, NORM_EPS)?;
-    let x_mod  = x_norm.mul(&scale_msa)?;
+    let x_mod = x_norm.mul(&scale_msa)?;
 
     // Fused QKV projection, then split
     let qkv = linear_3d(&x_mod, bw("attention.qkv.weight")?)?;
@@ -1992,7 +2237,8 @@ fn block_forward_iflame(
     // Output projection + LoRA
     let attn_out = add_lora(
         linear_3d(&out, bw("attention.out.weight")?)?,
-        &out, LoraTarget::AttnOut,
+        &out,
+        LoraTarget::AttnOut,
     )?;
 
     // Post-attn norm + gated residual: x + tanh(gate_msa) * norm(attn_out)
@@ -2002,13 +2248,25 @@ fn block_forward_iflame(
     // --- FFN branch ----------------------------------------------------------
     // Pre-FFN norm + scale modulation
     let ffn_norm = fused_rms_norm(&x, bw("ffn_norm1.weight")?, NORM_EPS)?;
-    let ffn_mod  = ffn_norm.mul(&scale_mlp)?;
+    let ffn_mod = ffn_norm.mul(&scale_mlp)?;
 
     // SwiGLU: w2(silu(w1(x)) * w3(x)) with LoRA on each projection
-    let w1 = add_lora(linear_3d(&ffn_mod, bw("feed_forward.w1.weight")?)?, &ffn_mod, LoraTarget::FfnW1)?;
-    let w3 = add_lora(linear_3d(&ffn_mod, bw("feed_forward.w3.weight")?)?, &ffn_mod, LoraTarget::FfnW3)?;
-    let h  = swiglu_fused_bf16(&w1, &w3)?;
-    let ffn_out = add_lora(linear_3d(&h, bw("feed_forward.w2.weight")?)?, &h, LoraTarget::FfnW2)?;
+    let w1 = add_lora(
+        linear_3d(&ffn_mod, bw("feed_forward.w1.weight")?)?,
+        &ffn_mod,
+        LoraTarget::FfnW1,
+    )?;
+    let w3 = add_lora(
+        linear_3d(&ffn_mod, bw("feed_forward.w3.weight")?)?,
+        &ffn_mod,
+        LoraTarget::FfnW3,
+    )?;
+    let h = swiglu_fused_bf16(&w1, &w3)?;
+    let ffn_out = add_lora(
+        linear_3d(&h, bw("feed_forward.w2.weight")?)?,
+        &h,
+        LoraTarget::FfnW2,
+    )?;
 
     // Post-FFN norm + gated residual: x + tanh(gate_mlp) * norm(ffn_out)
     let ffn_post = fused_rms_norm(&ffn_out, bw("ffn_norm2.weight")?, NORM_EPS)?;
@@ -2033,7 +2291,9 @@ fn zimage_dump(dir: &std::path::Path, name: &str, t: &Tensor) -> Result<()> {
     let mut m: HashMap<String, Tensor> = HashMap::new();
     m.insert("t".to_string(), f32);
     flame_core::serialization::save_tensors(
-        &m, &path, flame_core::serialization::SerializationFormat::SafeTensors,
+        &m,
+        &path,
+        flame_core::serialization::SerializationFormat::SafeTensors,
     )
 }
 
@@ -2049,16 +2309,22 @@ impl crate::models::TrainableModel for ZImageModel {
         _pooled: Option<&Tensor>,
     ) -> crate::Result<Tensor> {
         let cap_feats = context.first().ok_or_else(|| {
-            crate::EriDiffusionError::Model("ZImageModel needs caption embeddings in context[0]".into())
+            crate::EriDiffusionError::Model(
+                "ZImageModel needs caption embeddings in context[0]".into(),
+            )
         })?;
         let cap_mask = context.get(1);
         ZImageModel::forward(self, noisy, timestep, cap_feats, cap_mask)
             .map_err(crate::EriDiffusionError::from)
     }
 
-    fn parameters(&self) -> Vec<Parameter> { ZImageModel::parameters(self) }
+    fn parameters(&self) -> Vec<Parameter> {
+        ZImageModel::parameters(self)
+    }
 
-    fn post_optimizer_step(&mut self) { self.refresh_lora_cache(); }
+    fn post_optimizer_step(&mut self) {
+        self.refresh_lora_cache();
+    }
 
     fn save_weights(&self, path: &str) -> crate::Result<()> {
         ZImageModel::save_weights(self, std::path::Path::new(path))
@@ -2066,12 +2332,18 @@ impl crate::models::TrainableModel for ZImageModel {
     }
 
     fn load_weights(&mut self, path: &str) -> crate::Result<()> {
-        let device = self.bundle.adapters.values().next()
+        let device = self
+            .bundle
+            .adapters
+            .values()
+            .next()
             .map(|l| l.lora_a.tensor().map(|t| t.device().clone()))
             .transpose()?
-            .ok_or_else(|| crate::EriDiffusionError::Model("no LoRA adapters to load into".into()))?;
-        self.bundle.load(std::path::Path::new(path), &device)
+            .ok_or_else(|| {
+                crate::EriDiffusionError::Model("no LoRA adapters to load into".into())
+            })?;
+        self.bundle
+            .load(std::path::Path::new(path), &device)
             .map_err(crate::EriDiffusionError::from)
     }
 }
-

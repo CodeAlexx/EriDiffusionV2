@@ -1,15 +1,18 @@
 //! Decoder roundtrip smoke. Reads a Wan-VAE-normalized latent from a
 //! prepare_anima cache file, decodes it with Wan21VaeDecoder, writes PNG.
 use clap::Parser;
+use eridiffusion_core::encoders::wan21_decoder::Wan21VaeDecoder;
 use flame_core::DType;
 use std::path::PathBuf;
-use eridiffusion_core::encoders::wan21_decoder::Wan21VaeDecoder;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] cache: PathBuf,
-    #[arg(long)] vae_path: PathBuf,
-    #[arg(long, default_value = "decoded.png")] output: PathBuf,
+    #[arg(long)]
+    cache: PathBuf,
+    #[arg(long)]
+    vae_path: PathBuf,
+    #[arg(long, default_value = "decoded.png")]
+    output: PathBuf,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -20,11 +23,16 @@ fn main() -> anyhow::Result<()> {
     flame_core::config::set_default_dtype(DType::BF16);
 
     let tensors = flame_core::serialization::load_file(&args.cache, &device)?;
-    let latent = tensors.get("latent")
+    let latent = tensors
+        .get("latent")
         .ok_or_else(|| anyhow::anyhow!("'latent' not in cache"))?
         .clone()
         .to_dtype(DType::BF16)?;
-    log::info!("latent shape={:?} dtype={:?}", latent.shape().dims(), latent.dtype());
+    log::info!(
+        "latent shape={:?} dtype={:?}",
+        latent.shape().dims(),
+        latent.dtype()
+    );
 
     let vae = Wan21VaeDecoder::from_safetensors(&args.vae_path.to_string_lossy(), &device)?;
     let img = vae.decode_image_normalized(&latent)?;
@@ -43,7 +51,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    image::save_buffer(&args.output, &buf, w as u32, h as u32, image::ColorType::Rgb8)?;
+    image::save_buffer(
+        &args.output,
+        &buf,
+        w as u32,
+        h as u32,
+        image::ColorType::Rgb8,
+    )?;
     log::info!("Saved {:?}", args.output);
     Ok(())
 }

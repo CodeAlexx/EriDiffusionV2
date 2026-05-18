@@ -10,72 +10,95 @@
 //! yet. Data comes from the upstream ACE-Step Python pipeline.
 
 use clap::Parser;
-use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
-use flame_core::gradient_clip::GradientClipper;
+use eridiffusion_core::config::LrScheduler;
 use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::AceStepLoRAModel;
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
-use eridiffusion_core::config::LrScheduler;
-use eridiffusion_core::training::features::{
-    caption_dropout, ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
-    validation::ValidationLoop,
-};
 use eridiffusion_core::training::ema::ParameterEma;
+use eridiffusion_core::training::features::{
+    caption_dropout, ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers,
+    timestep_bias, validation::ValidationLoop,
+};
 use eridiffusion_core::training::schedule;
+use eridiffusion_core::training::training_features::timestep_dist::{
+    TimestepConfig, TimestepDistribution,
+};
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
-use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use flame_core::gradient_clip::GradientClipper;
+use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::str::FromStr as _;
 use std::path::PathBuf;
+use std::str::FromStr as _;
 
 const SEED_DEFAULT: u64 = 42;
 
 #[derive(Parser)]
 struct Args {
     /// ACE-Step DiT base safetensors checkpoint.
-    #[arg(long)] model: PathBuf,
+    #[arg(long)]
+    model: PathBuf,
     /// Directory of preprocessed `.safetensors` (or `.pt`) sample files.
-    #[arg(long)] cache_dir: PathBuf,
-    #[arg(long, default_value = "100")] steps: usize,
-    #[arg(long, default_value = "16")] rank: usize,
-    #[arg(long, default_value = "16.0")] lora_alpha: f32,
-    #[arg(long, default_value = "4e-4")] lr: f32,
-    #[arg(long, default_value = "200")] warmup_steps: usize,
+    #[arg(long)]
+    cache_dir: PathBuf,
+    #[arg(long, default_value = "100")]
+    steps: usize,
+    #[arg(long, default_value = "16")]
+    rank: usize,
+    #[arg(long, default_value = "16.0")]
+    lora_alpha: f32,
+    #[arg(long, default_value = "4e-4")]
+    lr: f32,
+    #[arg(long, default_value = "200")]
+    warmup_steps: usize,
     /// Logit-normal timestep mu (configuration_acestep_v15.py default -0.4).
     /// Used only when `--timestep-distribution=auto` (default).
-    #[arg(long, default_value = "-0.4")] timestep_mu: f32,
+    #[arg(long, default_value = "-0.4")]
+    timestep_mu: f32,
     /// Logit-normal timestep sigma (default 1.0).
     /// Used only when `--timestep-distribution=auto` (default).
-    #[arg(long, default_value = "1.0")] timestep_sigma: f32,
+    #[arg(long, default_value = "1.0")]
+    timestep_sigma: f32,
     /// Unified OneTrainer timestep distribution. `auto` (default) keeps
     /// the byte-equivalent legacy `(timestep_mu, timestep_sigma)` logit-normal
     /// path. Other choices: `uniform`, `sigmoid`, `logit_normal`, `heavy_tail`,
     /// `cos_map`, `inverted_parabola`. When non-`auto`, `--timestep-mu` and
     /// `--timestep-sigma` are ignored in favor of `--noising-weight` /
     /// `--noising-bias`.
-    #[arg(long, default_value = "auto")] timestep_distribution: String,
+    #[arg(long, default_value = "auto")]
+    timestep_distribution: String,
     /// Distribution-specific weight knob (default 0.0). Ignored when
     /// `--timestep-distribution=auto`.
-    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    #[arg(long, default_value_t = 0.0)]
+    noising_weight: f32,
     /// Distribution-specific bias knob (default 0.0). Ignored when
     /// `--timestep-distribution=auto`.
-    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
+    #[arg(long, default_value_t = 0.0)]
+    noising_bias: f32,
     /// CFG dropout ratio (modeling_acestep_v15_base.py default 0.15).
-    #[arg(long, default_value = "0.15")] cfg_ratio: f32,
+    #[arg(long, default_value = "0.15")]
+    cfg_ratio: f32,
     /// Resume LoRA weights only.
-    #[arg(long, conflicts_with = "resume_full")] resume_lora: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_full")]
+    resume_lora: Option<PathBuf>,
     /// Full resume: LoRA + AdamW + step.
-    #[arg(long, conflicts_with = "resume_lora")] resume_full: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_lora")]
+    resume_full: Option<PathBuf>,
     /// Save mode: `full` (LoRA + AdamW + step) or `weights` (legacy).
-    #[arg(long, default_value = "full")] save_mode: String,
-    #[arg(long, default_value = "0")] save_every: usize,
-    #[arg(long, default_value = "output")] output_dir: PathBuf,
-    #[arg(long, default_value_t = SEED_DEFAULT)] seed: u64,
+    #[arg(long, default_value = "full")]
+    save_mode: String,
+    #[arg(long, default_value = "0")]
+    save_every: usize,
+    #[arg(long, default_value = "output")]
+    output_dir: PathBuf,
+    #[arg(long, default_value_t = SEED_DEFAULT)]
+    seed: u64,
 
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
-    #[arg(long)] min_snr_gamma: Option<f32>,
-    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    #[arg(long)]
+    min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    caption_dropout_probability: f32,
     /// Path to a single cache file produced upstream from an empty-caption
     /// sample. When `--caption-dropout-probability > 0`, the trainer loads
     /// `encoder_hidden_states` from this file and swaps it in with probability
@@ -83,66 +106,98 @@ struct Args {
     /// model's internal `null_condition_emb`); both can be active and either
     /// firing produces a null-conditioned step. If unset and dropout > 0, the
     /// feature is disabled with a warning.
-    #[arg(long)] null_text_cache: Option<PathBuf>,
-    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
-    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
-    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
-    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
-    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
-    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    #[arg(long)]
+    null_text_cache: Option<PathBuf>,
+    #[arg(long, default_value_t = 1.0)]
+    noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)]
+    gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)]
+    huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lr_min_factor: f32,
+    #[arg(long)]
+    validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    validation_every_steps: u64,
+    #[arg(long, num_args = 0..)]
+    multi_backend_weights: Vec<f32>,
     /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
     /// trainers accept-and-warn until per-model wiring lands.
-    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    #[arg(long, num_args = 0..)]
+    multi_backend_cache_dirs: Vec<std::path::PathBuf>,
     /// Phase 2: validation prompt library JSON (Klein-only wiring; other
     /// trainers accept-and-warn).
-    #[arg(long)] validation_prompts_file: Option<std::path::PathBuf>,
-    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    #[arg(long)]
+    validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)]
+    masked_loss_weight: f32,
     /// Master switch for EMA shadow. Default false; loss curves are byte-
     /// identical to `--ema=false` because the shadow is parallel — only
     /// `--ema-validation-swap` exposes it at sample/checkpoint time.
-    #[arg(long, default_value_t = false)] ema: bool,
-    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
-    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
-    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
-    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
+    #[arg(long, default_value_t = false)]
+    ema: bool,
+    #[arg(long, default_value_t = 1.0)]
+    ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)]
+    ema_power: f32,
+    #[arg(long, default_value_t = 0)]
+    ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)]
+    ema_min_decay: f32,
     /// Upper clamp for the per-step computed decay. Default 0.9999 matches
     /// diffusers EMAModel.
-    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
+    #[arg(long, default_value_t = 0.9999)]
+    ema_max_decay: f32,
     /// Swap EMA shadow into live params at sample/checkpoint time. Default
     /// false. No effect when EMA is not constructed.
-    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+    #[arg(long, default_value_t = false)]
+    ema_validation_swap: bool,
     /// Multi-resolution / pyramid noise iterations. 0 = disabled (byte-
     /// invariant). NOTE: ACE-Step trains on non-4D audio latents
     /// `[B, C, T]`; the helper short-circuits to a no-op for non-4D
     /// inputs, so this flag is effectively a documented no-op for ACE-Step.
-    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
+    #[arg(long, default_value_t = 0)]
+    multires_noise_iterations: usize,
     /// Per-level discount factor for `--multires-noise-iterations`.
-    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+    #[arg(long, default_value_t = 0.3)]
+    multires_noise_discount: f32,
     /// Timestep bias strategy: `none` (default), `later`, `earlier`, `range`.
-    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
+    #[arg(long, default_value = "none")]
+    timestep_bias_strategy: String,
     /// Strength for `--timestep-bias-strategy later|earlier`.
-    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_multiplier: f32,
     /// Lower bound for `--timestep-bias-strategy range`, fraction of
     /// NUM_TRAIN_TIMESTEPS in [0, 1].
-    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_range_min: f32,
     /// Upper bound for `--timestep-bias-strategy range`, fraction in [0, 1].
-    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
-    #[arg(long)] tread_route_pattern: Option<String>,
+    #[arg(long, default_value_t = 1.0)]
+    timestep_bias_range_max: f32,
+    #[arg(long)]
+    tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
-    #[arg(long, default_value = "adamw")] optimizer: String,
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
 
     // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
-    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
-    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
-    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
-    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    #[arg(long, num_args = 0..)]
+    multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
     /// Phase 5: LR scheduler family. Default `constant` is byte-equivalent to
     /// the legacy `constant_with_warmup` ACE-Step has used since launch.
     /// Accepted: constant, linear, cosine, cosine_with_restarts, polynomial, rex.
-    #[arg(long, default_value = "constant")] lr_scheduler: String,
+    #[arg(long, default_value = "constant")]
+    lr_scheduler: String,
     /// Phase 5: cosine-with-restarts cycle count. Ignored for other schedulers.
-    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+    #[arg(long, default_value_t = 1.0)]
+    lr_cycles: f32,
 
     // ── LyCORIS algo selection (Phase 2b) ──
     //
@@ -155,19 +210,25 @@ struct Args {
     /// | `full` | `oft`. `full` and `oft` build successfully but their
     /// `forward_delta` will error inside ACE-Step's `base + delta_on_input`
     /// attention call pattern — Phase 2c will wire `merge_into_base`.
-    #[arg(long, default_value = "lora")] algo: String,
+    #[arg(long, default_value = "lora")]
+    algo: String,
     /// LoKr Kronecker split factor (ignored for non-LoKr).
-    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    #[arg(long, default_value_t = 16)]
+    lokr_factor: i32,
     /// OFT block size (ignored for non-OFT).
-    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    #[arg(long, default_value_t = 32)]
+    oft_block_size: usize,
     /// OFT Cayley-Neumann series term count (ignored for non-OFT).
-    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    #[arg(long, default_value_t = 5)]
+    oft_neumann_terms: usize,
     /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
     /// kernels. ACE-Step's LoRA targets (Q/K/V/O) are linear-only so this is
     /// currently a no-op.
-    #[arg(long, default_value_t = false)] use_tucker: bool,
+    #[arg(long, default_value_t = false)]
+    use_tucker: bool,
     /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
-    #[arg(long, default_value_t = false)] decompose_both: bool,
+    #[arg(long, default_value_t = false)]
+    decompose_both: bool,
     /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr
     /// (Full inherits, OFT errors).
     ///
@@ -176,46 +237,59 @@ struct Args {
     /// from `||I||_2 = 1` rather than `||W_orig||_2`. Trainer should still
     /// converge — first few hundred steps adjust the magnitude. Phase 2c
     /// will wire pre-load magnitude init.
-    #[arg(long, default_value_t = false)] dora: bool,
+    #[arg(long, default_value_t = false)]
+    dora: bool,
     /// DoRA magnitude axis. Default `true` matches lycoris-upstream
     /// (norm over input dims, magnitude shape `[out, 1]`).
-    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
-    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    #[arg(long, default_value_t = true)]
+    dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)]
+    dora_eps: f32,
     /// PEFT/SimpleTuner `--lora_init_type`. Applies to LoCon (the LoRA path)
     /// only. Choices: `default | gaussian | pissa | olora | loftq`. The
     /// PISSA/OLoRA/LoftQ variants parse but error at adapter construction
     /// because flame-core does not yet expose SVD/QR.
-    #[arg(long, default_value = "default")] lora_init_type: String,
+    #[arg(long, default_value = "default")]
+    lora_init_type: String,
     /// SimpleTuner-style `lycoris_config preset.json`. Optional; per-target
     /// `module_algo_map` overrides apply during adapter construction.
-    #[arg(long)] lycoris_config: Option<PathBuf>,
+    #[arg(long)]
+    lycoris_config: Option<PathBuf>,
     /// SimpleTuner-parity perturbed-normal LoKr init. No-op for ACE-Step in
     /// Phase 2b (base-weight-by-target lookup not plumbed — the resident
     /// `weights` map is keyed by string, and the per-target lookup helper
     /// would mirror `AceStepLoraTarget::suffix()`. Phase 2c will wire it).
-    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    #[arg(long, default_value_t = 0.0)]
+    init_lokr_norm: f32,
     /// SimpleTuner / ai-toolkit `network.conv` — per-LyCORIS rank for
     /// CONV-layer targets (separate from linear `--rank`). `0` (default)
     /// = fall back to linear rank. Inert when no conv targets are wired
     /// in the model bundle (current state on all EDv2 trainers).
-    #[arg(long, default_value_t = 0)] conv_rank: usize,
+    #[arg(long, default_value_t = 0)]
+    conv_rank: usize,
     /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
     /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
-    #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
+    #[arg(long, default_value_t = 0.0)]
+    conv_alpha: f32,
     /// Per-element dropout on the adapter delta (training only).
-    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lora_dropout: f32,
     /// Per-rank Bernoulli on the down-projection intermediate.
-    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    rank_dropout: f32,
     /// Per-step Bernoulli on the entire adapter.
-    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    module_dropout: f32,
     /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
-    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
+    #[arg(long, default_value_t = false)]
+    rank_dropout_scale: bool,
 
     // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
     /// Route the backward pass through `AutogradContext::backward_v2`
     /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
-    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
 }
 
 /// Apply CFG dropout: with probability `cfg_ratio`, replace `encoder_hs` with
@@ -255,10 +329,17 @@ fn main() -> anyhow::Result<()> {
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
 
-    log::info!("Loading ACE-Step DiT (rank={} alpha={}) from {}...",
-        args.rank, args.lora_alpha, args.model.display());
+    log::info!(
+        "Loading ACE-Step DiT (rank={} alpha={}) from {}...",
+        args.rank,
+        args.lora_alpha,
+        args.model.display()
+    );
     let mut model = AceStepLoRAModel::from_safetensors(
-        &args.model, args.rank, args.lora_alpha, device.clone(),
+        &args.model,
+        args.rank,
+        args.lora_alpha,
+        device.clone(),
     )?;
 
     // Phase 2b: parse the LyCORIS algo selector. `--algo lora` (or `none` /
@@ -297,8 +378,8 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("--lora_init_type: {e}"))?,
         ..LycorisBundleConfig::default()
     };
-    let lyc_config = lyc_config
-        .with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
+    let lyc_config =
+        lyc_config.with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
 
     if algo != LycorisAlgo::None {
         log::info!(
@@ -318,7 +399,8 @@ fn main() -> anyhow::Result<()> {
                 algo.as_str()
             );
         }
-        model.install_lycoris_bundle(&lyc_config, device.clone(), SEED_DEFAULT)
+        model
+            .install_lycoris_bundle(&lyc_config, device.clone(), SEED_DEFAULT)
             .map_err(|e| anyhow::anyhow!("LyCORIS bundle install: {e}"))?;
     } else {
         log::info!("[ACE-Step] algo='lora' (legacy LoRALinear path, byte-identical)");
@@ -338,12 +420,20 @@ fn main() -> anyhow::Result<()> {
     }
     // Reference-only: silence unused-warning for dropout flags wired in
     // Block 2 but not yet plumbed past `LycorisBundleConfig` (Phase 2c).
-    let _ = (args.lora_dropout, args.rank_dropout,
-             args.module_dropout, args.rank_dropout_scale);
+    let _ = (
+        args.lora_dropout,
+        args.rank_dropout,
+        args.module_dropout,
+        args.rank_dropout_scale,
+    );
 
     let params = model.parameters();
-    log::info!("Loaded {} trainable LoRA tensors ({} layers, hidden={})",
-        params.len(), model.config().num_layers, model.config().hidden_size);
+    log::info!(
+        "Loaded {} trainable LoRA tensors ({} layers, hidden={})",
+        params.len(),
+        model.config().num_layers,
+        model.config().hidden_size
+    );
     if params.is_empty() {
         anyhow::bail!("No trainable parameters — model produced empty param list");
     }
@@ -353,7 +443,8 @@ fn main() -> anyhow::Result<()> {
     let mut cache_files: Vec<PathBuf> = std::fs::read_dir(&args.cache_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.extension().and_then(|s| s.to_str())
+            p.extension()
+                .and_then(|s| s.to_str())
                 .map(|e| e == "safetensors" || e == "pt")
                 .unwrap_or(false)
         })
@@ -365,9 +456,10 @@ fn main() -> anyhow::Result<()> {
     log::info!("Found {} cached samples", cache_files.len());
 
     // Phase 2: validation harness — held-out cache + cadence. None at default.
-    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
-        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
-    {
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) = (
+        args.validation_dataset_dir.as_ref(),
+        args.validation_every_steps,
+    ) {
         if n > 0 {
             let v = ValidationLoop::new(dir, n)
                 .map_err(|e| anyhow::anyhow!("validation harness: {e}"))?;
@@ -384,8 +476,8 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    let opt_kind = OptimizerKind::parse(&args.optimizer)
-        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    let opt_kind =
+        OptimizerKind::parse(&args.optimizer).map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
     log::info!("[ACE-Step] optimizer={}", opt_kind.as_str());
     // Phase 1: caption_dropout. ACE-Step has no inline encoder, so the user
     // supplies a `--null-text-cache` produced upstream on a single
@@ -401,8 +493,11 @@ fn main() -> anyhow::Result<()> {
         match args.null_text_cache.as_ref() {
             Some(p) => match flame_core::serialization::load_file(p, &device) {
                 Ok(s) => {
-                    let nt_raw = s.get("encoder_hidden_states")
-                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'encoder_hidden_states'"))?
+                    let nt_raw = s
+                        .get("encoder_hidden_states")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--null-text-cache missing 'encoder_hidden_states'")
+                        })?
                         .to_dtype(DType::BF16)?;
                     // Match the per-step `pull("encoder_hidden_states")?.unsqueeze(0)`
                     // pattern: cached null is [T, C], we add the batch dim to
@@ -495,19 +590,20 @@ fn main() -> anyhow::Result<()> {
     // Unified OneTrainer timestep distribution dispatch (optional override).
     // `auto` keeps the legacy `(timestep_mu, timestep_sigma)` logit-normal
     // path for byte-equivalence with pre-flag runs.
-    let unified_timestep_cfg: Option<TimestepConfig> = if args.timestep_distribution.eq_ignore_ascii_case("auto") {
-        None
-    } else {
-        let dist = TimestepDistribution::from_str(&args.timestep_distribution)
-            .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
-        Some(TimestepConfig {
-            distribution: dist,
-            noising_weight: args.noising_weight,
-            noising_bias: args.noising_bias,
-            min_strength: 0.0,
-            max_strength: 1.0,
-        })
-    };
+    let unified_timestep_cfg: Option<TimestepConfig> =
+        if args.timestep_distribution.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            let dist = TimestepDistribution::from_str(&args.timestep_distribution)
+                .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+            Some(TimestepConfig {
+                distribution: dist,
+                noising_weight: args.noising_weight,
+                noising_bias: args.noising_bias,
+                min_strength: 0.0,
+                max_strength: 1.0,
+            })
+        };
 
     if args.multires_noise_iterations > 0 {
         log::warn!(
@@ -536,7 +632,10 @@ fn main() -> anyhow::Result<()> {
         }
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
-            log::warn!("Resumed step ({start_step}) >= --steps ({}); nothing to do.", args.steps);
+            log::warn!(
+                "Resumed step ({start_step}) >= --steps ({}); nothing to do.",
+                args.steps
+            );
             return Ok(());
         }
         log::info!("Continuing from step {start_step}/{}", args.steps);
@@ -551,15 +650,27 @@ fn main() -> anyhow::Result<()> {
     let board = BoardWriter::open(
         &args.output_dir,
         BoardWriter::new_session_id(),
-        if start_step > 0 { Some(start_step as u64) } else { None },
-    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+        if start_step > 0 {
+            Some(start_step as u64)
+        } else {
+            None
+        },
+    )
+    .map_err(|e| log::warn!("board.db open failed: {e}"))
+    .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
     }
     let t_start = std::time::Instant::now();
 
-    log::info!("Training {} steps from step={}, lr={} warmup={} cfg_ratio={}",
-        args.steps, start_step, args.lr, args.warmup_steps, args.cfg_ratio);
+    log::info!(
+        "Training {} steps from step={}, lr={} warmup={} cfg_ratio={}",
+        args.steps,
+        start_step,
+        args.lr,
+        args.warmup_steps,
+        args.cfg_ratio
+    );
 
     let sched: LrScheduler = args.lr_scheduler.parse().unwrap_or_else(|e: String| {
         log::warn!("[lr_scheduler] {e} — falling back to Constant");
@@ -583,10 +694,19 @@ fn main() -> anyhow::Result<()> {
         let sample_idx = rng.gen_range(0..cache_files.len());
         let tensors = flame_core::serialization::load_file(&cache_files[sample_idx], &device)?;
         let pull = |k: &str| -> flame_core::Result<Tensor> {
-            tensors.get(k)
-                .ok_or_else(|| flame_core::Error::InvalidInput(
-                    format!("Missing '{k}' in {}", cache_files[sample_idx].display())))
-                .map(|t| t.clone().to_dtype(DType::BF16).unwrap_or_else(|_| t.clone()))
+            tensors
+                .get(k)
+                .ok_or_else(|| {
+                    flame_core::Error::InvalidInput(format!(
+                        "Missing '{k}' in {}",
+                        cache_files[sample_idx].display()
+                    ))
+                })
+                .map(|t| {
+                    t.clone()
+                        .to_dtype(DType::BF16)
+                        .unwrap_or_else(|_| t.clone())
+                })
         };
         let target_latents = pull("target_latents")?.unsqueeze(0)?;
         let _attention_mask = pull("attention_mask")?.unsqueeze(0)?;
@@ -598,7 +718,12 @@ fn main() -> anyhow::Result<()> {
         // step swaps encoder_hidden_states with null cache. Default-off
         // (prob == 0.0 OR null_text == None) draws no rng.
         let encoder_hs = if let Some(ref nt) = null_text {
-            caption_dropout::maybe_drop_caption(&encoder_hs, nt, effective_caption_dropout_prob, &mut rng)?
+            caption_dropout::maybe_drop_caption(
+                &encoder_hs,
+                nt,
+                effective_caption_dropout_prob,
+                &mut rng,
+            )?
         } else {
             encoder_hs
         };
@@ -639,7 +764,11 @@ fn main() -> anyhow::Result<()> {
             let raw_t = if let Some(ref tcfg) = unified_timestep_cfg {
                 tcfg.sample_one(&mut rng)
             } else {
-                schedule::sample_timestep_logit_normal(&mut rng, args.timestep_mu, args.timestep_sigma)
+                schedule::sample_timestep_logit_normal(
+                    &mut rng,
+                    args.timestep_mu,
+                    args.timestep_sigma,
+                )
             };
             // schedule helper already returns sigmoid(z*sigma+mu)-equivalent in (0,1).
             // Default-off: Strategy::None → returns raw_t unchanged. Use total=1.0
@@ -651,7 +780,9 @@ fn main() -> anyhow::Result<()> {
             .to_dtype(DType::BF16)?;
 
         // x_t = t * x1 + (1 - t) * x0  (use perturbed for model input)
-        let xt = x1_perturbed.mul_scalar(t_val)?.add(&x0.mul_scalar(1.0 - t_val)?)?;
+        let xt = x1_perturbed
+            .mul_scalar(t_val)?
+            .add(&x0.mul_scalar(1.0 - t_val)?)?;
 
         // Forward + flow-matching loss.
         AutogradContext::clear();
@@ -668,13 +799,8 @@ fn main() -> anyhow::Result<()> {
         // ACE-Step trainer doesn't load TrainConfig; mse=1.0 mae=0.0 inline.
         let pred_f32 = pred.to_dtype(DType::F32)?;
         let flow_f32 = flow.to_dtype(DType::F32)?;
-        let raw_loss = loss_weight::combined_loss(
-            &pred_f32,
-            &flow_f32,
-            1.0,
-            0.0,
-            args.huber_strength,
-        )?;
+        let raw_loss =
+            loss_weight::combined_loss(&pred_f32, &flow_f32, 1.0, 0.0, args.huber_strength)?;
         // ACE-Step `t_val` is the flow-matching sigma analog.
         let loss = loss_weight::apply_loss_weight(
             &raw_loss,
@@ -724,10 +850,8 @@ fn main() -> anyhow::Result<()> {
         // pattern".  See flame-core/docs/TRAINER_DIAGNOSTICS.md.
         if step == 1 {
             let named = model.named_parameters();
-            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = named
-                .iter()
-                .map(|(n, p)| (n.as_str(), p))
-                .collect();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
             let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
             if report.is_clean() {
                 log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
@@ -738,7 +862,11 @@ fn main() -> anyhow::Result<()> {
 
         for param in &params {
             if let Some(g) = grads.get(param.id()) {
-                let g = if g.dtype() == DType::F32 { g.clone() } else { g.to_dtype(DType::F32)? };
+                let g = if g.dtype() == DType::F32 {
+                    g.clone()
+                } else {
+                    g.to_dtype(DType::F32)?
+                };
                 param.set_grad(g)?;
             }
         }
@@ -770,16 +898,26 @@ fn main() -> anyhow::Result<()> {
                 // 1-based step → matches the schedule's `update_after_step`
                 // semantics (step==update_after_step returns 0 / "skip").
                 e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
-                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
+                    .map_err(|err| {
+                        anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1)
+                    })?;
             }
         }
         AutogradContext::clear();
 
-        let _ = loss_sum; let _ = loss_count;
+        let _ = loss_sum;
+        let _ = loss_count;
         eridiffusion_core::training::progress::log_step(
             "AceStep-lora",
-            step, args.steps, cache_files.len(), 1,
-            loss_val, grad_norm, current_lr, t_start, board.as_ref(),
+            step,
+            args.steps,
+            cache_files.len(),
+            1,
+            loss_val,
+            grad_norm,
+            current_lr,
+            t_start,
+            board.as_ref(),
         );
 
         // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
@@ -804,34 +942,57 @@ fn main() -> anyhow::Result<()> {
                     };
                     let vpull = |k: &str| -> Option<Tensor> {
                         vtensors.get(k).map(|t| {
-                            t.clone().to_dtype(DType::BF16).unwrap_or_else(|_| t.clone())
+                            t.clone()
+                                .to_dtype(DType::BF16)
+                                .unwrap_or_else(|_| t.clone())
                         })
                     };
                     let v_target = match vpull("target_latents") {
-                        Some(t) => match t.unsqueeze(0) { Ok(x) => x, Err(e) => {
-                            log::warn!("[validation] {} target_latents unsqueeze: {e}", vfile.display());
-                            continue;
-                        }},
+                        Some(t) => match t.unsqueeze(0) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                log::warn!(
+                                    "[validation] {} target_latents unsqueeze: {e}",
+                                    vfile.display()
+                                );
+                                continue;
+                            }
+                        },
                         None => {
                             log::warn!("[validation] {} missing target_latents", vfile.display());
                             continue;
                         }
                     };
                     let v_encoder_hs = match vpull("encoder_hidden_states") {
-                        Some(t) => match t.unsqueeze(0) { Ok(x) => x, Err(e) => {
-                            log::warn!("[validation] {} encoder_hidden_states unsqueeze: {e}", vfile.display());
-                            continue;
-                        }},
+                        Some(t) => match t.unsqueeze(0) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                log::warn!(
+                                    "[validation] {} encoder_hidden_states unsqueeze: {e}",
+                                    vfile.display()
+                                );
+                                continue;
+                            }
+                        },
                         None => {
-                            log::warn!("[validation] {} missing encoder_hidden_states", vfile.display());
+                            log::warn!(
+                                "[validation] {} missing encoder_hidden_states",
+                                vfile.display()
+                            );
                             continue;
                         }
                     };
                     let v_context = match vpull("context_latents") {
-                        Some(t) => match t.unsqueeze(0) { Ok(x) => x, Err(e) => {
-                            log::warn!("[validation] {} context_latents unsqueeze: {e}", vfile.display());
-                            continue;
-                        }},
+                        Some(t) => match t.unsqueeze(0) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                log::warn!(
+                                    "[validation] {} context_latents unsqueeze: {e}",
+                                    vfile.display()
+                                );
+                                continue;
+                            }
+                        },
                         None => {
                             log::warn!("[validation] {} missing context_latents", vfile.display());
                             continue;
@@ -845,33 +1006,32 @@ fn main() -> anyhow::Result<()> {
                         tcfg.sample_one(&mut vrng)
                     } else {
                         schedule::sample_timestep_logit_normal(
-                            &mut vrng, args.timestep_mu, args.timestep_sigma,
+                            &mut vrng,
+                            args.timestep_mu,
+                            args.timestep_sigma,
                         )
                     };
                     // Mirror training: validation uses CLEAN noise (no offset/
                     // perturbation/multires — multires is a no-op for non-4D
                     // anyway, and offset+perturbation are training-only random
                     // augmentations that should not influence the eval signal).
-                    let v_x1 = match Tensor::randn(
-                        v_target.shape().clone(),
-                        0.0,
-                        1.0,
-                        device.clone(),
-                    ) {
-                        Ok(t) => match t.to_dtype(DType::BF16) {
-                            Ok(x) => x,
+                    let v_x1 =
+                        match Tensor::randn(v_target.shape().clone(), 0.0, 1.0, device.clone()) {
+                            Ok(t) => match t.to_dtype(DType::BF16) {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    log::warn!("[validation] noise dtype: {e}");
+                                    continue;
+                                }
+                            },
                             Err(e) => {
-                                log::warn!("[validation] noise dtype: {e}");
+                                log::warn!("[validation] noise: {e}");
                                 continue;
                             }
-                        },
-                        Err(e) => {
-                            log::warn!("[validation] noise: {e}");
-                            continue;
-                        }
-                    };
+                        };
                     // x_t = t * x1 + (1 - t) * x0
-                    let v_xt = match v_x1.mul_scalar(v_t_val)
+                    let v_xt = match v_x1
+                        .mul_scalar(v_t_val)
                         .and_then(|x| v_target.mul_scalar(1.0 - v_t_val).and_then(|y| x.add(&y)))
                     {
                         Ok(x) => x,
@@ -884,7 +1044,9 @@ fn main() -> anyhow::Result<()> {
                         vec![v_t_val],
                         Shape::from_dims(&[1]),
                         device.clone(),
-                    ).and_then(|t| t.to_dtype(DType::BF16)) {
+                    )
+                    .and_then(|t| t.to_dtype(DType::BF16))
+                    {
                         Ok(t) => t,
                         Err(e) => {
                             log::warn!("[validation] t_tensor: {e}");
@@ -911,7 +1073,8 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                     };
-                    let v_loss = match v_pred.to_dtype(DType::F32)
+                    let v_loss = match v_pred
+                        .to_dtype(DType::F32)
                         .and_then(|p| v_flow.to_dtype(DType::F32).and_then(|f| p.sub(&f)))
                         .and_then(|d| d.square())
                         .and_then(|s| s.mean())
@@ -956,19 +1119,32 @@ fn main() -> anyhow::Result<()> {
             // sees EMA-averaged weights. Restored at the end of this block so
             // optimizer moments stay consistent with the live tensors they
             // were taken against.
-            let ema_backup = if args.ema_validation_swap {
-                if let Some(ref e) = ema {
-                    let _g = AutogradContext::no_grad();
-                    Some(e.swap_with_live(&params)
-                        .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
+            let ema_backup =
+                if args.ema_validation_swap {
+                    if let Some(ref e) = ema {
+                        let _g = AutogradContext::no_grad();
+                        Some(e.swap_with_live(&params).map_err(|err| {
+                            anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}")
+                        })?)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
-            let path = args.output_dir.join(format!("acestep_lora_step{}.safetensors", step + 1));
-            save_ckpt(&path, &model, &optimizer, args.rank, args.lora_alpha, args.seed, &args.save_mode, step + 1)?;
+                };
+            let path = args
+                .output_dir
+                .join(format!("acestep_lora_step{}.safetensors", step + 1));
+            save_ckpt(
+                &path,
+                &model,
+                &optimizer,
+                args.rank,
+                args.lora_alpha,
+                args.seed,
+                &args.save_mode,
+                step + 1,
+            )?;
             if let (Some(backup), Some(ref e)) = (ema_backup, &ema) {
                 let _g = AutogradContext::no_grad();
                 e.restore_swapped(&params, backup)
@@ -983,21 +1159,35 @@ fn main() -> anyhow::Result<()> {
     if args.ema_validation_swap {
         if let Some(ref e) = ema {
             let _g = AutogradContext::no_grad();
-            let _ = e.swap_with_live(&params)
+            let _ = e
+                .swap_with_live(&params)
                 .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
             log::info!("[ema] swapped EMA shadow into live params for final save");
         }
     }
 
-    let final_path = args.output_dir.join(format!("acestep_lora_{}steps.safetensors", args.steps));
-    save_ckpt(&final_path, &model, &optimizer, args.rank, args.lora_alpha, args.seed, &args.save_mode, args.steps)?;
+    let final_path = args
+        .output_dir
+        .join(format!("acestep_lora_{}steps.safetensors", args.steps));
+    save_ckpt(
+        &final_path,
+        &model,
+        &optimizer,
+        args.rank,
+        args.lora_alpha,
+        args.seed,
+        &args.save_mode,
+        args.steps,
+    )?;
     log::info!(
         "Training complete: {} steps (avg loss={:.4}). Saved to {}",
         args.steps,
         loss_sum / loss_count.max(1) as f32,
         final_path.display(),
     );
-    if let Some(b) = &board { b.set_status("completed"); }
+    if let Some(b) = &board {
+        b.set_status("completed");
+    }
     Ok(())
 }
 

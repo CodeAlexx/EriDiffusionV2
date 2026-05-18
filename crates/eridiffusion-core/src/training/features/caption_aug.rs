@@ -56,10 +56,7 @@ pub fn shuffle_tags<R: Rng + ?Sized>(caption: &str, keep_tags: usize, rng: &mut 
 /// filtering"); errors only on I/O failure.
 pub fn load_filter_list(path: &Path) -> Result<Vec<String>> {
     let body = std::fs::read_to_string(path).map_err(|e| {
-        crate::EriDiffusionError::Data(format!(
-            "caption-filter-list {}: {e}",
-            path.display()
-        ))
+        crate::EriDiffusionError::Data(format!("caption-filter-list {}: {e}", path.display()))
     })?;
     let patterns: Vec<String> = body
         .lines()

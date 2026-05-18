@@ -3,9 +3,9 @@ pub mod bucket_dataset;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::Result;
 use cudarc::driver::CudaDevice;
 use flame_core::{Shape, Tensor};
-use crate::Result;
 
 /// A single cached latent sample (pre-encoded to safetensors)
 pub struct CachedSample {
@@ -27,10 +27,16 @@ impl CachedSample {
     pub fn embedding(&self, key: &str, device: &Arc<CudaDevice>) -> Result<Tensor> {
         for (k, data) in self.embedding_keys.iter().zip(&self.embedding_data) {
             if k == key {
-                return Ok(Tensor::from_vec(data.clone(), Shape::from_dims(&[1, data.len()]), device.clone())?);
+                return Ok(Tensor::from_vec(
+                    data.clone(),
+                    Shape::from_dims(&[1, data.len()]),
+                    device.clone(),
+                )?);
             }
         }
-        Err(crate::EriDiffusionError::Data(format!("embedding key not found: {key}")))
+        Err(crate::EriDiffusionError::Data(format!(
+            "embedding key not found: {key}"
+        )))
     }
 }
 
@@ -71,7 +77,8 @@ impl CachedDataset {
         for name in tensors.names() {
             let view = tensors.tensor(name).unwrap();
             let bytes = view.data();
-            let f32_data: Vec<f32> = bytes.chunks(4)
+            let f32_data: Vec<f32> = bytes
+                .chunks(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
 
@@ -84,11 +91,22 @@ impl CachedDataset {
             }
         }
 
-        Ok(CachedSample { latent, latent_shape, embedding_keys, embedding_data })
+        Ok(CachedSample {
+            latent,
+            latent_shape,
+            embedding_keys,
+            embedding_data,
+        })
     }
 
-    pub fn len(&self) -> usize { self.samples.len() }
-    pub fn is_empty(&self) -> bool { self.samples.is_empty() }
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
 
-    pub fn get(&self, idx: usize) -> Option<&CachedSample> { self.samples.get(idx) }
+    pub fn get(&self, idx: usize) -> Option<&CachedSample> {
+        self.samples.get(idx)
+    }
 }

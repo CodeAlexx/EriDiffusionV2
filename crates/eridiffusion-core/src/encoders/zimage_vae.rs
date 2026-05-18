@@ -24,10 +24,10 @@
 //!   up.3 (512->512, has upsample) processed FIRST
 //!   up.0 (256->128, no upsample) processed LAST
 
-use flame_core::sdpa::forward as sdpa_forward;
 use flame_core::conv::Conv2d;
 use flame_core::cuda_kernels::CudaKernels;
 use flame_core::group_norm::group_norm;
+use flame_core::sdpa::forward as sdpa_forward;
 use flame_core::serialization::load_file_filtered;
 use flame_core::{DType, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
@@ -93,7 +93,8 @@ impl ResBlock {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         let mut conv1 = Conv2d::new_with_bias(in_ch, out_ch, 3, 1, 1, device.clone(), true)?;
@@ -186,26 +187,28 @@ fn linear_3d(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
 }
 
 impl AttnBlock {
-    fn from_weights(
-        w: &HashMap<String, Tensor>,
-        prefix: &str,
-        channels: usize,
-    ) -> Result<Self> {
+    fn from_weights(w: &HashMap<String, Tensor>, prefix: &str, channels: usize) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         Ok(Self {
             norm_w: get(&format!("{prefix}.norm.weight"))?.to_dtype(flame_core::DType::BF16)?,
             norm_b: get(&format!("{prefix}.norm.bias"))?.to_dtype(flame_core::DType::BF16)?,
-            q_w: squeeze_1x1(get(&format!("{prefix}.q.weight"))?)?.to_dtype(flame_core::DType::BF16)?,
+            q_w: squeeze_1x1(get(&format!("{prefix}.q.weight"))?)?
+                .to_dtype(flame_core::DType::BF16)?,
             q_b: get(&format!("{prefix}.q.bias"))?.to_dtype(flame_core::DType::BF16)?,
-            k_w: squeeze_1x1(get(&format!("{prefix}.k.weight"))?)?.to_dtype(flame_core::DType::BF16)?,
+            k_w: squeeze_1x1(get(&format!("{prefix}.k.weight"))?)?
+                .to_dtype(flame_core::DType::BF16)?,
             k_b: get(&format!("{prefix}.k.bias"))?.to_dtype(flame_core::DType::BF16)?,
-            v_w: squeeze_1x1(get(&format!("{prefix}.v.weight"))?)?.to_dtype(flame_core::DType::BF16)?,
+            v_w: squeeze_1x1(get(&format!("{prefix}.v.weight"))?)?
+                .to_dtype(flame_core::DType::BF16)?,
             v_b: get(&format!("{prefix}.v.bias"))?.to_dtype(flame_core::DType::BF16)?,
-            proj_out_w: squeeze_1x1(get(&format!("{prefix}.proj_out.weight"))?)?.to_dtype(flame_core::DType::BF16)?,
-            proj_out_b: get(&format!("{prefix}.proj_out.bias"))?.to_dtype(flame_core::DType::BF16)?,
+            proj_out_w: squeeze_1x1(get(&format!("{prefix}.proj_out.weight"))?)?
+                .to_dtype(flame_core::DType::BF16)?,
+            proj_out_b: get(&format!("{prefix}.proj_out.bias"))?
+                .to_dtype(flame_core::DType::BF16)?,
             channels,
         })
     }
@@ -266,9 +269,21 @@ impl MidBlock {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         Ok(Self {
-            resnet0: ResBlock::from_weights(w, &format!("{prefix}.block_1"), channels, channels, device)?,
+            resnet0: ResBlock::from_weights(
+                w,
+                &format!("{prefix}.block_1"),
+                channels,
+                channels,
+                device,
+            )?,
             attn: AttnBlock::from_weights(w, &format!("{prefix}.attn_1"), channels)?,
-            resnet1: ResBlock::from_weights(w, &format!("{prefix}.block_2"), channels, channels, device)?,
+            resnet1: ResBlock::from_weights(
+                w,
+                &format!("{prefix}.block_2"),
+                channels,
+                channels,
+                device,
+            )?,
         })
     }
 
@@ -299,7 +314,8 @@ impl UpBlock {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         let mut resnets = Vec::new();
@@ -370,7 +386,9 @@ pub struct ZImageVAEDecoder {
 /// `decoder.norm_out`-style lookups, falling through to whatever was there last
 /// — i.e. uninitialized weights → gray-stripe garbage).
 fn remap_diffusers_to_ldm(w: HashMap<String, Tensor>) -> HashMap<String, Tensor> {
-    let is_diffusers = w.keys().any(|k| k.contains("mid_block") || k.contains("up_blocks"));
+    let is_diffusers = w
+        .keys()
+        .any(|k| k.contains("mid_block") || k.contains("up_blocks"));
     if !is_diffusers {
         return w;
     }
@@ -449,10 +467,7 @@ impl ZImageVAEDecoder {
     /// shipped with the official Z-Image VAE
     /// (`decoder.mid_block.resnets.0.*`, `decoder.up_blocks.0.*`,
     /// `decoder.conv_norm_out.*`).
-    pub fn from_safetensors(
-        path: &str,
-        device: &Arc<cudarc::driver::CudaDevice>,
-    ) -> Result<Self> {
+    pub fn from_safetensors(path: &str, device: &Arc<cudarc::driver::CudaDevice>) -> Result<Self> {
         let w = load_file_filtered(path, device, |key| {
             key.starts_with("decoder.") || key == "decoder.conv_in.weight"
         })?;
@@ -467,7 +482,8 @@ impl ZImageVAEDecoder {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         let get = |key: &str| -> Result<&Tensor> {
-            w.get(key).ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
+            w.get(key)
+                .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
         let ch: usize = 128;
@@ -530,7 +546,9 @@ impl ZImageVAEDecoder {
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
         // Undo VAE encode-time normalization: encode is z_scaled = (z_raw - shift) * scale,
         // so decode inverts to z_raw = z_scaled / scale + shift.
-        let z = z.mul_scalar(1.0 / SCALING_FACTOR)?.add_scalar(SHIFT_FACTOR)?;
+        let z = z
+            .mul_scalar(1.0 / SCALING_FACTOR)?
+            .add_scalar(SHIFT_FACTOR)?;
 
         // decoder.conv_in
         let mut h = self.conv_in.forward(&z)?;

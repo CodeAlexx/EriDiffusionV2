@@ -104,16 +104,13 @@ impl Mistral3bEncoder {
 
         let raw_weights = load_file_filtered(Path::new(safetensors_path), device, |key| {
             // Only load language_model.model.* keys
-            key.starts_with(KEY_PREFIX)
-                && !SKIP_PREFIXES.iter().any(|p| key.starts_with(p))
+            key.starts_with(KEY_PREFIX) && !SKIP_PREFIXES.iter().any(|p| key.starts_with(p))
         })?;
 
         // Strip prefix
         let mut weights: HashMap<String, Tensor> = raw_weights
             .into_iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix(KEY_PREFIX).map(|s| (s.to_string(), v))
-            })
+            .filter_map(|(k, v)| k.strip_prefix(KEY_PREFIX).map(|s| (s.to_string(), v)))
             .collect();
 
         log::info!(
@@ -167,9 +164,9 @@ impl Mistral3bEncoder {
     // -----------------------------------------------------------------------
 
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.weights.get(key).ok_or_else(|| {
-            flame_core::Error::InvalidInput(format!("Missing weight: {key}"))
-        })
+        self.weights
+            .get(key)
+            .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing weight: {key}")))
     }
 
     /// Matmul for [B, N, C] x [C, out] -> [B, N, out].
@@ -213,8 +210,12 @@ impl Mistral3bEncoder {
         let two_pi = 2.0 * std::f64::consts::PI;
 
         // Compute boundary factors from beta parameters
-        let low_freq_factor = (orig_max_pos / (two_pi / config.rope_beta_fast)).round().max(1.0);
-        let high_freq_factor = (orig_max_pos / (two_pi / config.rope_beta_slow)).round().max(1.0);
+        let low_freq_factor = (orig_max_pos / (two_pi / config.rope_beta_fast))
+            .round()
+            .max(1.0);
+        let high_freq_factor = (orig_max_pos / (two_pi / config.rope_beta_slow))
+            .round()
+            .max(1.0);
 
         let low_freq_wavelen = orig_max_pos / low_freq_factor;
         let high_freq_wavelen = orig_max_pos / high_freq_factor;
@@ -246,8 +247,16 @@ impl Mistral3bEncoder {
         let pos_col = pos.reshape(&[seq_len, 1])?;
         let angles = pos_col.matmul(&freq_tensor)?;
 
-        let cos = angles.cos()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
-        let sin = angles.sin()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
+        let cos = angles
+            .cos()?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .to_dtype(DType::BF16)?;
+        let sin = angles
+            .sin()?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .to_dtype(DType::BF16)?;
         Ok((cos, sin))
     }
 
@@ -312,9 +321,9 @@ impl Mistral3bEncoder {
 
         let w = |suffix: &str| -> Result<&Tensor> {
             let key = format!("{prefix}.{suffix}");
-            self.weights.get(&key).ok_or_else(|| {
-                flame_core::Error::InvalidInput(format!("Missing weight: {key}"))
-            })
+            self.weights
+                .get(&key)
+                .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing weight: {key}")))
         };
 
         // --- Self-attention ---
@@ -344,8 +353,11 @@ impl Mistral3bEncoder {
 
         // --- MLP ---
 
-        let normed2 =
-            Self::rms_norm(&hidden, w("post_attention_layernorm.weight")?, cfg.rms_norm_eps)?;
+        let normed2 = Self::rms_norm(
+            &hidden,
+            w("post_attention_layernorm.weight")?,
+            cfg.rms_norm_eps,
+        )?;
 
         let gate = Self::linear_3d(&normed2, w("mlp.gate_proj.weight")?)?;
         let up = Self::linear_3d(&normed2, w("mlp.up_proj.weight")?)?;
@@ -419,7 +431,10 @@ impl Mistral3bEncoder {
 
             if i == cfg.extract_layer {
                 result = Some(hidden.clone());
-                log::info!("[Mistral3b] Captured layer {} output (hidden_states[-2])", i);
+                log::info!(
+                    "[Mistral3b] Captured layer {} output (hidden_states[-2])",
+                    i
+                );
             }
 
             if i % 10 == 0 || i == cfg.num_layers - 1 {

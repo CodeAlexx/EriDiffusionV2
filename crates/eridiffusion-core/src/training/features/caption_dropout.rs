@@ -45,11 +45,6 @@ pub fn maybe_drop_caption(
 
 /// Legacy skeleton signature kept for any caller wired in Phase 0. Forwards
 /// to [`maybe_drop_caption`] with the same semantics.
-pub fn drop_caption(
-    uncond: &Tensor,
-    cond: &Tensor,
-    prob: f32,
-    rng: &mut StdRng,
-) -> Result<Tensor> {
+pub fn drop_caption(uncond: &Tensor, cond: &Tensor, prob: f32, rng: &mut StdRng) -> Result<Tensor> {
     maybe_drop_caption(cond, uncond, prob, rng)
 }

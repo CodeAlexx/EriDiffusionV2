@@ -116,8 +116,9 @@ impl Qwen25VLEncoder {
 
         // Count layers
         let mut num_layers = 0;
-        while weights.contains_key(&format!("model.layers.{num_layers}.self_attn.q_proj.weight"))
-        {
+        while weights.contains_key(&format!(
+            "model.layers.{num_layers}.self_attn.q_proj.weight"
+        )) {
             num_layers += 1;
         }
 
@@ -157,9 +158,9 @@ impl Qwen25VLEncoder {
 
     /// Get a reference to a weight tensor, returning an error if missing.
     fn w(&self, key: &str) -> Result<&Tensor> {
-        self.weights.get(key).ok_or_else(|| {
-            flame_core::Error::InvalidInput(format!("Missing weight key: {key}"))
-        })
+        self.weights
+            .get(key)
+            .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing weight key: {key}")))
     }
 
     // -----------------------------------------------------------------------
@@ -219,11 +220,7 @@ impl Qwen25VLEncoder {
         let positions: Vec<f32> = (0..seq_len)
             .map(|i| if i < real_len { i as f32 } else { 1.0 })
             .collect();
-        let pos = Tensor::from_vec(
-            positions,
-            Shape::from_dims(&[seq_len]),
-            device.clone(),
-        )?;
+        let pos = Tensor::from_vec(positions, Shape::from_dims(&[seq_len]), device.clone())?;
 
         let freq_idx = Tensor::arange(0.0, head_dim as f32, 2.0, device.clone())?;
         let log_theta = (theta as f32).ln();
@@ -386,9 +383,7 @@ impl Qwen25VLEncoder {
         let attn_out = flame_sdpa(&q, &k, &v, Some(attn_mask))?;
 
         // 7. Reshape + O projection (no bias on O)
-        let attn_out = attn_out
-            .permute(&[0, 2, 1, 3])?
-            .reshape(&[b, n, h * d])?;
+        let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?;
 
         let o_w = self.w(&format!("{prefix}.self_attn.o_proj.weight"))?;
         let attn_out = Self::linear(&attn_out, o_w)?;
@@ -461,8 +456,13 @@ impl Qwen25VLEncoder {
         let hidden = self.embed_tokens(token_ids)?;
         let embed = hidden.clone();
 
-        let (pe_cos, pe_sin) =
-            Self::build_rope_cache(seq_len, real_len, cfg.head_dim, cfg.rope_theta, &self.device)?;
+        let (pe_cos, pe_sin) = Self::build_rope_cache(
+            seq_len,
+            real_len,
+            cfg.head_dim,
+            cfg.rope_theta,
+            &self.device,
+        )?;
         let attn_mask = Self::build_causal_mask(seq_len, real_len, &self.device)?;
 
         let mut x = hidden;
@@ -496,10 +496,7 @@ impl Qwen25VLEncoder {
     ///   `mlp_pre_down`    `silu(gate) * up`
     ///   `mlp_out`         after `down_proj`
     ///   `layer_0_out`     `[1, N, H]`       after MLP residual add
-    pub fn layer0_substep_probe(
-        &self,
-        token_ids: &[i32],
-    ) -> Result<HashMap<String, Tensor>> {
+    pub fn layer0_substep_probe(&self, token_ids: &[i32]) -> Result<HashMap<String, Tensor>> {
         let cfg = &self.config;
         let seq_len = token_ids.len();
         let pad_id = 151643i32;
@@ -509,8 +506,13 @@ impl Qwen25VLEncoder {
             .unwrap_or(seq_len);
 
         let hidden = self.embed_tokens(token_ids)?;
-        let (pe_cos, pe_sin) =
-            Self::build_rope_cache(seq_len, real_len, cfg.head_dim, cfg.rope_theta, &self.device)?;
+        let (pe_cos, pe_sin) = Self::build_rope_cache(
+            seq_len,
+            real_len,
+            cfg.head_dim,
+            cfg.rope_theta,
+            &self.device,
+        )?;
         let attn_mask = Self::build_causal_mask(seq_len, real_len, &self.device)?;
 
         let mut out: HashMap<String, Tensor> = HashMap::new();
@@ -622,8 +624,13 @@ impl Qwen25VLEncoder {
         let mut hidden = self.embed_tokens(token_ids)?;
 
         // 2. Build RoPE cache for seq_len
-        let (pe_cos, pe_sin) =
-            Self::build_rope_cache(seq_len, real_len, cfg.head_dim, cfg.rope_theta, &self.device)?;
+        let (pe_cos, pe_sin) = Self::build_rope_cache(
+            seq_len,
+            real_len,
+            cfg.head_dim,
+            cfg.rope_theta,
+            &self.device,
+        )?;
 
         // Build causal + padding mask
         let attn_mask = Self::build_causal_mask(seq_len, real_len, &self.device)?;

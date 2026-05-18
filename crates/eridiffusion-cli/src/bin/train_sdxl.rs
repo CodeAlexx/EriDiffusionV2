@@ -24,7 +24,6 @@
 //!   pooled          [1, 2816]          BF16   (concat CLIP-G pool + size_ids embed)
 
 use clap::Parser;
-use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::{sdxl::SDXLModel, TrainableModel};
@@ -33,11 +32,16 @@ use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
-use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
+use eridiffusion_core::training::features::{
+    loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop,
+};
+use eridiffusion_core::training::training_features::timestep_dist::{
+    TimestepConfig, TimestepDistribution,
+};
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
-use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
-use std::str::FromStr as _;
+use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use std::path::PathBuf;
+use std::str::FromStr as _;
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
 const BETA_START: f64 = 0.00085;
@@ -48,101 +52,152 @@ const CLIP_GRAD_NORM: f32 = 1.0;
 #[derive(Parser)]
 struct Args {
     /// Optional OT-format JSON config; otherwise TrainConfig::default().
-    #[arg(long)] config: Option<PathBuf>,
-    #[arg(long)] cache_dir: PathBuf,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    cache_dir: PathBuf,
     /// SDXL UNet checkpoint (single safetensors file or directory of shards).
-    #[arg(long)] unet: PathBuf,
-    #[arg(long, default_value = "100")] steps: usize,
-    #[arg(long, default_value = "16")] rank: usize,
-    #[arg(long, default_value = "1.0")] lora_alpha: f64,
+    #[arg(long)]
+    unet: PathBuf,
+    #[arg(long, default_value = "100")]
+    steps: usize,
+    #[arg(long, default_value = "16")]
+    rank: usize,
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f64,
     /// Preset learning rate (3e-4).
-    #[arg(long, default_value = "3e-4")] lr: f32,
+    #[arg(long, default_value = "3e-4")]
+    lr: f32,
     /// Save a LoRA checkpoint every N steps (0 = end-only).
-    #[arg(long, default_value = "0")] save_every: usize,
+    #[arg(long, default_value = "0")]
+    save_every: usize,
     /// Resume LoRA weights only (no optimizer state).
-    #[arg(long, conflicts_with = "resume_full")] resume_lora: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_full")]
+    resume_lora: Option<PathBuf>,
     /// Full resume: LoRA weights + AdamW (m, v, t) + step counter.
-    #[arg(long, conflicts_with = "resume_lora")] resume_full: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_lora")]
+    resume_full: Option<PathBuf>,
     /// Periodic + final save mode. Default `full` (LoRA + AdamW + step) for
     /// resumable runs. `weights` writes legacy weights-only files.
-    #[arg(long, default_value = "full")] save_mode: String,
-    #[arg(long, default_value = "output")] output_dir: PathBuf,
+    #[arg(long, default_value = "full")]
+    save_mode: String,
+    #[arg(long, default_value = "output")]
+    output_dir: PathBuf,
 
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
-    #[arg(long)] min_snr_gamma: Option<f32>,
-    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    #[arg(long)]
+    min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    caption_dropout_probability: f32,
     /// Path to a single cache file produced by `prepare_sdxl` from an empty-
     /// caption sample. When `--caption-dropout-probability > 0`, the trainer
     /// loads `text_embedding` + `pooled` from this file and swaps them in
     /// (correlated, before pooled is concatenated with size embeds) with
     /// probability `p` per step. If unset and dropout > 0, the feature is
     /// disabled with a warning.
-    #[arg(long)] null_text_cache: Option<PathBuf>,
-    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
-    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
-    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
-    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
-    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
-    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    #[arg(long)]
+    null_text_cache: Option<PathBuf>,
+    #[arg(long, default_value_t = 1.0)]
+    noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)]
+    gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)]
+    huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lr_min_factor: f32,
+    #[arg(long)]
+    validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    validation_every_steps: u64,
+    #[arg(long, num_args = 0..)]
+    multi_backend_weights: Vec<f32>,
     /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
     /// trainers accept-and-warn until per-model wiring lands.
-    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    #[arg(long, num_args = 0..)]
+    multi_backend_cache_dirs: Vec<std::path::PathBuf>,
     /// Phase 2: validation prompt library JSON (Klein-only wiring; other
     /// trainers accept-and-warn).
-    #[arg(long)] validation_prompts_file: Option<std::path::PathBuf>,
-    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    #[arg(long)]
+    validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)]
+    masked_loss_weight: f32,
     /// Master switch for EMA shadow. See train_klein.rs for full doc.
     /// Default off → byte-identical to pre-flag commits.
-    #[arg(long, default_value_t = false)] ema: bool,
-    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
-    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
-    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
-    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
-    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
+    #[arg(long, default_value_t = false)]
+    ema: bool,
+    #[arg(long, default_value_t = 1.0)]
+    ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)]
+    ema_power: f32,
+    #[arg(long, default_value_t = 0)]
+    ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)]
+    ema_min_decay: f32,
+    #[arg(long, default_value_t = 0.9999)]
+    ema_max_decay: f32,
     /// Swap shadow → live params at sample/save time.
-    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+    #[arg(long, default_value_t = false)]
+    ema_validation_swap: bool,
     /// Pyramid / multi-resolution noise: number of additional resolution
     /// levels to mix into the per-step training noise. `0` (default) is a
     /// no-op — byte-identical to no-multires.
-    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
+    #[arg(long, default_value_t = 0)]
+    multires_noise_iterations: usize,
     /// Per-level discount factor for `--multires-noise-iterations`.
-    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+    #[arg(long, default_value_t = 0.3)]
+    multires_noise_discount: f32,
     /// Multi-distribution timestep bias strategy. `none` is byte-identical.
-    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
-    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
-    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    #[arg(long, default_value = "none")]
+    timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)]
+    timestep_bias_range_max: f32,
     /// Timestep distribution. `uniform` (default — SDXL preset, sampler
     /// returns an integer-valued continuous t to feed alpha_bar[]),
     /// `logit_normal`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
     /// Non-uniform sampling is sound for SDXL but breaks byte-identity
     /// against the pre-flag default.
-    #[arg(long, default_value = "uniform")] timestep_distribution: String,
+    #[arg(long, default_value = "uniform")]
+    timestep_distribution: String,
     /// Distribution-specific weight knob (default 0.0).
-    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    #[arg(long, default_value_t = 0.0)]
+    noising_weight: f32,
     /// Distribution-specific bias knob (default 0.0).
-    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
-    #[arg(long)] tread_route_pattern: Option<String>,
+    #[arg(long, default_value_t = 0.0)]
+    noising_bias: f32,
+    #[arg(long)]
+    tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
-    #[arg(long, default_value = "adamw")] optimizer: String,
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
 
     // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
-    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
-    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
-    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
-    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    #[arg(long, num_args = 0..)]
+    multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
     /// Phase 5: LR scheduler family. Default `constant` + `warmup_steps=0` is
     /// byte-equivalent to prior fixed-LR behaviour.
-    #[arg(long, default_value = "constant")] lr_scheduler: String,
+    #[arg(long, default_value = "constant")]
+    lr_scheduler: String,
     /// Phase 5: linear LR warmup steps. Default 0 keeps prior behaviour.
-    #[arg(long, default_value_t = 0)] warmup_steps: usize,
+    #[arg(long, default_value_t = 0)]
+    warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
-    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+    #[arg(long, default_value_t = 1.0)]
+    lr_cycles: f32,
     /// Zero-terminal SNR rescale of `ᾱ` (Lin et al. 2024). Default off → byte-
     /// identical. Pair with `force_v_prediction=true` (config) — terminal
     /// ᾱ=0 makes ε-prediction degenerate at the last step.
-    #[arg(long, default_value_t = false)] zero_terminal_snr: bool,
+    #[arg(long, default_value_t = false)]
+    zero_terminal_snr: bool,
 
     // ── LyCORIS algo selection (Phase 2b) ──
     //
@@ -161,19 +216,25 @@ struct Args {
     /// | `full` | `oft`. `full` and `oft` build successfully but their
     /// `forward_delta` will error inside SDXL's `base + delta_on_input` call
     /// pattern. Phase 2c will wire a `merge_into_base` path.
-    #[arg(long, default_value = "lora")] algo: String,
+    #[arg(long, default_value = "lora")]
+    algo: String,
     /// LoKr Kronecker split factor (ignored for non-LoKr).
-    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    #[arg(long, default_value_t = 16)]
+    lokr_factor: i32,
     /// OFT block size (ignored for non-OFT).
-    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    #[arg(long, default_value_t = 32)]
+    oft_block_size: usize,
     /// OFT Cayley-Neumann series term count (ignored for non-OFT).
-    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    #[arg(long, default_value_t = 5)]
+    oft_neumann_terms: usize,
     /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
     /// kernels. SDXL's current target set is Linear-only so this is
     /// forwarded but inert. Reserved for a future conv-LoRA target expansion.
-    #[arg(long, default_value_t = false)] use_tucker: bool,
+    #[arg(long, default_value_t = false)]
+    use_tucker: bool,
     /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
-    #[arg(long, default_value_t = false)] decompose_both: bool,
+    #[arg(long, default_value_t = false)]
+    decompose_both: bool,
     /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr
     /// (Full inherits, OFT errors).
     ///
@@ -182,58 +243,75 @@ struct Args {
     /// initialized from `||I||_2 = 1` rather than `||W_orig||_2`. The
     /// trainer should still converge but will spend the first few hundred
     /// steps adjusting the magnitude.
-    #[arg(long, default_value_t = false)] dora: bool,
+    #[arg(long, default_value_t = false)]
+    dora: bool,
     /// DoRA magnitude axis. Default `true` matches lycoris-upstream
     /// (norm over input dims, magnitude shape `[out, 1]`).
-    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
-    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    #[arg(long, default_value_t = true)]
+    dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)]
+    dora_eps: f32,
     /// PEFT/SimpleTuner `--lora_init_type`. Applies to LoCon (the LoRA path)
     /// only. Choices: `default | gaussian | pissa | olora | loftq`. The
     /// PISSA/OLoRA/LoftQ variants parse but error at adapter construction
     /// because flame-core does not yet expose SVD/QR.
-    #[arg(long, default_value = "default")] lora_init_type: String,
+    #[arg(long, default_value = "default")]
+    lora_init_type: String,
     /// SimpleTuner-style `lycoris_config preset.json`. Optional; per-target
     /// `module_algo_map` overrides apply during adapter construction.
-    #[arg(long)] lycoris_config: Option<PathBuf>,
+    #[arg(long)]
+    lycoris_config: Option<PathBuf>,
     /// SimpleTuner-parity: perturbed-normal LoKr init.  Scale `>0` triggers
     /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`.  No-op when algo != lokr or
     /// value is 0.0. Phase 2b: SDXL's resident `weights` map IS available at
     /// bundle-construction time (no streaming for SDXL UNet) so this can be
     /// wired; current impl logs a TODO and no-ops until the per-prefix
     /// base-weight lookup helper lands.
-    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    #[arg(long, default_value_t = 0.0)]
+    init_lokr_norm: f32,
     /// SimpleTuner / ai-toolkit `network.conv` — per-LyCORIS rank for
     /// CONV-layer targets (separate from linear `--rank`). `0` (default)
     /// = fall back to linear rank. Inert when no conv targets are wired
     /// in the model bundle (current state on all EDv2 trainers).
-    #[arg(long, default_value_t = 0)] conv_rank: usize,
+    #[arg(long, default_value_t = 0)]
+    conv_rank: usize,
     /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
     /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
-    #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
+    #[arg(long, default_value_t = 0.0)]
+    conv_alpha: f32,
     /// Per-element dropout on the adapter delta (training only).
-    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lora_dropout: f32,
     /// Per-rank Bernoulli on the down-projection intermediate.
-    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    rank_dropout: f32,
     /// Per-step Bernoulli on the entire adapter.
-    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    #[arg(long, default_value_t = 0.0)]
+    module_dropout: f32,
     /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
-    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
+    #[arg(long, default_value_t = false)]
+    rank_dropout_scale: bool,
 
     // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
     /// Route the backward pass through `AutogradContext::backward_v2`
     /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
-    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
 }
 
 fn collect_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
-    if path.is_file() { return Ok(vec![path.to_path_buf()]); }
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
     let mut shards: Vec<PathBuf> = std::fs::read_dir(path)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
         .collect();
     shards.sort();
-    if shards.is_empty() { anyhow::bail!("no safetensors at {:?}", path); }
+    if shards.is_empty() {
+        anyhow::bail!("no safetensors at {:?}", path);
+    }
     Ok(shards)
 }
 
@@ -263,7 +341,9 @@ fn rescale_zero_terminal_snr(ab: &[f32]) -> Vec<f32> {
     let mut sa: Vec<f64> = ab.iter().map(|x| (*x as f64).sqrt()).collect();
     let sa0 = sa[0];
     let sa_t = sa[n - 1];
-    if sa_t <= 0.0 || sa0 <= sa_t { return ab.to_vec(); }
+    if sa_t <= 0.0 || sa0 <= sa_t {
+        return ab.to_vec();
+    }
     let scale = sa0 / (sa0 - sa_t);
     for v in &mut sa {
         *v = (*v - sa_t) * scale;
@@ -373,12 +453,16 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("--lora_init_type: {e}"))?,
         ..LycorisBundleConfig::default()
     };
-    let lyc_config = lyc_config
-        .with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
+    let lyc_config =
+        lyc_config.with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
 
     let shards = collect_shards(&args.unet)?;
-    log::info!("[SDXL] loading UNet from {} shard(s) (rank={}, alpha={})",
-        shards.len(), args.rank, args.lora_alpha);
+    log::info!(
+        "[SDXL] loading UNet from {} shard(s) (rank={}, alpha={})",
+        shards.len(),
+        args.rank,
+        args.lora_alpha
+    );
     let mut model = SDXLModel::load(&shards, &config, device.clone())?;
 
     // If a LyCORIS algo other than the legacy plain LoRA was requested, swap
@@ -403,17 +487,23 @@ fn main() -> anyhow::Result<()> {
                 algo.as_str()
             );
         }
-        if args.lora_dropout > 0.0 || args.rank_dropout > 0.0
-            || args.module_dropout > 0.0 || args.rank_dropout_scale
+        if args.lora_dropout > 0.0
+            || args.rank_dropout > 0.0
+            || args.module_dropout > 0.0
+            || args.rank_dropout_scale
         {
             log::warn!(
                 "[SDXL] dropout flags (lora_dropout={}, rank_dropout={}, module_dropout={}, \
                  rank_dropout_scale={}) plumbed but not yet wired through the LycorisLinear \
                  forward path; defaults stay byte-identical.",
-                args.lora_dropout, args.rank_dropout, args.module_dropout, args.rank_dropout_scale
+                args.lora_dropout,
+                args.rank_dropout,
+                args.module_dropout,
+                args.rank_dropout_scale
             );
         }
-        model.swap_to_lycoris_bundle(&lyc_config, device.clone(), SEED)
+        model
+            .swap_to_lycoris_bundle(&lyc_config, device.clone(), SEED)
             .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
         if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
             // SDXL's `weights` map is resident — wired end-to-end.  Walks
@@ -437,8 +527,8 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("no trainable parameters — TrainingMethod::Lora produced empty list");
     }
 
-    let opt_kind = OptimizerKind::parse(&args.optimizer)
-        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    let opt_kind =
+        OptimizerKind::parse(&args.optimizer).map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
     log::info!("[SDXL] optimizer={}", opt_kind.as_str());
     let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
 
@@ -488,22 +578,23 @@ fn main() -> anyhow::Result<()> {
 
     // Unified OneTrainer timestep distribution dispatch. `None` ⇒ legacy
     // integer-uniform path (default-off byte invariance).
-    let timestep_cfg: Option<TimestepConfig> = if args.timestep_distribution.eq_ignore_ascii_case("uniform")
-        && args.noising_weight == 0.0
-        && args.noising_bias == 0.0
-    {
-        None
-    } else {
-        let dist = TimestepDistribution::from_str(&args.timestep_distribution)
-            .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
-        Some(TimestepConfig {
-            distribution: dist,
-            noising_weight: args.noising_weight,
-            noising_bias: args.noising_bias,
-            min_strength: 0.0,
-            max_strength: 1.0,
-        })
-    };
+    let timestep_cfg: Option<TimestepConfig> =
+        if args.timestep_distribution.eq_ignore_ascii_case("uniform")
+            && args.noising_weight == 0.0
+            && args.noising_bias == 0.0
+        {
+            None
+        } else {
+            let dist = TimestepDistribution::from_str(&args.timestep_distribution)
+                .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+            Some(TimestepConfig {
+                distribution: dist,
+                noising_weight: args.noising_weight,
+                noising_bias: args.noising_bias,
+                min_strength: 0.0,
+                max_strength: 1.0,
+            })
+        };
 
     // SDXL audit HIGH-4: caption-dropout uses the OT-parity ZERO-MULTIPLY
     // path (TE hidden × 0, pooled × 0). The legacy `--null-text-cache` swap
@@ -522,10 +613,14 @@ fn main() -> anyhow::Result<()> {
         match args.null_text_cache.as_ref() {
             Some(p) => match flame_core::serialization::load_file(p, &device) {
                 Ok(s) => {
-                    let nt = s.get("text_embedding")
-                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
+                    let nt = s
+                        .get("text_embedding")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--null-text-cache missing 'text_embedding'")
+                        })?
                         .to_dtype(DType::BF16)?;
-                    let np = s.get("pooled")
+                    let np = s
+                        .get("pooled")
                         .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'pooled'"))?
                         .to_dtype(DType::BF16)?;
                     log::info!(
@@ -538,9 +633,11 @@ fn main() -> anyhow::Result<()> {
                     Some((nt, np))
                 }
                 Err(e) => {
-                    log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — \
+                    log::warn!(
+                        "[caption-dropout] failed to load --null-text-cache {}: {e} — \
                         proceeding with zero-multiply (no cache needed for OT parity)",
-                        p.display());
+                        p.display()
+                    );
                     None
                 }
             },
@@ -557,7 +654,10 @@ fn main() -> anyhow::Result<()> {
         None
     };
     if let Some(resume_path) = args.resume_lora.as_ref() {
-        log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
+        log::info!(
+            "Resuming LoRA weights only (no optimizer state) from {}",
+            resume_path.display()
+        );
         model.load_weights(&resume_path.to_string_lossy())?;
     }
 
@@ -568,7 +668,13 @@ fn main() -> anyhow::Result<()> {
         let named = model.named_parameters();
         checkpoint::apply_lora_weights(&loaded, &named)?;
         if let Optimizer::AdamW(ref mut adam) = opt {
-            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha as f32)?;
+            checkpoint::apply_to_optimizer(
+                &loaded,
+                adam,
+                &named,
+                args.rank,
+                args.lora_alpha as f32,
+            )?;
         } else {
             log::warn!(
                 "[resume-full] non-AdamW resume not yet implemented for {:?}; LoRA weights restored, optimizer state reset",
@@ -577,7 +683,10 @@ fn main() -> anyhow::Result<()> {
         }
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
-            log::warn!("Resumed step ({start_step}) >= --steps ({}) — nothing to do.", args.steps);
+            log::warn!(
+                "Resumed step ({start_step}) >= --steps ({}) — nothing to do.",
+                args.steps
+            );
             return Ok(());
         }
         log::info!("Continuing from step {start_step}/{}", args.steps);
@@ -604,7 +713,8 @@ fn main() -> anyhow::Result<()> {
         let rescaled = rescale_zero_terminal_snr(&compute_alpha_bar());
         log::info!(
             "[zero-terminal-snr] WIRED — ᾱ[0]={:.6} ᾱ[T-1]={:.6e} (rescaled to terminal=0)",
-            rescaled[0], rescaled[NUM_TRAIN_TIMESTEPS - 1]
+            rescaled[0],
+            rescaled[NUM_TRAIN_TIMESTEPS - 1]
         );
         if !config.force_v_prediction {
             log::warn!("[zero-terminal-snr] running with ε-prediction — Lin et al. recommend pairing with v-prediction");
@@ -616,9 +726,10 @@ fn main() -> anyhow::Result<()> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
     // Phase 2: validation harness — held-out cache + cadence. None at default.
-    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
-        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
-    {
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) = (
+        args.validation_dataset_dir.as_ref(),
+        args.validation_every_steps,
+    ) {
         if n > 0 {
             let v = ValidationLoop::new(dir, n)?;
             log::info!(
@@ -637,8 +748,14 @@ fn main() -> anyhow::Result<()> {
     let board = BoardWriter::open(
         &args.output_dir,
         BoardWriter::new_session_id(),
-        if start_step > 0 { Some(start_step as u64) } else { None },
-    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+        if start_step > 0 {
+            Some(start_step as u64)
+        } else {
+            None
+        },
+    )
+    .map_err(|e| log::warn!("board.db open failed: {e}"))
+    .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
     }
@@ -650,13 +767,16 @@ fn main() -> anyhow::Result<()> {
         let cache_idx = step % cache_files.len();
         let sample = flame_core::serialization::load_file(&cache_files[cache_idx], &device)?;
 
-        let latent = sample.get("latent")
+        let latent = sample
+            .get("latent")
             .ok_or_else(|| anyhow::anyhow!("missing 'latent' in {:?}", cache_files[cache_idx]))?
             .to_dtype(DType::BF16)?;
-        let text_embedding = sample.get("text_embedding")
+        let text_embedding = sample
+            .get("text_embedding")
             .ok_or_else(|| anyhow::anyhow!("missing 'text_embedding'"))?
             .to_dtype(DType::BF16)?;
-        let pooled_clip_g = sample.get("pooled")
+        let pooled_clip_g = sample
+            .get("pooled")
             .ok_or_else(|| anyhow::anyhow!("missing 'pooled'"))?
             .to_dtype(DType::BF16)?;
         // Caption dropout — SDXL audit HIGH-4 (OT parity).
@@ -683,8 +803,10 @@ fn main() -> anyhow::Result<()> {
             if rng.r#gen::<f32>() < effective_caption_dropout_prob {
                 // Zero-multiply both TE hidden and pooled CLIP-G. Matches
                 // OT line 280-281: `text_encoder_*_output * 0`.
-                (text_embedding.mul_scalar(0.0)?,
-                 pooled_clip_g.mul_scalar(0.0)?)
+                (
+                    text_embedding.mul_scalar(0.0)?,
+                    pooled_clip_g.mul_scalar(0.0)?,
+                )
             } else {
                 (text_embedding, pooled_clip_g)
             }
@@ -699,20 +821,22 @@ fn main() -> anyhow::Result<()> {
         // cache; we rebuild the sinusoidal embedding here so bucketed
         // datasets see the right per-image conditioning. Pre-baking at
         // prepare time would freeze every sample to one resolution.
-        let time_ids_t = sample.get("time_ids")
-            .ok_or_else(|| anyhow::anyhow!("missing 'time_ids' (re-run prepare_sdxl with the H2 fix)"))?
+        let time_ids_t = sample
+            .get("time_ids")
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing 'time_ids' (re-run prepare_sdxl with the H2 fix)")
+            })?
             .to_dtype(DType::F32)?;
         let time_ids_v = time_ids_t.to_vec()?;
         if time_ids_v.len() != 6 {
             anyhow::bail!("expected time_ids length 6, got {}", time_ids_v.len());
         }
         let mut size_emb = Vec::with_capacity(6 * 256);
-        for &v in &time_ids_v { size_emb.extend_from_slice(&sin_embed_256(v)); }
-        let size_t = Tensor::from_vec(
-            size_emb,
-            Shape::from_dims(&[1, 1536]),
-            device.clone(),
-        )?.to_dtype(DType::BF16)?;
+        for &v in &time_ids_v {
+            size_emb.extend_from_slice(&sin_embed_256(v));
+        }
+        let size_t = Tensor::from_vec(size_emb, Shape::from_dims(&[1, 1536]), device.clone())?
+            .to_dtype(DType::BF16)?;
         // ADM input `y` = concat(CLIP-G pool [1280], size_emb [1536]) → [1, 2816]
         let pooled = Tensor::cat(&[&pooled_clip_g, &size_t], 1)?.to_dtype(DType::BF16)?;
 
@@ -726,11 +850,8 @@ fn main() -> anyhow::Result<()> {
             rng.gen_range(0..NUM_TRAIN_TIMESTEPS) as f32
         };
         // Default-off: Strategy::None → returns raw_t unchanged.
-        let t_continuous = timestep_bias::apply_bias(
-            raw_t,
-            NUM_TRAIN_TIMESTEPS as f32,
-            &timestep_bias_cfg,
-        );
+        let t_continuous =
+            timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
         let t_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
         let ab = alpha_bar[t_idx];
         let sqrt_ab = ab.sqrt();
@@ -769,34 +890,47 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let noisy = latent.mul_scalar(sqrt_ab)?.add(&perturbed_noise.mul_scalar(sqrt_1m_ab)?)?;
+        let noisy = latent
+            .mul_scalar(sqrt_ab)?
+            .add(&perturbed_noise.mul_scalar(sqrt_1m_ab)?)?;
         // Phase 1: force_v_prediction. ε-pred default → target = noise.
         // v-pred: target = sqrt(ᾱ_t)·noise - sqrt(1-ᾱ_t)·latent.
         let target = if config.force_v_prediction {
-            clean_noise.mul_scalar(sqrt_ab)?
+            clean_noise
+                .mul_scalar(sqrt_ab)?
                 .sub(&latent.mul_scalar(sqrt_1m_ab)?)?
         } else {
             clean_noise.clone()
         };
 
-        let timestep = Tensor::from_vec(
-            vec![t_idx as f32], Shape::from_dims(&[1]), device.clone(),
-        )?;
+        let timestep =
+            Tensor::from_vec(vec![t_idx as f32], Shape::from_dims(&[1]), device.clone())?;
 
         if step == 0 {
-            log::info!("step 0 | latent={:?} txt={:?} pooled={:?} t_idx={} ᾱ={:.4}",
-                latent.shape().dims(), text_embedding.shape().dims(),
-                pooled.shape().dims(), t_idx, ab);
+            log::info!(
+                "step 0 | latent={:?} txt={:?} pooled={:?} t_idx={} ᾱ={:.4}",
+                latent.shape().dims(),
+                text_embedding.shape().dims(),
+                pooled.shape().dims(),
+                t_idx,
+                ab
+            );
         }
 
         let pred = <SDXLModel as TrainableModel>::forward(
-            &mut model, &noisy, &timestep,
-            std::slice::from_ref(&text_embedding), Some(&pooled),
+            &mut model,
+            &noisy,
+            &timestep,
+            std::slice::from_ref(&text_embedding),
+            Some(&pooled),
         )?;
 
         if pred.shape().dims() != target.shape().dims() {
-            anyhow::bail!("pred shape {:?} != target {:?}",
-                pred.shape().dims(), target.shape().dims());
+            anyhow::bail!(
+                "pred shape {:?} != target {:?}",
+                pred.shape().dims(),
+                target.shape().dims()
+            );
         }
 
         // F32 MSE loss (sd-scripts default mse_strength=1.0, no min-SNR by default)
@@ -854,10 +988,8 @@ fn main() -> anyhow::Result<()> {
         // pattern".  See flame-core/docs/TRAINER_DIAGNOSTICS.md.
         if step == 1 {
             let named = model.named_parameters();
-            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = named
-                .iter()
-                .map(|(n, p)| (n.as_str(), p))
-                .collect();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
             let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
             if report.is_clean() {
                 log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
@@ -868,16 +1000,21 @@ fn main() -> anyhow::Result<()> {
 
         // clip_grad_norm = 1.0 (OT default)
         // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.
-        let grad_refs: Vec<&flame_core::Tensor> = params
-            .iter()
-            .filter_map(|p| grads.get(p.id()))
-            .collect();
-        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
-            .item()? as f32;
-        let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
+        let grad_refs: Vec<&flame_core::Tensor> =
+            params.iter().filter_map(|p| grads.get(p.id())).collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
+        let scale = if total_norm > CLIP_GRAD_NORM {
+            CLIP_GRAD_NORM / total_norm
+        } else {
+            1.0
+        };
         for param in &params {
             if let Some(g) = grads.get(param.id()) {
-                let g_scaled = if scale < 1.0 { g.mul_scalar(scale)? } else { g.clone() };
+                let g_scaled = if scale < 1.0 {
+                    g.mul_scalar(scale)?
+                } else {
+                    g.clone()
+                };
                 param.set_grad(g_scaled)?;
             }
         }
@@ -901,7 +1038,9 @@ fn main() -> anyhow::Result<()> {
             model.post_optimizer_step();
             if let Some(ref mut e) = ema {
                 e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
-                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
+                    .map_err(|err| {
+                        anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1)
+                    })?;
             }
         }
         AutogradContext::clear();
@@ -909,8 +1048,15 @@ fn main() -> anyhow::Result<()> {
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
             "SDXL-lora",
-            step, args.steps, cache_files.len(), 1,
-            loss_val, total_norm, cur_lr, t_start, board.as_ref(),
+            step,
+            args.steps,
+            cache_files.len(),
+            1,
+            loss_val,
+            total_norm,
+            cur_lr,
+            t_start,
+            board.as_ref(),
         );
 
         // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
@@ -933,7 +1079,10 @@ fn main() -> anyhow::Result<()> {
                     let v_lat = match sample.get("latent") {
                         Some(t) => match t.to_dtype(DType::BF16) {
                             Ok(x) => x,
-                            Err(e) => { log::warn!("[validation] latent dtype: {e}"); continue; }
+                            Err(e) => {
+                                log::warn!("[validation] latent dtype: {e}");
+                                continue;
+                            }
                         },
                         None => {
                             log::warn!("[validation] {} missing latent", vfile.display());
@@ -943,7 +1092,10 @@ fn main() -> anyhow::Result<()> {
                     let v_txt = match sample.get("text_embedding") {
                         Some(t) => match t.to_dtype(DType::BF16) {
                             Ok(x) => x,
-                            Err(e) => { log::warn!("[validation] text_embedding dtype: {e}"); continue; }
+                            Err(e) => {
+                                log::warn!("[validation] text_embedding dtype: {e}");
+                                continue;
+                            }
                         },
                         None => {
                             log::warn!("[validation] {} missing text_embedding", vfile.display());
@@ -953,7 +1105,10 @@ fn main() -> anyhow::Result<()> {
                     let v_pooled_clip_g = match sample.get("pooled") {
                         Some(t) => match t.to_dtype(DType::BF16) {
                             Ok(x) => x,
-                            Err(e) => { log::warn!("[validation] pooled dtype: {e}"); continue; }
+                            Err(e) => {
+                                log::warn!("[validation] pooled dtype: {e}");
+                                continue;
+                            }
                         },
                         None => {
                             log::warn!("[validation] {} missing pooled", vfile.display());
@@ -965,7 +1120,10 @@ fn main() -> anyhow::Result<()> {
                     let v_time_ids_t = match sample.get("time_ids") {
                         Some(t) => match t.to_dtype(DType::F32) {
                             Ok(x) => x,
-                            Err(e) => { log::warn!("[validation] time_ids dtype: {e}"); continue; }
+                            Err(e) => {
+                                log::warn!("[validation] time_ids dtype: {e}");
+                                continue;
+                            }
                         },
                         None => {
                             log::warn!("[validation] {} missing time_ids", vfile.display());
@@ -974,27 +1132,44 @@ fn main() -> anyhow::Result<()> {
                     };
                     let v_time_ids_v = match v_time_ids_t.to_vec() {
                         Ok(v) => v,
-                        Err(e) => { log::warn!("[validation] time_ids to_vec: {e}"); continue; }
+                        Err(e) => {
+                            log::warn!("[validation] time_ids to_vec: {e}");
+                            continue;
+                        }
                     };
                     if v_time_ids_v.len() != 6 {
-                        log::warn!("[validation] {} time_ids len {} != 6", vfile.display(), v_time_ids_v.len());
+                        log::warn!(
+                            "[validation] {} time_ids len {} != 6",
+                            vfile.display(),
+                            v_time_ids_v.len()
+                        );
                         continue;
                     }
                     let mut v_size_emb = Vec::with_capacity(6 * 256);
-                    for &v in &v_time_ids_v { v_size_emb.extend_from_slice(&sin_embed_256(v)); }
+                    for &v in &v_time_ids_v {
+                        v_size_emb.extend_from_slice(&sin_embed_256(v));
+                    }
                     let v_size_t = match Tensor::from_vec(
                         v_size_emb,
                         Shape::from_dims(&[1, 1536]),
                         device.clone(),
-                    ).and_then(|t| t.to_dtype(DType::BF16)) {
+                    )
+                    .and_then(|t| t.to_dtype(DType::BF16))
+                    {
                         Ok(x) => x,
-                        Err(e) => { log::warn!("[validation] size_t build: {e}"); continue; }
+                        Err(e) => {
+                            log::warn!("[validation] size_t build: {e}");
+                            continue;
+                        }
                     };
                     let v_pooled = match Tensor::cat(&[&v_pooled_clip_g, &v_size_t], 1)
                         .and_then(|t| t.to_dtype(DType::BF16))
                     {
                         Ok(x) => x,
-                        Err(e) => { log::warn!("[validation] pooled cat: {e}"); continue; }
+                        Err(e) => {
+                            log::warn!("[validation] pooled cat: {e}");
+                            continue;
+                        }
                     };
 
                     // Side-RNG: never touches training rng. Mirrors training
@@ -1015,40 +1190,60 @@ fn main() -> anyhow::Result<()> {
                     let sqrt_ab = ab.sqrt();
                     let sqrt_1m_ab = (1.0 - ab).sqrt();
 
-                    let v_noise = match Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())
-                        .and_then(|t| t.to_dtype(DType::BF16))
-                    {
-                        Ok(x) => x,
-                        Err(e) => { log::warn!("[validation] noise: {e}"); continue; }
-                    };
-                    let v_noisy = match v_lat.mul_scalar(sqrt_ab)
+                    let v_noise =
+                        match Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())
+                            .and_then(|t| t.to_dtype(DType::BF16))
+                        {
+                            Ok(x) => x,
+                            Err(e) => {
+                                log::warn!("[validation] noise: {e}");
+                                continue;
+                            }
+                        };
+                    let v_noisy = match v_lat
+                        .mul_scalar(sqrt_ab)
                         .and_then(|a| v_noise.mul_scalar(sqrt_1m_ab).and_then(|b| a.add(&b)))
                     {
                         Ok(x) => x,
-                        Err(e) => { log::warn!("[validation] noisy: {e}"); continue; }
+                        Err(e) => {
+                            log::warn!("[validation] noisy: {e}");
+                            continue;
+                        }
                     };
                     // SDXL ε-prediction default; force_v_prediction → v-target.
                     let v_target = if config.force_v_prediction {
-                        match v_noise.mul_scalar(sqrt_ab)
+                        match v_noise
+                            .mul_scalar(sqrt_ab)
                             .and_then(|a| v_lat.mul_scalar(sqrt_1m_ab).and_then(|b| a.sub(&b)))
                         {
                             Ok(x) => x,
-                            Err(e) => { log::warn!("[validation] v-target: {e}"); continue; }
+                            Err(e) => {
+                                log::warn!("[validation] v-target: {e}");
+                                continue;
+                            }
                         }
                     } else {
                         v_noise.clone()
                     };
 
                     let v_timestep = match Tensor::from_vec(
-                        vec![t_idx as f32], Shape::from_dims(&[1]), device.clone(),
+                        vec![t_idx as f32],
+                        Shape::from_dims(&[1]),
+                        device.clone(),
                     ) {
                         Ok(x) => x,
-                        Err(e) => { log::warn!("[validation] timestep: {e}"); continue; }
+                        Err(e) => {
+                            log::warn!("[validation] timestep: {e}");
+                            continue;
+                        }
                     };
 
                     let v_pred = match <SDXLModel as TrainableModel>::forward(
-                        &mut model, &v_noisy, &v_timestep,
-                        std::slice::from_ref(&v_txt), Some(&v_pooled),
+                        &mut model,
+                        &v_noisy,
+                        &v_timestep,
+                        std::slice::from_ref(&v_txt),
+                        Some(&v_pooled),
                     ) {
                         Ok(p) => p,
                         Err(e) => {
@@ -1056,17 +1251,24 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                     };
-                    let v_loss = match v_pred.to_dtype(DType::F32)
+                    let v_loss = match v_pred
+                        .to_dtype(DType::F32)
                         .and_then(|p| v_target.to_dtype(DType::F32).and_then(|t| p.sub(&t)))
                         .and_then(|d| d.square())
                         .and_then(|s| s.mean())
                     {
                         Ok(l) => l,
-                        Err(e) => { log::warn!("[validation] loss: {e}"); continue; }
+                        Err(e) => {
+                            log::warn!("[validation] loss: {e}");
+                            continue;
+                        }
                     };
                     let v_loss_val = match v_loss.to_vec() {
                         Ok(v) => v[0],
-                        Err(e) => { log::warn!("[validation] loss to_vec: {e}"); continue; }
+                        Err(e) => {
+                            log::warn!("[validation] loss to_vec: {e}");
+                            continue;
+                        }
                     };
                     if v_loss_val.is_finite() {
                         sum += v_loss_val;
@@ -1090,14 +1292,17 @@ fn main() -> anyhow::Result<()> {
         }
 
         let step_num = step + 1;
-        let save_now = args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps;
+        let save_now =
+            args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps;
         // EMA swap: when --ema --ema-validation-swap, save sees EMA-averaged
         // weights. Backup is restored at the end of this block.
         let ema_backup = if save_now && args.ema_validation_swap {
             if let Some(ref e) = ema {
                 let _g = AutogradContext::no_grad();
-                Some(e.swap_with_live(&params)
-                    .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
+                Some(
+                    e.swap_with_live(&params)
+                        .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?,
+                )
             } else {
                 None
             }
@@ -1105,12 +1310,19 @@ fn main() -> anyhow::Result<()> {
             None
         };
         if save_now {
-            let mid_ckpt = args.output_dir.join(format!("sdxl_lora_step{step_num}.safetensors"));
+            let mid_ckpt = args
+                .output_dir
+                .join(format!("sdxl_lora_step{step_num}.safetensors"));
             if save_mode_full {
                 if let Optimizer::AdamW(ref adam) = opt {
                     let header = CkptHeader::from_adamw(
-                        "train_sdxl", step_num as u64, adam,
-                        args.rank, args.lora_alpha as f32, SEED, String::new(),
+                        "train_sdxl",
+                        step_num as u64,
+                        adam,
+                        args.rank,
+                        args.lora_alpha as f32,
+                        SEED,
+                        String::new(),
                     );
                     let named = model.named_parameters();
                     if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, adam, &header) {
@@ -1135,9 +1347,9 @@ fn main() -> anyhow::Result<()> {
             let comfy_path = args
                 .output_dir
                 .join(format!("sdxl_lora_step{step_num}_comfyui.safetensors"));
-            if let Err(e) = save_kohya_companion(
-                &model, args.lora_alpha as f32, &device, &comfy_path,
-            ) {
+            if let Err(e) =
+                save_kohya_companion(&model, args.lora_alpha as f32, &device, &comfy_path)
+            {
                 log::warn!("[save step {step_num}] kohya companion failed: {e}");
             } else {
                 log::info!("[save step {step_num}] kohya: {}", comfy_path.display());
@@ -1154,23 +1366,41 @@ fn main() -> anyhow::Result<()> {
     if args.ema_validation_swap {
         if let Some(ref e) = ema {
             let _g = AutogradContext::no_grad();
-            let _ = e.swap_with_live(&params)
+            let _ = e
+                .swap_with_live(&params)
                 .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
             log::info!("[ema] swapped EMA shadow into live params for final save");
         }
     }
 
     let trained = args.steps - start_step;
-    let avg_loss = if trained > 0 { total_loss / trained as f32 } else { 0.0 };
-    log::info!("Training complete: {trained} new steps (total={}), avg loss={:.4}", args.steps, avg_loss);
-    if let Some(b) = &board { b.set_status("completed"); }
+    let avg_loss = if trained > 0 {
+        total_loss / trained as f32
+    } else {
+        0.0
+    };
+    log::info!(
+        "Training complete: {trained} new steps (total={}), avg loss={:.4}",
+        args.steps,
+        avg_loss
+    );
+    if let Some(b) = &board {
+        b.set_status("completed");
+    }
 
-    let ckpt = args.output_dir.join(format!("sdxl_lora_{}steps.safetensors", args.steps));
+    let ckpt = args
+        .output_dir
+        .join(format!("sdxl_lora_{}steps.safetensors", args.steps));
     if save_mode_full {
         if let Optimizer::AdamW(ref adam) = opt {
             let header = CkptHeader::from_adamw(
-                "train_sdxl", args.steps as u64, adam,
-                args.rank, args.lora_alpha as f32, SEED, String::new(),
+                "train_sdxl",
+                args.steps as u64,
+                adam,
+                args.rank,
+                args.lora_alpha as f32,
+                SEED,
+                String::new(),
             );
             let named = model.named_parameters();
             if let Err(e) = checkpoint::save_full(&ckpt, &named, adam, &header) {

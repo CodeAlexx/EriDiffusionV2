@@ -47,10 +47,7 @@ impl SampleLibrary {
     /// `{ "prompts": [...] }` form or a bare `[...]` array.
     pub fn from_file(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path).map_err(|e| {
-            crate::EriDiffusionError::Data(format!(
-                "validation prompts {}: {e}",
-                path.display()
-            ))
+            crate::EriDiffusionError::Data(format!("validation prompts {}: {e}", path.display()))
         })?;
         if let Ok(wrapped) = serde_json::from_str::<SampleLibrary>(&s) {
             return Ok(wrapped);
@@ -93,11 +90,7 @@ mod tests {
     fn parses_bare_array() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("v.json");
-        std::fs::write(
-            &p,
-            r#"[{"prompt":"a dog"},{"prompt":"a fish","size":512}]"#,
-        )
-        .unwrap();
+        std::fs::write(&p, r#"[{"prompt":"a dog"},{"prompt":"a fish","size":512}]"#).unwrap();
         let lib = SampleLibrary::from_file(&p).unwrap();
         assert_eq!(lib.len(), 2);
         assert_eq!(lib.prompts[0].prompt, "a dog");

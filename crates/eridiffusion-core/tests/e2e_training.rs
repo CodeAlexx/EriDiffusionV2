@@ -1,7 +1,7 @@
 //! End-to-end training test: model -> loss -> backward -> optimizer.step -> verify loss decreases.
 //! Tests the CRITICAL path that gradient pipeline actually works.
-use flame_core::{self, autograd::AutogradContext, DType, Shape, Tensor, parameter::Parameter};
 use flame_core::adam::AdamW;
+use flame_core::{self, autograd::AutogradContext, parameter::Parameter, DType, Shape, Tensor};
 
 /// Test that Parameter gradients flow correctly through backward → optimizer.step
 #[test]
@@ -12,19 +12,23 @@ fn e2e_training_converges() {
     // Create a small 2-layer FC model with Parameters (F32 storage for AdamW)
     let w1 = Parameter::new(
         Tensor::randn(Shape::from_dims(&[64, 32]), 0.0, 0.02, device.clone())
-            .unwrap().requires_grad_(true)
+            .unwrap()
+            .requires_grad_(true),
     );
     let b1 = Parameter::new(
         Tensor::zeros_dtype(Shape::from_dims(&[64]), DType::F32, device.clone())
-            .unwrap().requires_grad_(true)
+            .unwrap()
+            .requires_grad_(true),
     );
     let w2 = Parameter::new(
         Tensor::randn(Shape::from_dims(&[32, 64]), 0.0, 0.02, device.clone())
-            .unwrap().requires_grad_(true)
+            .unwrap()
+            .requires_grad_(true),
     );
     let b2 = Parameter::new(
         Tensor::zeros_dtype(Shape::from_dims(&[32]), DType::F32, device.clone())
-            .unwrap().requires_grad_(true)
+            .unwrap()
+            .requires_grad_(true),
     );
 
     let params = vec![w1.clone(), b1.clone(), w2.clone(), b2.clone()];
@@ -46,7 +50,9 @@ fn e2e_training_converges() {
 
         let w2t = w2.tensor().unwrap();
         let out = h.matmul(&w2t.transpose().unwrap()).unwrap();
-        let out = out.add(&b2.tensor().unwrap().unsqueeze(0).unwrap()).unwrap();
+        let out = out
+            .add(&b2.tensor().unwrap().unsqueeze(0).unwrap())
+            .unwrap();
 
         let diff = out.sub(&target).unwrap();
         let loss = diff.square().unwrap().mean().unwrap();
@@ -70,7 +76,12 @@ fn e2e_training_converges() {
         let gnorm = total_norm.sqrt();
         grad_norms.push(gnorm);
         assert!(gnorm.is_finite(), "Gradient norm NaN/inf at step {}", step);
-        assert!(gnorm < 1000.0, "Gradient explosion at step {}: norm={}", step, gnorm);
+        assert!(
+            gnorm < 1000.0,
+            "Gradient explosion at step {}: norm={}",
+            step,
+            gnorm
+        );
 
         // ---- Optimizer step ----
         {
@@ -81,16 +92,25 @@ fn e2e_training_converges() {
         AutogradContext::clear();
 
         if step % 5 == 0 || step == 19 {
-            println!("step {:2}: loss={:.6} grad_count={}", step, loss_val, grad_count);
+            println!(
+                "step {:2}: loss={:.6} grad_count={}",
+                step, loss_val, grad_count
+            );
         }
     }
 
     println!("loss progression: {:?}", losses);
     assert!(losses[0].is_finite(), "Initial loss should be finite");
-    assert!(losses[19] < losses[0] * 0.95, "Loss should decrease by >5% over 20 steps");
+    assert!(
+        losses[19] < losses[0] * 0.95,
+        "Loss should decrease by >5% over 20 steps"
+    );
     assert!(losses[19] < losses[0], "Loss should decrease");
     for i in 1..losses.len() {
         assert!(losses[i].is_finite(), "Loss at step {} should be finite", i);
     }
-    println!("e2e_training_converges: PASS (loss: {:.6} -> {:.6})", losses[0], losses[19]);
+    println!(
+        "e2e_training_converges: PASS (loss: {:.6} -> {:.6})",
+        losses[0], losses[19]
+    );
 }

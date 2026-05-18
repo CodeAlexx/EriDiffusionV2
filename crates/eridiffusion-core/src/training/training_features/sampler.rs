@@ -181,12 +181,7 @@ impl InTrainingSampler {
             let elapsed = started.elapsed().as_secs_f32();
             match &outcome {
                 Ok(()) => log::info!("  wrote {} ({:.1}s)", out_path.display(), elapsed),
-                Err(e) => log::warn!(
-                    "  sampling FAILED at step={} prompt={}: {}",
-                    step,
-                    i,
-                    e,
-                ),
+                Err(e) => log::warn!("  sampling FAILED at step={} prompt={}: {}", step, i, e,),
             }
             // Optional sibling JSONL log for SerenityBoard. One line per
             // (step, prompt). Failures here are logged but never abort the
