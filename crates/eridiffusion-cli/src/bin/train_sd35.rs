@@ -1099,8 +1099,16 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| args.transformer.clone());
             log::info!("[sample-setup] loading text encoders to encode prompt once...");
             let clip_l_w = load_one_or_dir(clip_l_p, &device)?;
+            let clip_l_w: std::collections::HashMap<String, Tensor> = clip_l_w
+                .into_iter()
+                .map(|(k, t)| Ok::<_, anyhow::Error>((k, t.to_dtype(DType::BF16)?)))
+                .collect::<anyhow::Result<_>>()?;
             let clip_l = ClipEncoder::new(clip_l_w, ClipConfig::default(), device.clone());
             let clip_g_w = load_one_or_dir(clip_g_p, &device)?;
+            let clip_g_w: std::collections::HashMap<String, Tensor> = clip_g_w
+                .into_iter()
+                .map(|(k, t)| Ok::<_, anyhow::Error>((k, t.to_dtype(DType::BF16)?)))
+                .collect::<anyhow::Result<_>>()?;
             let clip_g = ClipGEncoder::new(clip_g_w, device.clone());
             let mut t5 = T5Encoder::load(
                 t5_p.to_str()

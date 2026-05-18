@@ -113,20 +113,25 @@ fn load_one_or_dir(
     path: &std::path::Path,
     device: &std::sync::Arc<flame_core::CudaDevice>,
 ) -> flame_core::Result<HashMap<String, Tensor>> {
-    if path.is_file() {
-        return flame_core::serialization::load_file(path, device);
-    }
     let mut all = HashMap::new();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
-        .map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
-        .collect();
-    entries.sort();
-    for p in entries {
-        all.extend(flame_core::serialization::load_file(&p, device)?);
+    if path.is_file() {
+        all.extend(flame_core::serialization::load_file(path, device)?);
+    } else {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+            .map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+            .collect();
+        entries.sort();
+        for p in entries {
+            all.extend(flame_core::serialization::load_file(&p, device)?);
+        }
     }
-    Ok(all)
+    let mut cast = HashMap::with_capacity(all.len());
+    for (k, t) in all {
+        cast.insert(k, t.to_dtype(DType::BF16)?);
+    }
+    Ok(cast)
 }
 
 fn tokenize_clip(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Result<Vec<i32>> {
