@@ -1401,13 +1401,6 @@ impl QwenImageTrainingModel {
         };
 
         if let Some(ref offloader_arc) = self.offloader {
-            if zero_cond_t {
-                return Err(flame_core::Error::InvalidInput(
-                    "edit-2511 (zero_cond_t) is not yet wired through the BlockOffloader path; \
-                     run without --block-swap or run forward_edit_2511 on the resident path."
-                        .into(),
-                ));
-            }
             // Same closure-fetch-not-capture pattern as `forward()` —
             // prevents the 38 GB closure-capture leak. See `forward()` for
             // the full rationale.
@@ -1421,13 +1414,15 @@ impl QwenImageTrainingModel {
             for i in 0..n_blocks {
                 let img_c = img.clone();
                 let txt_c = txt.clone();
-                let temb_c = img_temb.clone();
+                let img_temb_c = img_temb.clone();
+                let txt_temb_c = temb_base.clone();
                 let ic = img_cos.clone();
                 let is_ = img_sin.clone();
                 let tc = txt_cos.clone();
                 let ts = txt_sin.clone();
                 let bundle_c = self.bundle.clone();
                 let off_clone = offloader_arc.clone();
+                let use_zero_cond_t = zero_cond_t;
 
                 let block_out = flame_core::autograd::AutogradContext::checkpoint_offload(
                     &[img_c.clone(), txt_c.clone()],
@@ -1446,9 +1441,35 @@ impl QwenImageTrainingModel {
                         drop(raw);
 
                         bundle_c.refresh_caches();
-                        let (new_img, new_txt) = dual_stream_block_standalone(
-                            &img_c, &txt_c, &temb_c, i, &ic, &is_, &tc, &ts, &weights, &bundle_c,
-                        )?;
+                        let (new_img, new_txt) = if use_zero_cond_t {
+                            dual_stream_block_standalone_2511(
+                                &img_c,
+                                &txt_c,
+                                &img_temb_c,
+                                &txt_temb_c,
+                                i,
+                                &ic,
+                                &is_,
+                                &tc,
+                                &ts,
+                                target_seq,
+                                &weights,
+                                &bundle_c,
+                            )?
+                        } else {
+                            dual_stream_block_standalone(
+                                &img_c,
+                                &txt_c,
+                                &img_temb_c,
+                                i,
+                                &ic,
+                                &is_,
+                                &tc,
+                                &ts,
+                                &weights,
+                                &bundle_c,
+                            )?
+                        };
                         Tensor::cat(&[&new_img, &new_txt], 1)
                     },
                 )?;
@@ -2477,6 +2498,287 @@ fn dual_stream_block_standalone(
         LoraTarget::ImgFfnDown,
     )?;
     let img = img.add(&img_chunks[5].mul(&img_ffn_down)?)?;
+
+    let txt_norm2 = flame_core::layer_norm::layer_norm(&txt, &[DIM], None, None, NORM_EPS)?;
+    let txt_ffn_in = txt_norm2
+        .mul(&txt_chunks[4].add_scalar(1.0)?)?
+        .add(&txt_chunks[3])?;
+    let txt_ffn_up = add_lora(
+        matmul_bias(
+            &txt_ffn_in,
+            bw("txt_mlp.net.0.proj.weight")?,
+            Some(bw("txt_mlp.net.0.proj.bias")?),
+        )?,
+        &txt_ffn_in,
+        LoraTarget::TxtFfnUp,
+    )?;
+    let txt_ffn_act = txt_ffn_up.gelu()?;
+    let txt_ffn_down = add_lora(
+        matmul_bias(
+            &txt_ffn_act,
+            bw("txt_mlp.net.2.weight")?,
+            Some(bw("txt_mlp.net.2.bias")?),
+        )?,
+        &txt_ffn_act,
+        LoraTarget::TxtFfnDown,
+    )?;
+    let txt = txt.add(&txt_chunks[5].mul(&txt_ffn_down)?)?;
+
+    Ok((img, txt))
+}
+
+/// Standalone Edit-2511 block for BlockOffloader. Same math as
+/// `dual_stream_block_2511`, but reads weights from an explicit per-block map
+/// instead of `self.block_weights`.
+#[allow(clippy::too_many_arguments)]
+fn dual_stream_block_standalone_2511(
+    img: &Tensor,
+    txt: &Tensor,
+    img_temb: &Tensor,
+    txt_temb: &Tensor,
+    block_idx: usize,
+    img_cos: &Tensor,
+    img_sin: &Tensor,
+    txt_cos: &Tensor,
+    txt_sin: &Tensor,
+    target_seq: usize,
+    weights: &HashMap<String, Tensor>,
+    bundle: &QwenImageLoraBundle,
+) -> Result<(Tensor, Tensor)> {
+    let (b, img_seq, _) = {
+        let d = img.shape().dims();
+        (d[0], d[1], d[2])
+    };
+    let txt_seq = txt.shape().dims()[1];
+    if target_seq > img_seq {
+        return Err(flame_core::Error::InvalidInput(format!(
+            "dual_stream_block_standalone_2511: target_seq {target_seq} > img_seq {img_seq}",
+        )));
+    }
+    let ext_seq = img_seq - target_seq;
+
+    let bw = |suffix: &str| -> Result<&Tensor> {
+        let key = format!("transformer_blocks.{block_idx}.{suffix}");
+        weights
+            .get(&key)
+            .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
+    };
+
+    let matmul_bias = |x: &Tensor, weight: &Tensor, bias: Option<&Tensor>| -> Result<Tensor> {
+        let dims = x.shape().dims().to_vec();
+        let in_feat = *dims.last().unwrap();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
+        let out_feat = weight.shape().dims()[1];
+        let x_2d = x.reshape(&[batch, in_feat])?;
+        let mut out = x_2d.matmul(weight)?;
+        if let Some(bias) = bias {
+            out = out.add(bias)?;
+        }
+        let mut out_shape = dims[..dims.len() - 1].to_vec();
+        out_shape.push(out_feat);
+        out.reshape(&out_shape)
+    };
+
+    let add_lora = |base: Tensor, input: &Tensor, target: LoraTarget| -> Result<Tensor> {
+        if let Some(adapter) = bundle.adapter_for(block_idx, target) {
+            let input_3d = if input.shape().dims().len() == 2 {
+                input.unsqueeze(0)?
+            } else {
+                input.clone()
+            };
+            let delta = adapter.forward_delta(&input_3d)?;
+            base.add(&delta)
+        } else {
+            Ok(base)
+        }
+    };
+
+    let img_mod = img_temb.silu()?;
+    let img_mod = matmul_bias(
+        &img_mod,
+        bw("img_mod.1.weight")?,
+        Some(bw("img_mod.1.bias")?),
+    )?;
+    let img_chunks = img_mod.unsqueeze(1)?.chunk(6, 2)?;
+
+    let txt_mod = txt_temb.silu()?;
+    let txt_mod = matmul_bias(
+        &txt_mod,
+        bw("txt_mod.1.weight")?,
+        Some(bw("txt_mod.1.bias")?),
+    )?;
+    let txt_chunks = txt_mod.unsqueeze(1)?.chunk(6, 2)?;
+
+    let modulate_split =
+        |x: &Tensor, scale_chunk: &Tensor, shift_chunk: &Tensor| -> Result<Tensor> {
+            let s_base = scale_chunk.narrow(0, 0, b)?;
+            let s_ext = scale_chunk.narrow(0, b, b)?;
+            let h_base = shift_chunk.narrow(0, 0, b)?;
+            let h_ext = shift_chunk.narrow(0, b, b)?;
+            let x_base = x.narrow(1, 0, target_seq)?;
+            let part_base = x_base.mul(&s_base.add_scalar(1.0)?)?.add(&h_base)?;
+            if ext_seq == 0 {
+                return Ok(part_base);
+            }
+            let x_ext = x.narrow(1, target_seq, ext_seq)?;
+            let part_ext = x_ext.mul(&s_ext.add_scalar(1.0)?)?.add(&h_ext)?;
+            Tensor::cat(&[&part_base, &part_ext], 1)
+        };
+
+    let gate_split = |out: &Tensor, gate_chunk: &Tensor| -> Result<Tensor> {
+        let g_base = gate_chunk.narrow(0, 0, b)?;
+        let g_ext = gate_chunk.narrow(0, b, b)?;
+        let out_base = out.narrow(1, 0, target_seq)?;
+        let part_base = g_base.mul(&out_base)?;
+        if ext_seq == 0 {
+            return Ok(part_base);
+        }
+        let out_ext = out.narrow(1, target_seq, ext_seq)?;
+        let part_ext = g_ext.mul(&out_ext)?;
+        Tensor::cat(&[&part_base, &part_ext], 1)
+    };
+
+    let img_norm1 = flame_core::layer_norm::layer_norm(img, &[DIM], None, None, NORM_EPS)?;
+    let img_normed = modulate_split(&img_norm1, &img_chunks[1], &img_chunks[0])?;
+
+    let txt_norm1 = flame_core::layer_norm::layer_norm(txt, &[DIM], None, None, NORM_EPS)?;
+    let txt_normed = txt_norm1
+        .mul(&txt_chunks[1].add_scalar(1.0)?)?
+        .add(&txt_chunks[0])?;
+
+    let img_q = add_lora(
+        matmul_bias(
+            &img_normed,
+            bw("attn.to_q.weight")?,
+            Some(bw("attn.to_q.bias")?),
+        )?,
+        &img_normed,
+        LoraTarget::ImgQ,
+    )?;
+    let img_k = add_lora(
+        matmul_bias(
+            &img_normed,
+            bw("attn.to_k.weight")?,
+            Some(bw("attn.to_k.bias")?),
+        )?,
+        &img_normed,
+        LoraTarget::ImgK,
+    )?;
+    let img_v = add_lora(
+        matmul_bias(
+            &img_normed,
+            bw("attn.to_v.weight")?,
+            Some(bw("attn.to_v.bias")?),
+        )?,
+        &img_normed,
+        LoraTarget::ImgV,
+    )?;
+    let txt_q = add_lora(
+        matmul_bias(
+            &txt_normed,
+            bw("attn.add_q_proj.weight")?,
+            Some(bw("attn.add_q_proj.bias")?),
+        )?,
+        &txt_normed,
+        LoraTarget::TxtQ,
+    )?;
+    let txt_k = add_lora(
+        matmul_bias(
+            &txt_normed,
+            bw("attn.add_k_proj.weight")?,
+            Some(bw("attn.add_k_proj.bias")?),
+        )?,
+        &txt_normed,
+        LoraTarget::TxtK,
+    )?;
+    let txt_v = add_lora(
+        matmul_bias(
+            &txt_normed,
+            bw("attn.add_v_proj.weight")?,
+            Some(bw("attn.add_v_proj.bias")?),
+        )?,
+        &txt_normed,
+        LoraTarget::TxtV,
+    )?;
+
+    let img_q = rms_norm_per_head(&img_q, bw("attn.norm_q.weight")?, NUM_HEADS, HEAD_DIM)?;
+    let img_k = rms_norm_per_head(&img_k, bw("attn.norm_k.weight")?, NUM_HEADS, HEAD_DIM)?;
+    let txt_q = rms_norm_per_head(&txt_q, bw("attn.norm_added_q.weight")?, NUM_HEADS, HEAD_DIM)?;
+    let txt_k = rms_norm_per_head(&txt_k, bw("attn.norm_added_k.weight")?, NUM_HEADS, HEAD_DIM)?;
+
+    let img_q_4d = img_q.reshape(&[b, img_seq, NUM_HEADS, HEAD_DIM])?;
+    let img_k_4d = img_k.reshape(&[b, img_seq, NUM_HEADS, HEAD_DIM])?;
+    let txt_q_4d = txt_q.reshape(&[b, txt_seq, NUM_HEADS, HEAD_DIM])?;
+    let txt_k_4d = txt_k.reshape(&[b, txt_seq, NUM_HEADS, HEAD_DIM])?;
+
+    let img_q_rope = apply_rope(&img_q_4d, img_cos, img_sin)?;
+    let img_k_rope = apply_rope(&img_k_4d, img_cos, img_sin)?;
+    let txt_q_rope = apply_rope(&txt_q_4d, txt_cos, txt_sin)?;
+    let txt_k_rope = apply_rope(&txt_k_4d, txt_cos, txt_sin)?;
+
+    let total_seq = img_seq + txt_seq;
+    let q = Tensor::cat(&[&img_q_rope, &txt_q_rope], 1)?.permute(&[0, 2, 1, 3])?;
+    let k = Tensor::cat(&[&img_k_rope, &txt_k_rope], 1)?.permute(&[0, 2, 1, 3])?;
+    let v = {
+        let img_v_4d = img_v.reshape(&[b, img_seq, NUM_HEADS, HEAD_DIM])?;
+        let txt_v_4d = txt_v.reshape(&[b, txt_seq, NUM_HEADS, HEAD_DIM])?;
+        Tensor::cat(&[&img_v_4d, &txt_v_4d], 1)?.permute(&[0, 2, 1, 3])?
+    };
+
+    let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    let attn_out = attn_out
+        .permute(&[0, 2, 1, 3])?
+        .reshape(&[b, total_seq, DIM])?;
+
+    let img_attn = attn_out.narrow(1, 0, img_seq)?;
+    let txt_attn = attn_out.narrow(1, img_seq, txt_seq)?;
+
+    let img_attn_out = add_lora(
+        matmul_bias(
+            &img_attn,
+            bw("attn.to_out.0.weight")?,
+            Some(bw("attn.to_out.0.bias")?),
+        )?,
+        &img_attn,
+        LoraTarget::ImgOut,
+    )?;
+    let txt_attn_out = add_lora(
+        matmul_bias(
+            &txt_attn,
+            bw("attn.to_add_out.weight")?,
+            Some(bw("attn.to_add_out.bias")?),
+        )?,
+        &txt_attn,
+        LoraTarget::TxtOut,
+    )?;
+
+    let img_gate1 = gate_split(&img_attn_out, &img_chunks[2])?;
+    let img = img.add(&img_gate1)?;
+    let txt = txt.add(&txt_chunks[2].mul(&txt_attn_out)?)?;
+
+    let img_norm2 = flame_core::layer_norm::layer_norm(&img, &[DIM], None, None, NORM_EPS)?;
+    let img_ffn_in = modulate_split(&img_norm2, &img_chunks[4], &img_chunks[3])?;
+    let img_ffn_up = add_lora(
+        matmul_bias(
+            &img_ffn_in,
+            bw("img_mlp.net.0.proj.weight")?,
+            Some(bw("img_mlp.net.0.proj.bias")?),
+        )?,
+        &img_ffn_in,
+        LoraTarget::ImgFfnUp,
+    )?;
+    let img_ffn_act = img_ffn_up.gelu()?;
+    let img_ffn_down = add_lora(
+        matmul_bias(
+            &img_ffn_act,
+            bw("img_mlp.net.2.weight")?,
+            Some(bw("img_mlp.net.2.bias")?),
+        )?,
+        &img_ffn_act,
+        LoraTarget::ImgFfnDown,
+    )?;
+    let img_gate2 = gate_split(&img_ffn_down, &img_chunks[5])?;
+    let img = img.add(&img_gate2)?;
 
     let txt_norm2 = flame_core::layer_norm::layer_norm(&txt, &[DIM], None, None, NORM_EPS)?;
     let txt_ffn_in = txt_norm2
