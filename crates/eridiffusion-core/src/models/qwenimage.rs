@@ -325,6 +325,59 @@ impl QwenImageLoraBundle {
         device: &std::sync::Arc<cudarc::driver::CudaDevice>,
     ) -> Result<()> {
         let raw = flame_core::serialization::load_file(path, device)?;
+        if !self.lycoris_adapters.is_empty() {
+            let mut applied = 0usize;
+            let mut missing = 0usize;
+            for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+                let prefix = format!(
+                    "transformer_blocks.{block_idx}.{}",
+                    Self::target_suffix(target),
+                );
+                let params = adapter.to_parameters();
+                let named = adapter.named_tensors();
+                if params.len() != named.len() {
+                    return Err(flame_core::Error::InvalidInput(format!(
+                        "LyCORIS adapter at ({block_idx}, {:?}) has {} params but {} named tensors",
+                        target,
+                        params.len(),
+                        named.len(),
+                    )));
+                }
+                for ((leaf, _), param) in named.into_iter().zip(params.into_iter()) {
+                    let key = format!("{prefix}.{leaf}");
+                    match raw.get(&key) {
+                        Some(t) => {
+                            let live = param.tensor()?;
+                            let cast = if t.dtype() == live.dtype() {
+                                t.clone()
+                            } else {
+                                t.to_dtype(live.dtype())?
+                            };
+                            param.set_data(cast.requires_grad_(true))?;
+                            applied += 1;
+                        }
+                        None => {
+                            missing += 1;
+                            log::warn!("[qwenimage] no saved LyCORIS tensor for `{key}`");
+                        }
+                    }
+                }
+            }
+            log::info!(
+                "[qwenimage] LyCORIS loaded: {applied}/{} tensors from {}",
+                applied + missing,
+                path.display()
+            );
+            if applied == 0 {
+                return Err(flame_core::Error::InvalidInput(format!(
+                    "no LyCORIS tensors matched any prefix in {}",
+                    path.display()
+                )));
+            }
+            self.refresh_caches();
+            return Ok(());
+        }
+
         let mut applied = 0usize;
         let mut missing = 0usize;
         for (&(block_idx, target), lora) in &self.adapters {
@@ -535,8 +588,9 @@ impl QwenImageTrainingModel {
             .unwrap_or(NUM_LAYERS);
 
         // Decide: BlockOffloader (per-step block loading) vs resident (all blocks on GPU).
-        // Use BlockOffloader when loading all 60 blocks from a sharded directory.
-        let use_offloader = max_blocks == NUM_LAYERS && model_path.is_dir();
+        // Use BlockOffloader whenever the full 60-block model is requested; Qwen-Image-Edit
+        // checkpoints are commonly single-file safetensors and still need streamed blocks.
+        let use_offloader = max_blocks == NUM_LAYERS;
 
         let (resident, per_block, offloader) = if use_offloader {
             // BlockOffloader path: load shared weights only, blocks loaded per-step.
@@ -554,20 +608,29 @@ impl QwenImageTrainingModel {
             let mut resident = HashMap::new();
             let mut shard_paths: Vec<String> = Vec::new();
 
-            for entry in
-                std::fs::read_dir(model_path).map_err(|e| flame_core::Error::Io(e.to_string()))?
-            {
-                let entry = entry.map_err(|e| flame_core::Error::Io(e.to_string()))?;
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
-                    shard_paths.push(p.to_string_lossy().into_owned());
-                    // Load only shared (non-block) weights
-                    let shared =
-                        flame_core::serialization::load_file_filtered(&p, &device, |key| {
-                            shared_prefixes.iter().any(|pfx| key.starts_with(pfx))
-                        })?;
-                    resident.extend(shared);
+            if model_path.is_dir() {
+                for entry in std::fs::read_dir(model_path)
+                    .map_err(|e| flame_core::Error::Io(e.to_string()))?
+                {
+                    let entry = entry.map_err(|e| flame_core::Error::Io(e.to_string()))?;
+                    let p = entry.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
+                        shard_paths.push(p.to_string_lossy().into_owned());
+                        // Load only shared (non-block) weights
+                        let shared =
+                            flame_core::serialization::load_file_filtered(&p, &device, |key| {
+                                shared_prefixes.iter().any(|pfx| key.starts_with(pfx))
+                            })?;
+                        resident.extend(shared);
+                    }
                 }
+            } else {
+                shard_paths.push(model_path.to_string_lossy().into_owned());
+                let shared =
+                    flame_core::serialization::load_file_filtered(model_path, &device, |key| {
+                        shared_prefixes.iter().any(|pfx| key.starts_with(pfx))
+                    })?;
+                resident.extend(shared);
             }
             shard_paths.sort();
 
@@ -2548,7 +2611,7 @@ fn dual_stream_block_iflame(
             _ => None,
         };
         if let Some(target) = target {
-            if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
+            if let Some(lora) = bundle.adapter_for(block_idx, target) {
                 let input_3d = if x.shape().dims().len() == 2 {
                     x.unsqueeze(0)?
                 } else {

@@ -460,6 +460,57 @@ impl ZImageLoraBundle {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<()> {
         let tensors = flame_core::serialization::load_file(path, device)?;
+        if !self.lycoris_adapters.is_empty() {
+            let mut applied = 0usize;
+            let mut missing = 0usize;
+            for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+                let suffix = Self::ai_toolkit_suffix(target);
+                let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
+                let params = adapter.to_parameters();
+                let named = adapter.named_tensors();
+                if params.len() != named.len() {
+                    return Err(flame_core::Error::InvalidInput(format!(
+                        "LyCORIS adapter at ({block_idx}, {:?}) has {} params but {} named tensors",
+                        target,
+                        params.len(),
+                        named.len(),
+                    )));
+                }
+                for ((leaf, _), param) in named.into_iter().zip(params.into_iter()) {
+                    let key = format!("{prefix}.{leaf}");
+                    match tensors.get(&key) {
+                        Some(t) => {
+                            let live = param.tensor()?;
+                            let cast = if t.dtype() == live.dtype() {
+                                t.clone()
+                            } else {
+                                t.to_dtype(live.dtype())?
+                            };
+                            param.set_data(cast.requires_grad_(true))?;
+                            applied += 1;
+                        }
+                        None => {
+                            missing += 1;
+                            log::warn!("[zimage] no saved LyCORIS tensor for `{key}`");
+                        }
+                    }
+                }
+            }
+            log::info!(
+                "[zimage] LyCORIS loaded: {applied}/{} tensors from {}",
+                applied + missing,
+                path.display()
+            );
+            if applied == 0 {
+                return Err(flame_core::Error::InvalidInput(format!(
+                    "no LyCORIS tensors matched any prefix in {}",
+                    path.display()
+                )));
+            }
+            self.refresh_caches();
+            return Ok(());
+        }
+
         for (&(block_idx, target), lora) in &self.adapters {
             let suffix = Self::ai_toolkit_suffix(target);
             // Try ai-toolkit format first.

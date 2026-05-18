@@ -3,11 +3,12 @@
 //! `qwenimage_sampler::sample_image` for the denoise + VAE-decode pipeline.
 
 use clap::Parser;
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use flame_core::{DType, Tensor};
 use std::path::PathBuf;
 
 use eridiffusion_core::encoders::qwen25vl::Qwen25VLEncoder;
-use eridiffusion_core::models::QwenImageTrainingModel;
+use eridiffusion_core::models::{qwenimage::QwenImageLoraBundle, QwenImageTrainingModel};
 use eridiffusion_core::sampler::qwenimage_sampler;
 
 const QWEN_PAD_ID: i32 = 151643;
@@ -79,6 +80,41 @@ struct Args {
     /// Match the alpha used at training time. Mismatch = silent scale drift.
     #[arg(long, default_value = "16.0")]
     lora_alpha: f32,
+    /// Adapter algo for `--lora-path`: `lora` = legacy LoRA, or LyCORIS
+    /// `locon | loha | lokr`. Must match the algo used for training.
+    #[arg(long, default_value = "lora")]
+    algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)]
+    lokr_factor: i32,
+    /// OFT block size (ignored for non-OFT).
+    #[arg(long, default_value_t = 32)]
+    oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (ignored for non-OFT).
+    #[arg(long, default_value_t = 5)]
+    oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr Tucker decomposition flag. Qwen-Image is linear-only.
+    #[arg(long, default_value_t = false)]
+    use_tucker: bool,
+    /// LoKr only: factorize both W1 and W2.
+    #[arg(long, default_value_t = false)]
+    decompose_both: bool,
+    /// Enable DoRA reconstruction when the sampled LyCORIS checkpoint used DoRA.
+    #[arg(long, default_value_t = false)]
+    dora: bool,
+    #[arg(long, default_value_t = true)]
+    dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)]
+    dora_eps: f32,
+    /// Per-LyCORIS conv rank override. Inert for current Qwen-Image targets.
+    #[arg(long, default_value_t = 0)]
+    conv_rank: usize,
+    /// Per-LyCORIS conv alpha override. Inert for current Qwen-Image targets.
+    #[arg(long, default_value_t = 0.0)]
+    conv_alpha: f32,
+    /// Optional SimpleTuner-style LyCORIS preset used during training.
+    #[arg(long)]
+    lycoris_config: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -91,6 +127,26 @@ fn main() -> anyhow::Result<()> {
     if args.size % 16 != 0 {
         anyhow::bail!("size must be divisible by 16, got {}", args.size);
     }
+
+    let algo = parse_adapter_algo(&args.algo)?;
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+        factor: args.lokr_factor,
+        conv_rank: args.conv_rank,
+        conv_alpha: args.conv_alpha,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    }
+    .with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
 
     log::info!("[1/4] Loading Qwen2.5-VL-7B text encoder + tokenizer...");
     let tokenizer = tokenizers::Tokenizer::from_file(&args.tokenizer_path)
@@ -201,10 +257,26 @@ fn main() -> anyhow::Result<()> {
         device.clone(),
         args.seed,
     )?;
+    if algo != LycorisAlgo::None {
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            anyhow::bail!(
+                "--algo {} is not sample-safe in the Qwen residual adapter path yet",
+                algo.as_str()
+            );
+        }
+        model.bundle = QwenImageLoraBundle::new_with_config(&lyc_config, device.clone(), args.seed)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
+        log::info!(
+            "  using LyCORIS algo={} rank={} alpha={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha
+        );
+    }
     if let Some(lp) = &args.lora_path {
         model.bundle.load(lp, &device)?;
         log::info!(
-            "  applied LoRA from {} (rank={}, alpha={})",
+            "  applied adapter from {} (rank={}, alpha={})",
             lp.display(),
             args.lora_rank,
             args.lora_alpha,
@@ -268,4 +340,13 @@ fn load_te_weights(
         }
     }
     Ok(all)
+}
+
+fn parse_adapter_algo(raw: &str) -> anyhow::Result<LycorisAlgo> {
+    let algo_str = raw.trim().to_ascii_lowercase();
+    if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        Ok(LycorisAlgo::None)
+    } else {
+        LycorisAlgo::parse(raw).map_err(|e| anyhow::anyhow!("--algo: {e}"))
+    }
 }
