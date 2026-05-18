@@ -1401,9 +1401,15 @@ impl QwenImageTrainingModel {
         };
 
         if let Some(ref offloader_arc) = self.offloader {
-            // Same closure-fetch-not-capture pattern as `forward()` —
-            // prevents the 38 GB closure-capture leak. See `forward()` for
-            // the full rationale.
+            // Edit inference should not pay the training checkpoint path.
+            // The training branch has to own per-block tensors because
+            // backward recompute may run after the offloader slot is reused;
+            // inference can consume the awaited block directly and prefetch
+            // the next one after the block has finished.
+            let is_inference = !flame_core::autograd::AutogradContext::is_recording();
+            if is_inference {
+                log::info!("[qwenimage-edit] offloader inference fast path: direct block tensors");
+            }
             {
                 let mut g = offloader_arc
                     .lock()
@@ -1412,81 +1418,136 @@ impl QwenImageTrainingModel {
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
             for i in 0..n_blocks {
-                let img_c = img.clone();
-                let txt_c = txt.clone();
-                let img_temb_c = img_temb.clone();
-                let txt_temb_c = temb_base.clone();
-                let ic = img_cos.clone();
-                let is_ = img_sin.clone();
-                let tc = txt_cos.clone();
-                let ts = txt_sin.clone();
-                let bundle_c = self.bundle.clone();
-                let off_clone = offloader_arc.clone();
-                let use_zero_cond_t = zero_cond_t;
+                if is_inference {
+                    let raw = {
+                        let mut g = offloader_arc.lock().map_err(|e| {
+                            flame_core::Error::InvalidInput(format!(
+                                "offloader lock (block {i}): {e}"
+                            ))
+                        })?;
+                        g.await_block(i).map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("await block {i}: {e}"))
+                        })?
+                    };
+                    self.bundle.refresh_caches();
+                    let (new_img, new_txt) = if zero_cond_t {
+                        dual_stream_block_standalone_2511(
+                            &img,
+                            &txt,
+                            &img_temb,
+                            &temb_base,
+                            i,
+                            &img_cos,
+                            &img_sin,
+                            &txt_cos,
+                            &txt_sin,
+                            target_seq,
+                            &raw,
+                            &self.bundle,
+                        )?
+                    } else {
+                        dual_stream_block_standalone(
+                            &img,
+                            &txt,
+                            &img_temb,
+                            i,
+                            &img_cos,
+                            &img_sin,
+                            &txt_cos,
+                            &txt_sin,
+                            &raw,
+                            &self.bundle,
+                        )?
+                    };
+                    drop(raw);
+                    img = new_img;
+                    txt = new_txt;
 
-                let block_out = flame_core::autograd::AutogradContext::checkpoint_offload(
-                    &[img_c.clone(), txt_c.clone()],
-                    move || {
-                        let raw = {
-                            let mut g = off_clone.lock().map_err(|e| {
-                                flame_core::Error::InvalidInput(format!(
-                                    "offloader lock (block {i}): {e}"
-                                ))
-                            })?;
-                            g.await_block(i).map_err(|e| {
-                                flame_core::Error::InvalidInput(format!("await block {i}: {e}"))
-                            })?
-                        };
-                        let weights = clone_block_weights(&raw)?;
-                        drop(raw);
+                    if i + 1 < n_blocks {
+                        let mut g = offloader_arc.lock().map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("offloader lock: {e}"))
+                        })?;
+                        g.prefetch_block(i + 1).map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1))
+                        })?;
+                    }
+                } else {
+                    let img_c = img.clone();
+                    let txt_c = txt.clone();
+                    let img_temb_c = img_temb.clone();
+                    let txt_temb_c = temb_base.clone();
+                    let ic = img_cos.clone();
+                    let is_ = img_sin.clone();
+                    let tc = txt_cos.clone();
+                    let ts = txt_sin.clone();
+                    let bundle_c = self.bundle.clone();
+                    let off_clone = offloader_arc.clone();
+                    let use_zero_cond_t = zero_cond_t;
 
-                        bundle_c.refresh_caches();
-                        let (new_img, new_txt) = if use_zero_cond_t {
-                            dual_stream_block_standalone_2511(
-                                &img_c,
-                                &txt_c,
-                                &img_temb_c,
-                                &txt_temb_c,
-                                i,
-                                &ic,
-                                &is_,
-                                &tc,
-                                &ts,
-                                target_seq,
-                                &weights,
-                                &bundle_c,
-                            )?
-                        } else {
-                            dual_stream_block_standalone(
-                                &img_c,
-                                &txt_c,
-                                &img_temb_c,
-                                i,
-                                &ic,
-                                &is_,
-                                &tc,
-                                &ts,
-                                &weights,
-                                &bundle_c,
-                            )?
-                        };
-                        Tensor::cat(&[&new_img, &new_txt], 1)
-                    },
-                )?;
+                    let block_out = flame_core::autograd::AutogradContext::checkpoint_offload(
+                        &[img_c.clone(), txt_c.clone()],
+                        move || {
+                            let raw = {
+                                let mut g = off_clone.lock().map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!(
+                                        "offloader lock (block {i}): {e}"
+                                    ))
+                                })?;
+                                g.await_block(i).map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!("await block {i}: {e}"))
+                                })?
+                            };
+                            let weights = clone_block_weights(&raw)?;
+                            drop(raw);
 
-                if i + 1 < n_blocks {
-                    let mut g = offloader_arc.lock().map_err(|e| {
-                        flame_core::Error::InvalidInput(format!("offloader lock: {e}"))
-                    })?;
-                    g.prefetch_block(i + 1).map_err(|e| {
-                        flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1))
-                    })?;
+                            bundle_c.refresh_caches();
+                            let (new_img, new_txt) = if use_zero_cond_t {
+                                dual_stream_block_standalone_2511(
+                                    &img_c,
+                                    &txt_c,
+                                    &img_temb_c,
+                                    &txt_temb_c,
+                                    i,
+                                    &ic,
+                                    &is_,
+                                    &tc,
+                                    &ts,
+                                    target_seq,
+                                    &weights,
+                                    &bundle_c,
+                                )?
+                            } else {
+                                dual_stream_block_standalone(
+                                    &img_c,
+                                    &txt_c,
+                                    &img_temb_c,
+                                    i,
+                                    &ic,
+                                    &is_,
+                                    &tc,
+                                    &ts,
+                                    &weights,
+                                    &bundle_c,
+                                )?
+                            };
+                            Tensor::cat(&[&new_img, &new_txt], 1)
+                        },
+                    )?;
+
+                    if i + 1 < n_blocks {
+                        let mut g = offloader_arc.lock().map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("offloader lock: {e}"))
+                        })?;
+                        g.prefetch_block(i + 1).map_err(|e| {
+                            flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1))
+                        })?;
+                    }
+
+                    let img_seq_len = img.shape().dims()[1];
+                    let txt_seq_len = txt.shape().dims()[1];
+                    img = block_out.narrow(1, 0, img_seq_len)?;
+                    txt = block_out.narrow(1, img_seq_len, txt_seq_len)?;
                 }
-
-                let img_seq_len = img.shape().dims()[1];
-                let txt_seq_len = txt.shape().dims()[1];
-                img = block_out.narrow(1, 0, img_seq_len)?;
-                txt = block_out.narrow(1, img_seq_len, txt_seq_len)?;
 
                 if i % 10 == 0 || i == n_blocks - 1 {
                     log::info!("[qwenimage-edit] block {}/{n_blocks}", i + 1);
