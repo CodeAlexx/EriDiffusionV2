@@ -75,53 +75,38 @@ impl LoRALinear {
     /// the LoRA branch. Until then, BF16 LoRA produces soft / identity-less
     /// renders (the inference-flame "featureless mush" failure mode).
     ///
-    /// **2026-05-12 perf**: was `a.transpose().contiguous()` + matmul →
-    /// each adapter materialized two BF16 transposes via the slow
-    /// `permute_generic_bf16_kernel` (rank-2 perm[1,0] is not a fast-path
-    /// perm). Z-Image zimage 30-block × 6-LoRA × 2-transposes × 2
-    /// (forward + grad replay) = **840 permute_generic launches/step**
-    /// (~50 µs each = ~42 ms/step). Replaced with two
-    /// `fused_linear3d_native` calls — cuBLASLt applies TRANSA=T inline,
-    /// zero materialization. `lora_a` is already in `[Cout=rank,
-    /// Cin=in_features]` and `lora_b` is already in `[Cout=out_features,
-    /// Cin=rank]` — both match the PyTorch `[Cout, Cin]` layout the
-    /// fused kernel expects. Autograd is preserved via Op::Linear.
+    /// 2026-05-18: Flux legacy LoRA OOMed at 512 with the fused Linear path
+    /// because each adapter's Linear autograd entry retained too much block
+    /// state. Keep the low-rank projection explicit, matching the LyCORIS
+    /// LoCon memory profile that fits the same run. This does not materialize
+    /// a dense `[in_features, out_features]` delta.
     pub fn forward_delta(&self, input: &Tensor) -> Result<Tensor> {
-        use flame_core::ops::fused_inference::fused_linear3d_native;
-
         // Preserve original rank so the caller's tensor shape semantics
         // (typically 3D `[B, N, Cin]` from `ensure_3d`) are unchanged.
         let orig_dims: Vec<usize> = input.shape().dims().to_vec();
         let orig_rank = orig_dims.len();
 
-        // `fused_linear3d_native` requires 3D `[B, N, Cin]`. Flatten any
-        // leading dims into N, keep batch=1. Equivalent to the previous
-        // `reshape(&[leading, in_f])` but in 3D layout.
+        // Flatten leading dims, apply x @ A^T @ B^T, then reshape back.
         let leading: usize = orig_dims[..orig_rank - 1].iter().product();
-        let input_3d = input.reshape(&[1, leading, self.in_features])?;
+        let input_2d = input.reshape(&[leading, self.in_features])?;
 
         // Cast LoRA params to BF16 to match `input` dtype. Autograd-aware
         // via Op::Cast (verified: to_dtype short-circuits to the
         // autograd path when source requires_grad).
         let a = self.lora_a.tensor()?.to_dtype(DType::BF16)?;
         let b = self.lora_b.tensor()?.to_dtype(DType::BF16)?;
+        let a_t = a.transpose()?;
+        let b_t = b.transpose()?;
 
-        // First GEMM: input @ A^T (cuBLASLt TRANSA=T on weight A).
-        // A.shape = [rank, in_f]   = [Cout=rank, Cin=in_f]   ✓
-        // Output: [1, leading, rank]
-        let intermediate = fused_linear3d_native(&input_3d, &a, None)?;
-
-        // Second GEMM: intermediate @ B^T.
-        // B.shape = [out_f, rank]  = [Cout=out_f, Cin=rank]  ✓
-        // Output: [1, leading, out_f]
-        let out_3d = fused_linear3d_native(&intermediate, &b, None)?;
+        let intermediate = input_2d.matmul(&a_t)?;
+        let out_2d = intermediate.matmul(&b_t)?;
 
         // Apply alpha scaling.
         let scale = self.alpha / self.rank as f32;
         let scaled = if (scale - 1.0).abs() > f32::EPSILON {
-            out_3d.mul_scalar(scale)?
+            out_2d.mul_scalar(scale)?
         } else {
-            out_3d
+            out_2d
         };
 
         // Reshape back to original rank, with last dim = out_features.

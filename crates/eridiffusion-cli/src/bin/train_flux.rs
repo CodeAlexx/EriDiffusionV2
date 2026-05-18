@@ -376,11 +376,16 @@ fn main() -> anyhow::Result<()> {
         args.algo
     );
 
-    // Phase 2b: parse `--algo`. `lora`/`none` → legacy `FluxLoraBundle`
-    // (byte-identical to pre-LyCORIS commits). Anything else → LyCORIS bundle.
-    // Build a `LycorisBundleConfig` either way; the model dispatches on
-    // `LycorisAlgo::None` to pick the legacy path.
-    let lyc_algo = LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?;
+    // Phase 2b: parse `--algo`. `lora`/`none` -> legacy `FluxLoraBundle`
+    // (byte-identical to pre-LyCORIS commits). `LycorisAlgo::parse("lora")`
+    // aliases to LoCon globally, so re-map it here to match SDXL/SD3.5:
+    // users who want the LyCORIS LoCon path pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let lyc_algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
     let lyc_cfg = if lyc_algo == LycorisAlgo::None {
         None
     } else {
@@ -813,6 +818,27 @@ fn main() -> anyhow::Result<()> {
         } else {
             loss.backward()?
         };
+
+        // Grad-flow diagnostic.  Runs at step 1, not step 0, because LoRA-like
+        // adapters intentionally start with one zero factor; after the first
+        // optimizer step, all trainable leaves should receive real gradients.
+        if step == 1 {
+            let named = if let Some(ref b) = model.bundle {
+                b.named_parameters()
+            } else if let Some(ref lb) = model.lycoris_bundle {
+                lb.named_parameters()
+            } else {
+                Vec::new()
+            };
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
+            let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
+            if report.is_clean() {
+                log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
+            } else {
+                log::warn!("{}", report.summary());
+            }
+        }
 
         // clip_grad_norm = 1.0 (preset default; matches OT BaseFluxSetup).
         // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.

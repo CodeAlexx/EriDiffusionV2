@@ -75,7 +75,7 @@ use flame_core::{
 };
 
 use crate::adapter::{AdapterModule, LycorisLinear};
-use crate::config::TrainConfig;
+use crate::config::{GradientCheckpointing, TrainConfig};
 use crate::lora::LoRALinear;
 use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::models::chroma::build_lycoris_linear;
@@ -1061,12 +1061,41 @@ impl SD35Model {
             self.linear("context_embedder.weight", "context_embedder.bias", context)?;
 
         let depth = self.mmdit_config.depth;
+        let use_checkpoint = self.config.gradient_checkpointing == GradientCheckpointing::On;
         for i in 0..depth {
             let is_last = i == depth - 1;
-            let (new_ctx, new_x) = self.joint_block(&ctx_tokens, &x_tokens, &c, i, is_last)?;
-            x_tokens = new_x;
-            if let Some(ctx) = new_ctx {
-                ctx_tokens = ctx;
+            if use_checkpoint {
+                let ctx_len = ctx_tokens.dims()[1];
+                let x_len = x_tokens.dims()[1];
+                let combined = Tensor::cat(&[&ctx_tokens, &x_tokens], 1)?;
+                let c_c = c.clone();
+                let combined_c = combined.clone();
+                let self_ptr = self as *const SD35Model as usize;
+
+                let block_out =
+                    flame_core::autograd::AutogradContext::checkpoint(&[combined], move || {
+                        // The checkpoint closure is consumed during the same
+                        // training step before `self` can move or drop. Capture
+                        // a raw pointer so the block can reuse the existing
+                        // adapter stores without cloning trainable parameters.
+                        let model = unsafe { &*(self_ptr as *const SD35Model) };
+                        let ctx_in = combined_c.narrow(1, 0, ctx_len)?;
+                        let x_in = combined_c.narrow(1, ctx_len, x_len)?;
+                        let (new_ctx, new_x) = model
+                            .joint_block(&ctx_in, &x_in, &c_c, i, is_last)
+                            .map_err(|e| flame_core::Error::InvalidInput(format!("{e}")))?;
+                        let ctx_out = new_ctx.unwrap_or(ctx_in);
+                        Tensor::cat(&[&ctx_out, &new_x], 1)
+                    })?;
+
+                ctx_tokens = block_out.narrow(1, 0, ctx_len)?;
+                x_tokens = block_out.narrow(1, ctx_len, x_len)?;
+            } else {
+                let (new_ctx, new_x) = self.joint_block(&ctx_tokens, &x_tokens, &c, i, is_last)?;
+                x_tokens = new_x;
+                if let Some(ctx) = new_ctx {
+                    ctx_tokens = ctx;
+                }
             }
         }
 

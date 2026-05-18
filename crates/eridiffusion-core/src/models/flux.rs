@@ -2,7 +2,7 @@
 //! Architecture constants match BFL/flux-1-dev.
 
 use crate::adapter::AdapterModule;
-use crate::config::TrainConfig;
+use crate::config::{GradientCheckpointing, TrainConfig};
 use crate::lora::LoRALinear;
 use crate::lycoris::{AdapterStore, LycorisAlgo, LycorisBundleConfig};
 use crate::models::TrainableModel;
@@ -1304,34 +1304,80 @@ impl FluxModel {
         // `flux1_dit.rs::build_rope_2d`).
         let (cos, sin) = Self::build_rope(&all_ids)?;
 
-        // Double blocks
-        // Note: Flux double blocks return (img, txt) — gradient checkpointing
-        // via flame_core::AutogradContext::checkpoint() returns a single Tensor,
-        // so we'd need to fuse along a fresh axis to checkpoint. Left as a
-        // future optimization — VRAM headroom is gained via the BlockOffloader
-        // (per-block weight streaming) instead.
+        // Double blocks. Checkpointing fuses the image/text streams into one
+        // tensor because flame-core checkpoint returns a single Tensor. For
+        // block-offload runs the closure stages and evicts the block itself so
+        // backward recompute sees the same weights after the eager forward has
+        // cleared the resident block slot.
         let (mut img, mut txt) = (img, txt);
+        let use_checkpoint = self.config.gradient_checkpointing == GradientCheckpointing::On;
         for i in 0..NUM_DOUBLE {
-            // BlockOffloader: stream block i from pinned host RAM into GPU slot.
-            if let Some(ref off) = self.offloader {
-                let arc = off
-                    .lock()
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .ensure_block(i)
-                    .map_err(|e| {
-                        crate::EriDiffusionError::Model(format!("offloader ensure_block({i}): {e}"))
+            if use_checkpoint {
+                let img_len = img.shape().dims()[1];
+                let txt_len = txt.shape().dims()[1];
+                let img_c = img.clone();
+                let txt_c = txt.clone();
+                let vec_c = vec.clone();
+                let cos_c = cos.clone();
+                let sin_c = sin.clone();
+                let self_ptr = self as *mut FluxModel as usize;
+
+                let block_out =
+                    flame_core::autograd::AutogradContext::checkpoint(&[img_c.clone(), txt_c.clone()], move || {
+                        // The closure is consumed within the same train step.
+                        // Use the live model so LoRA leaves and the block
+                        // offloader remain shared with the outer trainer state.
+                        let model = unsafe { &mut *(self_ptr as *mut FluxModel) };
+                        if let Some(ref off) = model.offloader {
+                            let arc = off
+                                .lock()
+                                .map_err(|e| flame_core::Error::InvalidInput(format!("offloader lock: {e}")))?
+                                .ensure_block(i)
+                                .map_err(|e| flame_core::Error::InvalidInput(format!("offloader ensure_block({i}): {e}")))?;
+                            model.double_block_weights[i] = (*arc).clone();
+                        }
+                        let result = model
+                            .double_block_forward(&img_c, &txt_c, &vec_c, &cos_c, &sin_c, i)
+                            .map_err(|e| flame_core::Error::InvalidInput(format!("{e}")));
+                        if let Some(ref off) = model.offloader {
+                            model.double_block_weights[i].clear();
+                            off.lock()
+                                .map_err(|e| flame_core::Error::InvalidInput(format!("offloader lock: {e}")))?
+                                .evict_block();
+                        }
+                        let (ni, nt) = result?;
+                        Tensor::cat(&[&ni, &nt], 1)
                     })?;
-                self.double_block_weights[i] = (*arc).clone();
+                img = block_out.narrow(1, 0, img_len)?;
+                txt = block_out.narrow(1, img_len, txt_len)?;
+            } else {
+                // BlockOffloader: stream block i from pinned host RAM into GPU slot.
+                if let Some(ref off) = self.offloader {
+                    let arc = off
+                        .lock()
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
+                        .ensure_block(i)
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "offloader ensure_block({i}): {e}"
+                            ))
+                        })?;
+                    self.double_block_weights[i] = (*arc).clone();
+                }
+                let (ni, nt) = self.double_block_forward(&img, &txt, &vec, &cos, &sin, i)?;
+                if let Some(ref off) = self.offloader {
+                    self.double_block_weights[i].clear();
+                    off.lock()
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
+                        .evict_block();
+                }
+                img = ni;
+                txt = nt;
             }
-            let (ni, nt) = self.double_block_forward(&img, &txt, &vec, &cos, &sin, i)?;
-            if let Some(ref off) = self.offloader {
-                self.double_block_weights[i].clear();
-                off.lock()
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .evict_block();
-            }
-            img = ni;
-            txt = nt;
         }
 
         // Merge + single blocks. H9: `.contiguous()` after cat — the merged
@@ -1340,24 +1386,57 @@ impl FluxModel {
         let mut merged = Tensor::cat(&[&txt, &img], 1)?.contiguous()?;
         for i in 0..NUM_SINGLE {
             let unified_idx = NUM_DOUBLE + i;
-            if let Some(ref off) = self.offloader {
-                let arc = off
-                    .lock()
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .ensure_block(unified_idx)
-                    .map_err(|e| {
-                        crate::EriDiffusionError::Model(format!(
-                            "offloader ensure_block({unified_idx}): {e}"
-                        ))
-                    })?;
-                self.single_block_weights[i] = (*arc).clone();
-            }
-            merged = self.single_block_forward(&merged, &vec, &cos, &sin, n_txt, i)?;
-            if let Some(ref off) = self.offloader {
-                self.single_block_weights[i].clear();
-                off.lock()
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .evict_block();
+            if use_checkpoint {
+                let merged_c = merged.clone();
+                let vec_c = vec.clone();
+                let cos_c = cos.clone();
+                let sin_c = sin.clone();
+                let self_ptr = self as *mut FluxModel as usize;
+                merged = flame_core::autograd::AutogradContext::checkpoint(&[merged_c.clone()], move || {
+                    let model = unsafe { &mut *(self_ptr as *mut FluxModel) };
+                    if let Some(ref off) = model.offloader {
+                        let arc = off
+                            .lock()
+                            .map_err(|e| flame_core::Error::InvalidInput(format!("offloader lock: {e}")))?
+                            .ensure_block(unified_idx)
+                            .map_err(|e| flame_core::Error::InvalidInput(format!("offloader ensure_block({unified_idx}): {e}")))?;
+                        model.single_block_weights[i] = (*arc).clone();
+                    }
+                    let result = model
+                        .single_block_forward(&merged_c, &vec_c, &cos_c, &sin_c, n_txt, i)
+                        .map_err(|e| flame_core::Error::InvalidInput(format!("{e}")));
+                    if let Some(ref off) = model.offloader {
+                        model.single_block_weights[i].clear();
+                        off.lock()
+                            .map_err(|e| flame_core::Error::InvalidInput(format!("offloader lock: {e}")))?
+                            .evict_block();
+                    }
+                    result
+                })?;
+            } else {
+                if let Some(ref off) = self.offloader {
+                    let arc = off
+                        .lock()
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
+                        .ensure_block(unified_idx)
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!(
+                                "offloader ensure_block({unified_idx}): {e}"
+                            ))
+                        })?;
+                    self.single_block_weights[i] = (*arc).clone();
+                }
+                merged = self.single_block_forward(&merged, &vec, &cos, &sin, n_txt, i)?;
+                if let Some(ref off) = self.offloader {
+                    self.single_block_weights[i].clear();
+                    off.lock()
+                        .map_err(|e| {
+                            crate::EriDiffusionError::Model(format!("offloader lock: {e}"))
+                        })?
+                        .evict_block();
+                }
             }
         }
 
