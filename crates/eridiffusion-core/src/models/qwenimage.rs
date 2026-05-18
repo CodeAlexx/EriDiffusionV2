@@ -1078,9 +1078,10 @@ impl QwenImageTrainingModel {
             //     per block instead of using captured handles. Slower but
             //     fits in 24 GB GPU.
             //
-            // Outer prefetch primes block 0. Subsequent prefetches happen
-            // after each block forward returns (so the next block's H2D
-            // overlaps with the autograd bookkeeping for this one).
+            // Outer prefetch primes block 0. Training prefetches the next
+            // block from inside the checkpoint body after cloning the current
+            // block weights, so the next H2D transfer can overlap current
+            // block compute instead of waiting for the block to finish.
             {
                 let mut g = offloader_arc
                     .lock()
@@ -1146,9 +1147,14 @@ impl QwenImageTrainingModel {
                     img = new_img;
                     txt = new_txt;
                 } else {
-                    // Training path — unchanged from pre-port behavior.
-                    let img_c = img.clone();
-                    let txt_c = txt.clone();
+                    // Training path: checkpointed recompute with owned block
+                    // weights so offloader slots can be reused safely.
+                    // Block 0 enters checkpointing from frozen input projections,
+                    // so its inputs may not already require grad. Mark the
+                    // checkpoint leaves as grad-carrying so recompute fallback
+                    // still returns the block-0 adapter gradients.
+                    let img_c = img.clone().requires_grad_(true);
+                    let txt_c = txt.clone().requires_grad_(true);
                     let temb_c = temb.clone();
                     let ic = img_cos.clone();
                     let is_ = img_sin.clone();
@@ -1173,6 +1179,20 @@ impl QwenImageTrainingModel {
                             let weights = clone_block_weights(&raw)?;
                             drop(raw);
 
+                            if i + 1 < n_blocks {
+                                let mut g = off_clone.lock().map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!(
+                                        "offloader lock: {e}"
+                                    ))
+                                })?;
+                                g.prefetch_block(i + 1).map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!(
+                                        "prefetch {}: {e}",
+                                        i + 1
+                                    ))
+                                })?;
+                            }
+
                             bundle_c.refresh_caches();
                             let (new_img, new_txt) = dual_stream_block_standalone(
                                 &img_c, &txt_c, &temb_c, i, &ic, &is_, &tc, &ts, &weights,
@@ -1181,15 +1201,6 @@ impl QwenImageTrainingModel {
                             Tensor::cat(&[&new_img, &new_txt], 1)
                         },
                     )?;
-
-                    if i + 1 < n_blocks {
-                        let mut g = offloader_arc.lock().map_err(|e| {
-                            flame_core::Error::InvalidInput(format!("offloader lock: {e}"))
-                        })?;
-                        g.prefetch_block(i + 1).map_err(|e| {
-                            flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1))
-                        })?;
-                    }
 
                     let img_seq_len = img.shape().dims()[1];
                     let txt_seq_len = txt.shape().dims()[1];
@@ -1472,8 +1483,10 @@ impl QwenImageTrainingModel {
                         })?;
                     }
                 } else {
-                    let img_c = img.clone();
-                    let txt_c = txt.clone();
+                    // Keep first-block adapter grads alive when checkpoint
+                    // offload falls back to recompute.
+                    let img_c = img.clone().requires_grad_(true);
+                    let txt_c = txt.clone().requires_grad_(true);
                     let img_temb_c = img_temb.clone();
                     let txt_temb_c = temb_base.clone();
                     let ic = img_cos.clone();
@@ -1499,6 +1512,20 @@ impl QwenImageTrainingModel {
                             };
                             let weights = clone_block_weights(&raw)?;
                             drop(raw);
+
+                            if i + 1 < n_blocks {
+                                let mut g = off_clone.lock().map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!(
+                                        "offloader lock: {e}"
+                                    ))
+                                })?;
+                                g.prefetch_block(i + 1).map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!(
+                                        "prefetch {}: {e}",
+                                        i + 1
+                                    ))
+                                })?;
+                            }
 
                             bundle_c.refresh_caches();
                             let (new_img, new_txt) = if use_zero_cond_t {
@@ -1533,15 +1560,6 @@ impl QwenImageTrainingModel {
                             Tensor::cat(&[&new_img, &new_txt], 1)
                         },
                     )?;
-
-                    if i + 1 < n_blocks {
-                        let mut g = offloader_arc.lock().map_err(|e| {
-                            flame_core::Error::InvalidInput(format!("offloader lock: {e}"))
-                        })?;
-                        g.prefetch_block(i + 1).map_err(|e| {
-                            flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1))
-                        })?;
-                    }
 
                     let img_seq_len = img.shape().dims()[1];
                     let txt_seq_len = txt.shape().dims()[1];

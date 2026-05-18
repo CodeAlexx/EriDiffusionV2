@@ -1136,12 +1136,9 @@ fn main() -> anyhow::Result<()> {
         // (after the first optimizer step has moved them off zero) is the
         // earliest meaningful check.
         if step == 1 {
-            let names = model.bundle.parameter_names();
-            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = names
-                .iter()
-                .zip(params.iter())
-                .map(|(n, p)| (n.as_str(), p))
-                .collect();
+            let named = qwen_named_parameters(&model);
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
             let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
             if report.is_clean() {
                 log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
@@ -1163,12 +1160,16 @@ fn main() -> anyhow::Result<()> {
         // the non-finite tensor's update for that step.
         let mut nan_skipped = 0usize;
         let mut nan_names: Vec<String> = Vec::new();
-        let names = if step == 0 || step % 100 == 99 {
-            Some(model.bundle.parameter_names())
+        let names_by_id = if step == 0 || step % 100 == 99 {
+            let mut names = std::collections::HashMap::new();
+            for (name, param) in qwen_named_parameters(&model) {
+                names.insert(param.id(), name);
+            }
+            Some(names)
         } else {
             None
         };
-        for (i, param) in params.iter().enumerate() {
+        for param in params.iter() {
             if let Some(g) = grads.get(param.id()) {
                 let g = if g.dtype() == DType::F32 {
                     g.clone()
@@ -1179,8 +1180,8 @@ fn main() -> anyhow::Result<()> {
                 let any_bad = g_vec.iter().any(|x| !x.is_finite());
                 if any_bad {
                     nan_skipped += 1;
-                    if let Some(ref ns) = names {
-                        if let Some(n) = ns.get(i) {
+                    if let Some(ref ns) = names_by_id {
+                        if let Some(n) = ns.get(&param.id()) {
                             nan_names.push(n.clone());
                         }
                     }
@@ -1192,7 +1193,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         if nan_skipped > 0 {
-            if let Some(_) = names {
+            if names_by_id.is_some() {
                 log::warn!(
                     "[grad-guard] step={} zeroed {} non-finite-grad params: {:?}",
                     step + 1,
