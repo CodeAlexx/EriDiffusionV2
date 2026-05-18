@@ -676,64 +676,36 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Activation offload pool — sized for 24 GB GPU + 62 GB system after
-    // accounting for BlockOffloader's ~38 GB pinned weights. Headroom for
-    // the activation pool is ~22 GB pinned.
-    //
-    // Per-slot size (BF16): max_seq * MLP_HIDDEN * 2
-    //   max_seq = pack_h * pack_w + 512 = 1024 + 512 = 1536 at 512²
-    //   slot = 1536 * 12288 * 2 = ~38 MB
-    //
-    // Budget: 8 slots/block × 60 blocks + 32 buffer = 512 slots total.
-    //   No compression: 512 × 38 MB ≈ 19 GB pinned.
-    //   FP8 compression: ~9.5 GB pinned (effectively 1024-slot equivalent).
-    //
-    // Saved tensors that don't fit auto-fall-back to recompute via the
-    // graceful path (autograd.rs:1795) — slower but no crash. The chroma
-    // pattern's slots_per_block=130 was 16× over budget and OOM'd 62 GB
-    // system RAM hard last attempt.
-    {
-        use eridiffusion_core::training::offload::{setup_activation_offload, OffloadConfig};
-        use flame_core::activation_offload::OffloadCompression;
+    // Qwen uses boundary checkpointing in qwenimage.rs: only block inputs are
+    // pushed to a grow-on-demand activation cache, then backward pulls them
+    // and recomputes the block. This mirrors OneTrainer's conductor model
+    // more closely than the legacy sub-tape pool, which tried to offload
+    // hundreds of internal saved tensors per block and fell back after pool
+    // exhaustion, paying an extra forward pass before the real checkpoint.
+    let _activation_cache = {
+        use eridiffusion_core::training::offload::setup_grow_activation_cache;
         let pack_h = args.resolution / 8 / 2;
         let pack_w = args.resolution / 8 / 2;
         let max_seq = pack_h * pack_w + 512;
-        let max_activation_bytes = max_seq * qwen_model::MLP_HIDDEN * 2;
-        // FP8 mode allocates per-slot **GPU** staging buffers for the
-        // quant kernel (activation_offload.rs:367). Each slot costs:
-        //   pinned: max_bytes/2 (FP8) ≈ 19 MB
-        //   GPU staging: max_bytes (BF16) ≈ 38 MB
-        //
-        // Closure-capture leak fix in qwenimage.rs freed the previous
-        // ~38 GB of weight-Arc GPU pressure, so we can fit a bigger pool
-        // now. Bumped from 4→8 slots/block for ~2× more offload coverage:
-        //   512 slots × 38 MB GPU staging ≈ 19 GB GPU
-        //   512 slots × 19 MB pinned       ≈ 10 GB pinned
-        // BlockOffloader 2 blocks GPU = 1.3 GB, leaves ~3-4 GB GPU for
-        // activations / LoRA state. Tight but workable on 24 GB.
-        // If this OOMs, drop back to 4. If it doesn't OOM and pool still
-        // fills (warns about exhaustion), try 12.
-        let slots_per_block = 8;
-        let total_slots = qwen_model::NUM_LAYERS * slots_per_block + 32;
-        let cfg = OffloadConfig {
-            num_blocks: qwen_model::NUM_LAYERS,
-            max_activation_bytes,
-            // FP8 compression halves pinned bytes per slot. Saved tensor
-            // values are 8-bit quant on push, dequant on pop. Roughly 2x
-            // effective slot count vs None at the same pinned budget.
-            compression: OffloadCompression::FP8,
-            extra_slots: total_slots - qwen_model::NUM_LAYERS,
-        };
-        match setup_activation_offload(&device, &cfg) {
-            Ok((slots, bytes)) => log::info!(
-                "[activation_offload] {slots} slots, {:.1} GB pinned (FP8), slot={:.1}MB raw",
-                bytes as f64 / 1e9, max_activation_bytes as f64 / 1e6
-            ),
-            Err(e) => log::warn!(
-                "[activation_offload] setup failed ({e}); falling back to recompute checkpoint (slower)"
-            ),
+        let boundary_bytes_per_block = max_seq * qwen_model::DIM * 2;
+        let slab_bytes = 1usize << 30;
+        match setup_grow_activation_cache(&device, slab_bytes) {
+            Ok(cache) => {
+                log::info!(
+                    "[activation_offload] grow cache installed (slab={} MB, boundary≈{:.1}MB/block)",
+                    slab_bytes / (1024 * 1024),
+                    boundary_bytes_per_block as f64 / 1e6
+                );
+                Some(cache)
+            }
+            Err(e) => {
+                log::warn!(
+                    "[activation_offload] grow cache setup failed ({e}); falling back to plain checkpoint"
+                );
+                None
+            }
         }
-    }
+    };
     let params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors", params.len());
     if params.is_empty() {

@@ -1078,10 +1078,10 @@ impl QwenImageTrainingModel {
             //     per block instead of using captured handles. Slower but
             //     fits in 24 GB GPU.
             //
-            // Outer prefetch primes block 0. Training prefetches the next
-            // block from inside the checkpoint body after cloning the current
-            // block weights, so the next H2D transfer can overlap current
-            // block compute instead of waiting for the block to finish.
+            // Outer prefetch primes block 0. Training uses boundary
+            // checkpointing and scoped block handles, so the closure can
+            // prefetch forward on the first pass and backward on checkpoint
+            // replay without cloning an entire block's weights.
             {
                 let mut g = offloader_arc
                     .lock()
@@ -1147,8 +1147,13 @@ impl QwenImageTrainingModel {
                     img = new_img;
                     txt = new_txt;
                 } else {
-                    // Training path: checkpointed recompute with owned block
-                    // weights so offloader slots can be reused safely.
+                    // Training path: checkpointed recompute with scoped block
+                    // handles. The handle records compute_done when dropped,
+                    // letting the next prefetch reuse a slot via GPU events
+                    // instead of a host-side device sync. Boundary
+                    // checkpointing stores only block I/O, matching the
+                    // OneTrainer conductor pattern more closely than
+                    // sub-tape activation offload.
                     // Block 0 enters checkpointing from frozen input projections,
                     // so its inputs may not already require grad. Mark the
                     // checkpoint leaves as grad-carrying so recompute fallback
@@ -1163,39 +1168,61 @@ impl QwenImageTrainingModel {
                     let bundle_c = self.bundle.clone();
                     let off_clone = offloader_arc.clone();
 
-                    let block_out = flame_core::autograd::AutogradContext::checkpoint_offload(
+                    let block_out = flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
                         &[img_c.clone(), txt_c.clone()],
-                        move || {
-                            let raw = {
+                        move |inputs: &[Tensor]| {
+                            let img_in = inputs[0].clone();
+                            let txt_in = inputs[1].clone();
+                            let is_recompute =
+                                flame_core::autograd::AutogradContext::is_checkpoint_recompute();
+                            let handle = {
                                 let mut g = off_clone.lock().map_err(|e| {
                                     flame_core::Error::InvalidInput(format!(
                                         "offloader lock (block {i}): {e}"
                                     ))
                                 })?;
-                                g.await_block(i).map_err(|e| {
-                                    flame_core::Error::InvalidInput(format!("await block {i}: {e}"))
-                                })?
+                                let has_layer_policy = g.has_layer_offload_policy();
+                                if has_layer_policy {
+                                    g.plan_layer_access(i, !is_recompute, false).map_err(|e| {
+                                        flame_core::Error::InvalidInput(format!(
+                                            "plan layer {i}: {e}"
+                                        ))
+                                    })?;
+                                }
+                                let handle = g.await_block_handle(i).map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!(
+                                        "await block handle {i}: {e}"
+                                    ))
+                                })?;
+                                if !has_layer_policy {
+                                    let next = if is_recompute {
+                                        i.checked_sub(1)
+                                    } else if i + 1 < n_blocks {
+                                        Some(i + 1)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(next_idx) = next {
+                                        g.prefetch_block(next_idx).map_err(|e| {
+                                            flame_core::Error::InvalidInput(format!(
+                                                "prefetch {next_idx}: {e}"
+                                            ))
+                                        })?;
+                                    }
+                                }
+                                handle
                             };
-                            let weights = clone_block_weights(&raw)?;
-                            drop(raw);
-
-                            if i + 1 < n_blocks {
-                                let mut g = off_clone.lock().map_err(|e| {
-                                    flame_core::Error::InvalidInput(format!(
-                                        "offloader lock: {e}"
-                                    ))
-                                })?;
-                                g.prefetch_block(i + 1).map_err(|e| {
-                                    flame_core::Error::InvalidInput(format!(
-                                        "prefetch {}: {e}",
-                                        i + 1
-                                    ))
-                                })?;
-                            }
-
                             bundle_c.refresh_caches();
                             let (new_img, new_txt) = dual_stream_block_standalone(
-                                &img_c, &txt_c, &temb_c, i, &ic, &is_, &tc, &ts, &weights,
+                                &img_in,
+                                &txt_in,
+                                &temb_c,
+                                i,
+                                &ic,
+                                &is_,
+                                &tc,
+                                &ts,
+                                handle.weights(),
                                 &bundle_c,
                             )?;
                             Tensor::cat(&[&new_img, &new_txt], 1)
@@ -1484,7 +1511,7 @@ impl QwenImageTrainingModel {
                     }
                 } else {
                     // Keep first-block adapter grads alive when checkpoint
-                    // offload falls back to recompute.
+                    // replay recomputes from frozen input projections.
                     let img_c = img.clone().requires_grad_(true);
                     let txt_c = txt.clone().requires_grad_(true);
                     let img_temb_c = img_temb.clone();
@@ -1497,41 +1524,55 @@ impl QwenImageTrainingModel {
                     let off_clone = offloader_arc.clone();
                     let use_zero_cond_t = zero_cond_t;
 
-                    let block_out = flame_core::autograd::AutogradContext::checkpoint_offload(
+                    let block_out = flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
                         &[img_c.clone(), txt_c.clone()],
-                        move || {
-                            let raw = {
+                        move |inputs: &[Tensor]| {
+                            let img_in = inputs[0].clone();
+                            let txt_in = inputs[1].clone();
+                            let is_recompute =
+                                flame_core::autograd::AutogradContext::is_checkpoint_recompute();
+                            let handle = {
                                 let mut g = off_clone.lock().map_err(|e| {
                                     flame_core::Error::InvalidInput(format!(
                                         "offloader lock (block {i}): {e}"
                                     ))
                                 })?;
-                                g.await_block(i).map_err(|e| {
-                                    flame_core::Error::InvalidInput(format!("await block {i}: {e}"))
-                                })?
+                                let has_layer_policy = g.has_layer_offload_policy();
+                                if has_layer_policy {
+                                    g.plan_layer_access(i, !is_recompute, false).map_err(|e| {
+                                        flame_core::Error::InvalidInput(format!(
+                                            "plan layer {i}: {e}"
+                                        ))
+                                    })?;
+                                }
+                                let handle = g.await_block_handle(i).map_err(|e| {
+                                    flame_core::Error::InvalidInput(format!(
+                                        "await block handle {i}: {e}"
+                                    ))
+                                })?;
+                                if !has_layer_policy {
+                                    let next = if is_recompute {
+                                        i.checked_sub(1)
+                                    } else if i + 1 < n_blocks {
+                                        Some(i + 1)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(next_idx) = next {
+                                        g.prefetch_block(next_idx).map_err(|e| {
+                                            flame_core::Error::InvalidInput(format!(
+                                                "prefetch {next_idx}: {e}"
+                                            ))
+                                        })?;
+                                    }
+                                }
+                                handle
                             };
-                            let weights = clone_block_weights(&raw)?;
-                            drop(raw);
-
-                            if i + 1 < n_blocks {
-                                let mut g = off_clone.lock().map_err(|e| {
-                                    flame_core::Error::InvalidInput(format!(
-                                        "offloader lock: {e}"
-                                    ))
-                                })?;
-                                g.prefetch_block(i + 1).map_err(|e| {
-                                    flame_core::Error::InvalidInput(format!(
-                                        "prefetch {}: {e}",
-                                        i + 1
-                                    ))
-                                })?;
-                            }
-
                             bundle_c.refresh_caches();
                             let (new_img, new_txt) = if use_zero_cond_t {
                                 dual_stream_block_standalone_2511(
-                                    &img_c,
-                                    &txt_c,
+                                    &img_in,
+                                    &txt_in,
                                     &img_temb_c,
                                     &txt_temb_c,
                                     i,
@@ -1540,20 +1581,20 @@ impl QwenImageTrainingModel {
                                     &tc,
                                     &ts,
                                     target_seq,
-                                    &weights,
+                                    handle.weights(),
                                     &bundle_c,
                                 )?
                             } else {
                                 dual_stream_block_standalone(
-                                    &img_c,
-                                    &txt_c,
+                                    &img_in,
+                                    &txt_in,
                                     &img_temb_c,
                                     i,
                                     &ic,
                                     &is_,
                                     &tc,
                                     &ts,
-                                    &weights,
+                                    handle.weights(),
                                     &bundle_c,
                                 )?
                             };
@@ -2266,16 +2307,6 @@ impl QwenImageTrainingModel {
 // ---------------------------------------------------------------------------
 // Block offload helpers
 // ---------------------------------------------------------------------------
-
-/// Clone all tensors from a block weight map — BlockOffloader reuses GPU slots,
-/// so we must own the data before the next block is loaded.
-fn clone_block_weights(raw: &HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
-    let mut out = HashMap::with_capacity(raw.len());
-    for (key, t) in raw {
-        out.insert(key.clone(), t.clone_result()?);
-    }
-    Ok(out)
-}
 
 /// Standalone dual-stream block using explicit weight map (for BlockOffloader path).
 /// Keys in `weights` are full paths like `transformer_blocks.{i}.attn.to_q.weight`.
