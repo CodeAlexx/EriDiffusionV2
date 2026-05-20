@@ -1,7 +1,7 @@
 # HiDream-O1 Trainer Status
 
 **Last updated:** 2026-05-20
-**State:** usable with scaled weights-only export; raw full-strength O1 LoRA export still needs deeper parity work.
+**State:** usable with scaled weights-only export validated from the committed trainer at 256 and 800 steps; raw full-strength O1 LoRA export still needs deeper parity work.
 
 ## Current Launch Defaults
 
@@ -62,29 +62,49 @@ Runs used `/home/alex/1/datasets/gigerver3` and HiDream-O1 Dev weights.
 | Run | Result |
 |---|---|
 | x0, 768 steps, resident heads, F32 LoRA | Selected loss stable: avg `0.1093`, max `0.6438`, grad max `1.0359`, no clamps. Full-strength render was still flat purple/gray. |
-| velocity, 256 steps, resident heads, F32 LoRA | Raw velocity spikes reproduced: max `4.0579`; diagnostic x0 stayed small: max `0.6446`. Full-strength render was flat gray. |
-| same velocity LoRA, B tensors scaled by `0.25` at export | Render became clean and valid with the same Rust O1 sampler. |
+| velocity, 256 steps, resident heads, F32 LoRA, committed `--export-scale 0.25` | Raw velocity spikes reproduced: max `4.0579`, avg `0.2887`; export rendered clean and valid with the same Rust O1 sampler. |
+| velocity, 800 steps, resident heads, F32 LoRA, committed `--export-scale 0.25` | Completed in `41:34` at about `3.1 s/step`; avg velocity loss `0.3118`, max raw velocity loss `12.0565`, avg x0 loss `0.1090`, max x0 loss `0.6446`, grad max `7.4430`, no clamps. Export rendered clean and valid with the same Rust O1 sampler. |
 | downloaded public O1 LoRA at full strength | Rendered valid with the same Rust O1 loader and sampler. |
 
-The key artifact from the successful strength test is:
+The fresh 800-step trainer artifact is:
 
 ```text
-/home/alex/EriDiffusion/inference-flame/output/o1_velocity_validation_20260520/lora_velocity_resident_256_Bscale025_seed42.png
+/home/alex/EriDiffusion/EriDiffusion-v2/output/hidream_o1_gigerver3_velocity_resident_800_rerun_20260520/hidream_o1_lora_800steps.safetensors
 ```
 
-The same unscaled checkpoint rendered flat gray:
+It rendered cleanly through Flame O1 inference at:
 
 ```text
-/home/alex/EriDiffusion/inference-flame/output/o1_velocity_validation_20260520/lora_velocity_resident_256_seed42.png
+/home/alex/EriDiffusion/inference-flame/output/o1_800_rerun_20260520/velocity_800_exportscale025_seed42.png
 ```
 
-That means the O1 loader/sampler can apply a valid full-strength public LoRA, and our trained LoRA becomes usable when exported at the measured safe scale. This does not fully explain why raw EDV2 O1 weights are overpowered versus the public LoRA; it makes the trainer output usable while leaving a clear parity target.
+Hashes from that validation:
+
+```text
+LoRA: 2b8e9e938ff8495fe52341899bc0fb0e8e96c1595b81afbded69ce67a28e5df7
+PNG:  cd0d31351db4b4dcc7048bc78ffbebef9c67e69499692ddd398fed1fd211b54e
+```
+
+That means the O1 loader/sampler can apply a valid full-strength public LoRA, and a LoRA produced by the committed EDV2 trainer renders cleanly when exported at the measured safe scale. This does not fully explain why raw EDV2 O1 weights are overpowered versus the public LoRA; it makes the trainer output usable while leaving a clear parity target.
+
+The earlier 256-step committed validation remains useful for quick repro:
+
+```text
+LoRA: /home/alex/EriDiffusion/EriDiffusion-v2/output/hidream_o1_gigerver3_velocity_resident_256_validrun_20260520/hidream_o1_lora_256steps.safetensors
+PNG:  /home/alex/EriDiffusion/inference-flame/output/o1_validrun_20260520/velocity_256_exportscale025_seed42.png
+```
 
 ## Memory And Speed Notes
 
 The 768-step x0 run did not show a runaway host leak. Host RSS stayed around 15.4 GB. VRAM high-water moved from about 10.9 GB to about 12.1 GB and then plateaued.
 
-O1 512 training measured around 3.1-3.5 s/step with flame-core block offload and boundary checkpointing. That is slower than Klein because O1 recomputes all 36 Qwen decoder blocks during backward. Retuning only the offloader window is not expected to reach Klein step time; future speed work should reduce checkpoint coverage where memory allows or add a no-recompute activation/sub-tape offload path.
+The 800-step velocity run also did not show a runaway host leak. Host RSS stayed around 15.4 GB. VRAM moved from about 10.7 GB to `11202 MiB` and then plateaued for the rest of the run.
+
+O1 512 training measured around 3.1 s/step after warmup with flame-core block offload and boundary checkpointing. The fresh 800-step validation held that rate through completion.
+
+This is not currently an H2D miss problem. The model path keeps only a resident block window and wraps every Qwen decoder block in `checkpoint_offload_boundary`, so backward replays all 36 blocks. AI-toolkit's O1 path uses PyTorch/HF checkpointing, and when not in `low_vram` layer-offload mode it keeps the transformer resident on GPU. If an AI-toolkit O1 run is near 1 s/step, it is almost certainly measuring a higher-memory resident/quantized PyTorch path, not the conservative Flame block-streaming path.
+
+Retuning only the offloader window is not expected to reach that step time. Future speed work should add a high-memory O1 training mode that reduces checkpoint coverage where VRAM allows, or implement true no-recompute activation/sub-tape offload.
 
 ## Reproduce Current Recommended Run
 
@@ -94,7 +114,7 @@ cd /home/alex/EriDiffusion/EriDiffusion-v2
 LD_LIBRARY_PATH=/home/alex/libtorch-cu124/libtorch/lib:$LD_LIBRARY_PATH \
 RUST_LOG=info FLAME_ASSERT_GRAD_FLOW=1 \
 ./target/release/train_hidream_o1 \
-  --cache-dir cache/hidream_o1_gigerver3_512 \
+  --cache-dir cache/gigerver3_hidream_o1_512_mropefix \
   --model-path /home/alex/HiDream-O1-Image-Dev-weights \
   --output-dir output/hidream_o1_gigerver3 \
   --steps 768 \

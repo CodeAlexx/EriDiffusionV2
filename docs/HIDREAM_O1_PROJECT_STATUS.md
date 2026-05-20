@@ -1,7 +1,7 @@
 # HiDream-O1 Project Status
 
 **Updated:** 2026-05-20
-**Phase:** O1 trainer launch fix landed; deeper raw-weight parity remains open.
+**Phase:** O1 trainer launch fix landed and freshly validated at 256 and 800 steps; deeper raw-weight parity remains open.
 
 ## Scope
 
@@ -41,14 +41,27 @@ resident-head F32 LoRA training + weights-only export_scale=0.25
 
 `--export-scale` scales B matrices only in the exported safetensors. Full checkpoints stay raw for resume.
 
+The 800-step validation proved the spike diagnosis directly: max velocity loss was `12.0565`, but the corresponding x0 loss was only `0.008483` at sigma `0.0265`. The exported LoRA still rendered a clean image through Flame O1 inference.
+
 ## Validated Artifacts
 
 | Artifact | Meaning |
 |---|---|
 | `output/hidream_o1_gigerver3_x0_resident_768_20260520/hidream_o1_lora_768steps.safetensors` | Stable x0 training metrics, but full-strength render was flat. |
-| `output/hidream_o1_gigerver3_velocity_resident_256_20260520/hidream_o1_lora_256steps.safetensors` | Velocity spikes reproduced; unscaled full-strength render was flat. |
-| `output/hidream_o1_gigerver3_velocity_resident_256_20260520/hidream_o1_lora_256steps_Bscale025.safetensors` | Manual precursor to the new `--export-scale 0.25` behavior; rendered valid. |
+| `output/hidream_o1_gigerver3_velocity_resident_256_validrun_20260520/hidream_o1_lora_256steps.safetensors` | Fresh committed-trainer run with `--export-scale 0.25`; rendered valid. |
+| `output/hidream_o1_gigerver3_velocity_resident_800_rerun_20260520/hidream_o1_lora_800steps.safetensors` | 800-step committed-trainer run with `--export-scale 0.25`; rendered valid. |
+| `inference-flame/output/o1_validrun_20260520/velocity_256_exportscale025_seed42.png` | Clean render from the fresh committed-trainer LoRA. |
+| `inference-flame/output/o1_800_rerun_20260520/velocity_800_exportscale025_seed42.png` | Clean render from the 800-step committed-trainer LoRA. |
 | `inference-flame/output/o1_velocity_validation_20260520/known_good_steampunk_gigver_prompt_seed42.png` | Public O1 LoRA rendered valid at full strength, so Flame O1 LoRA loading is not generally broken. |
+
+Fresh 800-step validation hashes:
+
+```text
+LoRA: 2b8e9e938ff8495fe52341899bc0fb0e8e96c1595b81afbded69ce67a28e5df7
+PNG:  cd0d31351db4b4dcc7048bc78ffbebef9c67e69499692ddd398fed1fd211b54e
+```
+
+The LoRA metadata has `ss_training_comment = edv2 trainer`, `edv2.export_scale = 0.25`, and no `ai-toolkit` / `aitoolkit` strings.
 
 ## Code Decisions
 
@@ -63,8 +76,10 @@ resident-head F32 LoRA training + weights-only export_scale=0.25
 
 O1 training uses the flame-core `BlockOffloader` path and `checkpoint_offload_boundary` around decoder blocks. Flame docs now record that this buys memory headroom but still recomputes the 36 Qwen decoder blocks during backward, so O1 should not be expected to match Klein speed until checkpoint coverage or activation offload changes.
 
+The observed EDV2 O1 rate is about 3.1 s/step at 512 after warmup. The 800-step run took `41:34`, with host RSS flat around 15.4 GB and VRAM plateaued at `11202 MiB`. AI-toolkit's O1 implementation uses PyTorch/HF checkpointing and, when not in `low_vram` layer-offload mode, keeps the transformer resident on GPU. A near-1 s/step AI-toolkit O1 run is therefore not apples-to-apples against EDV2's conservative BF16 block-streaming path.
+
 ## Next Work
 
-1. Run a fresh 768-step O1 job with the new default `--export-scale 0.25`, then render the produced checkpoint directly instead of the manually scaled precursor.
-2. Compare raw EDV2 O1 deltas against the public O1 LoRA per layer to explain why raw full-strength EDV2 output is overpowered.
+1. Compare raw EDV2 O1 deltas against the public O1 LoRA per layer to explain why raw full-strength EDV2 output is overpowered.
+2. Add a high-memory O1 speed probe that reduces checkpoint coverage where VRAM allows.
 3. Keep using x0 telemetry as the main stability signal and velocity telemetry as the parity/debug signal.
