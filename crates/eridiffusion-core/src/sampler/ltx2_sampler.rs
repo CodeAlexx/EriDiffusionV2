@@ -1,6 +1,6 @@
 //! LTX-2 rectified-flow Euler sampler with sequence-length-dependent
 //! shift schedule. Mirrors `CustomFlowMatchEulerDiscreteScheduler`
-//! (ai-toolkit) and `LTX2Scheduler` (musubi).
+//! (edv2-reference) and `LTX2Scheduler` (musubi).
 //!
 //! ## Math (T2V):
 //! - Forward noising at train time: `noisy = (1 - sigma) * clean + sigma * noise`
@@ -19,7 +19,7 @@
 //!   `mu = mu.clamp(base_shift, max_shift)`
 //!   then `sigma_shifted = exp(mu) * sigma / (1 + (exp(mu) - 1) * sigma)`
 //!
-//! The `time_shift_type=exponential` mode in ai-toolkit is the same;
+//! The `time_shift_type=exponential` mode in edv2-reference is the same;
 //! `dynamic_shifting=True` means we recompute `mu` per call from the
 //! actual token count.
 
@@ -74,7 +74,7 @@ pub fn euler_step(x: &Tensor, pred: &Tensor, sigma: f32, sigma_next: f32) -> Res
 }
 
 /// Logit-normal timestep sampler used at training (matches musubi's
-/// `shifted_logit_normal` and ai-toolkit's flow scheduler training mode).
+/// `shifted_logit_normal` and edv2-reference's flow scheduler training mode).
 /// Returns a continuous timestep in [0, NUM_TRAIN_TIMESTEPS).
 pub fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng, mu: f32) -> f32 {
     use rand_distr::{Distribution, Normal};

@@ -67,7 +67,7 @@ impl LoRALinear {
     /// Compute LoRA delta: scale * (input @ A^T @ B^T).
     ///
     /// **Currently BF16.** F32 LoRA branch (matching inference-flame /
-    /// ai-toolkit) was attempted 2026-05-04 at rank 16/8/4 — all OOM ERNIE
+    /// edv2-reference) was attempted 2026-05-04 at rank 16/8/4 — all OOM ERNIE
     /// training at step 0 even with FLAME_ALLOC_POOL=0. Each `to_dtype(F32)`
     /// is autograd-retained for backward; 252 modules × multiple F32
     /// intermediates per call exceeds 24 GB regardless of rank. Real fix
@@ -119,10 +119,10 @@ impl LoRALinear {
         vec![self.lora_a.clone(), self.lora_b.clone()]
     }
 
-    /// Save in diffusers / PEFT / ai-toolkit convention:
+    /// Save in diffusers / PEFT / edv2-reference convention:
     ///   `<prefix>.lora_A.weight` and `<prefix>.lora_B.weight`
     /// — the `.weight` suffix is what the broader ecosystem expects (HF PEFT,
-    /// diffusers `load_lora_weights`, ai-toolkit, etc.). Without it, every
+    /// diffusers `load_lora_weights`, edv2-reference, etc.). Without it, every
     /// inference-side loader has to special-case "bare suffix" trainers.
     pub fn save_tensors(&self, prefix: &str, out: &mut HashMap<String, Tensor>) -> Result<()> {
         out.insert(format!("{prefix}.lora_A.weight"), self.lora_a.tensor()?);

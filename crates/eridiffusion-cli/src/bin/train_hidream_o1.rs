@@ -22,37 +22,39 @@
 //!
 //! Top-level `_meta.json` carries `format: "hidream-o1-v2"` which we validate.
 //!
-//! ## Training step (aligned to ai-toolkit `HidreamO1Model`, 2026-05-16)
+//! ## Training step (aligned to edv2-reference `HidreamO1Model`, 2026-05-16)
 //!
 //! Source of truth:
-//!   - `ai-toolkit/extensions_built_in/diffusion_models/hidream/hidream_o1_model.py`
+//!   - `edv2-reference/extensions_built_in/diffusion_models/hidream/hidream_o1_model.py`
 //!     `add_noise` (line 48-57) and `get_loss_target` (line 517-521).
-//!   - `ai-toolkit/extensions_built_in/diffusion_models/hidream/src/hidream_o1/pipeline.py`
+//!   - `edv2-reference/extensions_built_in/diffusion_models/hidream/src/hidream_o1/pipeline.py`
 //!     `DEFAULT_NOISE_SCALE = 8.0`, `T_EPS = 0.001`, `PATCH_SIZE = 32`.
 //!
 //! ```text
 //!   noise_scale = 8.0          # DEFAULT_NOISE_SCALE
-//!   t_idx       ~ randint(0, 999)    # ai-toolkit O1 UI default: linear
+//!   u           ~ linspace(1.0, 0.001, 1000)[randint(0, 999)]
+//!   t           = shift * u / (1 + (shift - 1) * u)
 //!   t_eps       = 1e-3         # T_EPS
 //!
-//!   t    = (1000 - t_idx) / 1000
 //!   z    ~ N(0, 1), same shape as patches
 //!   z_s  = z * noise_scale                        # SCALED noise
 //!   x_t  = (1 - t) * patches + t * z_s            # add_noise()
-//!   target = (z_s - patches).detach()             # get_loss_target()
+//!   target = (z_s - patches).detach()             # velocity target, for parity/debug
 //!
 //!   x_pred = model.forward_lora(x_t, ids, pos, mask, ...)  # model emits x0-style
 //!   # Convert model x0-style output to velocity to match `target`. From
 //!   # `hidream_o1_model.py:469-473`:
 //!   pred  = (x_t - x_pred) / max(t, t_eps)         # = z_s - patches if perfect
-//!   loss  = clamp(MSE(pred[image_rows], target), max=1.0)
+//!   # Production training defaults to x0 MSE (`--loss-objective x0`) because
+//!   # velocity MSE is algebraically x0 error weighted by 1 / t^2, which makes
+//!   # low-sigma samples dominate O1 LoRA gradients.
 //! ```
 //!
-//! The conversion `pred = (x_t - x_pred)/t` (in float32) reproduces ai-toolkit's
-//! `get_noise_prediction` exactly, then loss compares the resulting "noise
-//! prediction" to `(z_s - patches)`. This is the **only** loss form that
-//! matches inference at sampling time — inference uses
-//! `v = (x_pred - z)/sigma`, sign-flips for the scheduler.
+//! The conversion `pred = (x_t - x_pred)/t` (in float32) reproduces the
+//! reference Python implementation's
+//! `get_noise_prediction` exactly and is still available as
+//! `--loss-objective velocity` for reference parity.  The default trains the
+//! model's native x0 prediction directly.
 //!
 //! ## Diagnostics
 //!
@@ -61,10 +63,23 @@
 //! `feedback_grad_flow_default_on.md` this should be the default; we surface
 //! it in the doc rather than hard-coding `std::env::set_var` so users can
 //! still opt out for production runs.
+//!
+//! ## Offload/checkpoint speed note (2026-05-20)
+//!
+//! HiDream-O1 now uses the Klein-style flame-core `BlockOffloader` path:
+//! native `[Cout, Cin]` weights, `FLAME_LAYER_OFFLOAD_FRACTION=0.77` by
+//! default, `plan_layer_access` in forward and checkpoint replay, and
+//! `checkpoint_offload_boundary` around each decoder block. A 512 smoke still
+//! measured about 3.5 s/step; widening the resident target to `0.50` did not
+//! materially change it. Future speed work should treat boundary recompute of
+//! all 36 Qwen decoder blocks as the bottleneck and look at partial checkpoint
+//! coverage or true no-recompute activation/sub-tape offload. Retuning the
+//! block-loader window alone is not expected to reach Klein-like step time.
 
 use clap::Parser;
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};
 use eridiffusion_core::training::board::BoardWriter;
+use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use flame_core::parameter::Parameter;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
@@ -77,13 +92,13 @@ use std::path::{Path, PathBuf};
 const SEED: u64 = 42;
 const CLIP_GRAD_NORM: f32 = 1.0;
 const DEFAULT_MODEL_PATH: &str = "/home/alex/HiDream-O1-Image-Dev-weights";
-/// Ai-toolkit `DEFAULT_NOISE_SCALE` (pipeline.py:15). Noise is scaled by this
+/// Reference `DEFAULT_NOISE_SCALE` (pipeline.py:15). Noise is scaled by this
 /// factor in both add_noise and the loss target.
 const NOISE_SCALE: f32 = 8.0;
-/// Ai-toolkit `T_EPS` (pipeline.py:16). Lower bound on `t` (and `1-t`) to
+/// Reference `T_EPS` (pipeline.py:16). Lower bound on `t` (and `1-t`) to
 /// avoid the divide-by-zero in `(x_t - x_pred)/t`.
 const T_EPS_AT: f32 = 1.0e-3;
-/// Ai-toolkit flowmatch scheduler `shift` (hidream_o1_model.py:33-36 +
+/// Reference flowmatch scheduler `shift` (hidream_o1_model.py:33-36 +
 /// `set_train_timesteps`@sampler.py:161). With `use_dynamic_shifting=False`,
 /// the shift mapping is `sigma_shifted = shift * u / (1 + (shift-1) * u)`.
 const FLOW_SHIFT: f32 = 3.0;
@@ -105,23 +120,34 @@ struct Args {
     /// shards + `tokenizer.json`).
     #[arg(long, default_value = DEFAULT_MODEL_PATH)]
     model_path: PathBuf,
-    #[arg(long, default_value = "3000")]
+    #[arg(long, default_value = "768")]
     steps: usize,
     /// Global step offset for LoRA-only resume runs. Example: resume a
     /// step-1000 LoRA with `--start-step 1000 --steps 1000` to continue cache
     /// order and save the final checkpoint as 2000 steps.
     #[arg(long, default_value_t = 0)]
     start_step: usize,
-    /// LoRA rank. Ai-toolkit yaml default: 32 (`train_lora_hidream_48.yaml:26`).
+    /// LoRA rank. Reference yaml default: 32 (`train_lora_hidream_48.yaml:26`).
     #[arg(long, default_value = "32")]
     rank: usize,
-    /// LoRA alpha. Ai-toolkit yaml default: 32 (`train_lora_hidream_48.yaml:27`).
+    /// LoRA alpha. Reference yaml default: 32 (`train_lora_hidream_48.yaml:27`).
     #[arg(long, default_value = "32.0")]
     lora_alpha: f32,
-    /// Learning rate. Ai-toolkit yaml default: 2e-4 (`train_lora_hidream_48.yaml:58`).
-    #[arg(long, default_value = "2e-4")]
+    /// Compatibility flag retained for old scripts. Resident pixel/timestep
+    /// heads are now enabled by default; use `--no-resident-lora` for the old
+    /// transformer-only 504-tensor layout.
+    #[arg(long, default_value_t = false, conflicts_with = "no_resident_lora")]
+    include_resident_lora: bool,
+    /// Disable O1 resident pixel/timestep-head LoRAs and train decoder layers
+    /// only. This is useful for transformer-only parity probes, but the
+    /// known-good public O1 LoRA layout includes these heads.
+    #[arg(long, default_value_t = false, conflicts_with = "include_resident_lora")]
+    no_resident_lora: bool,
+    /// Learning rate. Kept conservative for O1; override explicitly when
+    /// matching a config that uses a higher value.
+    #[arg(long, default_value = "1e-4")]
     lr: f32,
-    /// Save a LoRA checkpoint every N steps (0 = end-only). Ai-toolkit yaml
+    /// Save a LoRA checkpoint every N steps (0 = end-only). Reference yaml
     /// default: 250 (`train_lora_hidream_48.yaml:36` → `save_every: 250`).
     #[arg(long, default_value = "250")]
     save_every: usize,
@@ -133,79 +159,105 @@ struct Args {
     #[arg(long, default_value = "output")]
     output_dir: PathBuf,
     /// `weights` (default — LoRA-only safetensors) or `full` (LoRA + AdamW
-    /// state + step counter).  **`full` is not yet implemented**; passing it
-    /// errors out so the user isn't surprised by silently-degraded checkpoints.
+    /// state + step counter). Full checkpoint state is available only for
+    /// `--optimizer adamw`; other optimizers fail loudly instead of writing a
+    /// checkpoint that looks full but only contains weights.
     #[arg(long, default_value = "weights")]
     save_mode: String,
     /// Resume LoRA weights only.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "resume_full")]
     resume_lora: Option<PathBuf>,
     /// Resume LoRA + AdamW state + step counter.
-    /// TODO(O1-M3.1): wire AdamW state save/load. Until then, passing this
-    /// errors out (BUG-4 fix) rather than silently restarting the optimizer
-    /// state, which would jolt long-resumed runs.
-    #[arg(long)]
+    /// Full AdamW state restore is available only for `--optimizer adamw`.
+    #[arg(long, conflicts_with = "resume_lora")]
     resume_full: Option<PathBuf>,
 
     // ── Training-step knobs ─────────────────────────────────────────────
-    /// Timestep distribution. `linear` is the current ai-toolkit HiDream-O1
-    /// UI default: pick a random scheduler index from linearly-spaced
-    /// timesteps 1000..1. `shift` keeps the older flowmatch shift mapping for
-    /// ablation, and `uniform` keeps the continuous unshifted ablation.
-    #[arg(long, default_value = "linear")]
+    /// Timestep distribution. Default `shift` matches the edv2-reference HiDream-O1
+    /// reference config and the flowmatch scheduler config (`shift=3.0`).
+    /// `linear` and `uniform` are retained only for ablation.
+    #[arg(long, default_value = "shift")]
     timestep_distribution: String,
-    /// Flowmatch shift constant. Ai-toolkit default = 3.0 (per the scheduler
+    /// Flowmatch shift constant. Reference default = 3.0 (per the scheduler
     /// kwargs in `hidream_o1_model.py:32-36`). Only used when
     /// `--timestep-distribution shift`.
     #[arg(long, default_value_t = FLOW_SHIFT)]
     flow_shift: f32,
-    /// Optimizer. Ai-toolkit default = `adamw8bit`
+    /// Optimizer. Reference default = `adamw8bit`
     /// (`train_lora_hidream_48.yaml:57`). HiDream-O1 yaml passes only
     /// `optimizer: "adamw8bit"` and `lr: 2e-4`, no `optimizer_params`. The
     /// downstream `bitsandbytes.optim.AdamW8bit(params, lr, eps=1e-6)` call
-    /// (`ai-toolkit/toolkit/optimizer.py:71`) therefore takes bitsandbytes
+    /// (`edv2-reference/toolkit/optimizer.py:71`) therefore takes bitsandbytes
     /// defaults for betas=(0.9, 0.999) and weight_decay=1e-2; only `eps` is
     /// overridden (`1e-6` instead of the torch `1e-8` default).
     ///
-    /// Default = `adamw` for production safety. The flame-core AdamW8bit
-    /// kernel now matches bitsandbytes 0.49.2 in isolated parity tests, but
-    /// HiDream-O1 still needs end-to-end optimizer parity and the G2 overfit
-    /// gate is unstable with `adamw8bit` selected. Keep `adamw8bit` as an
-    /// explicit opt-in while that integration work is open.
-    #[arg(long, default_value = "adamw")]
+    /// Default = `adamw8bit` to match the reference HiDream-O1 config. Use
+    /// `adamw` for optimizer ablations and for full-state checkpoints.
+    #[arg(long, default_value = "adamw8bit")]
     optimizer: String,
     /// AdamW β1 momentum coefficient. Default = 0.9 (bitsandbytes / torch
-    /// AdamW default — ai-toolkit's HiDream-O1 yaml does not override).
+    /// AdamW default — edv2-reference's HiDream-O1 yaml does not override).
     #[arg(long, default_value_t = 0.9)]
     adamw_beta1: f32,
     /// AdamW β2 second-moment coefficient. Default = 0.999 (bitsandbytes /
-    /// torch AdamW default — ai-toolkit's HiDream-O1 yaml does not override).
+    /// torch AdamW default — edv2-reference's HiDream-O1 yaml does not override).
     #[arg(long, default_value_t = 0.999)]
     adamw_beta2: f32,
-    /// AdamW ε. Default = 1e-6 (ai-toolkit `optimizer.py:67,71,77,79`
+    /// AdamW ε. Default = 1e-6 (edv2-reference `optimizer.py:67,71,77,79`
     /// hard-codes this for every Adam-family path, overriding torch's 1e-8).
     #[arg(long, default_value_t = 1.0e-6)]
     adamw_eps: f32,
-    /// AdamW weight decay. Default = 1e-2 (bitsandbytes AdamW8bit default;
-    /// the HiDream-O1 yaml passes no `optimizer_params` so the bnb default
-    /// is what runs in ai-toolkit).
-    #[arg(long, default_value_t = 1.0e-2)]
+    /// AdamW weight decay.
+    #[arg(long, default_value_t = 1.0e-4)]
     adamw_weight_decay: f32,
-    /// Clamp scalar loss before backward, matching current ai-toolkit
-    /// HiDream-O1 default `train.max_loss: 1.0`. Set <= 0 to disable.
-    #[arg(long, default_value_t = 1.0)]
+    /// Clamp scalar loss before backward. Disabled by default; the reference
+    /// TrainConfig leaves `max_loss` unset, and clamping a scalar MSE
+    /// above the cap has zero derivative, silently turning those samples into
+    /// no-op optimizer steps.
+    #[arg(long, default_value_t = 0.0)]
     max_loss: f32,
+    /// Loss objective. `x0` trains HiDream-O1's native clean-patch prediction
+    /// directly and is the EDv2 default. `velocity` preserves reference parity,
+    /// but weights clean-patch error by 1/sigma^2 and can produce low-sigma
+    /// loss/grad spikes.
+    #[arg(long, default_value = "x0")]
+    loss_objective: String,
+    /// Log aggregate LoRA A/B magnitudes every N optimizer steps. Set 0 to
+    /// disable. This catches A-collapse or B-overgrowth early in long runs.
+    #[arg(long, default_value_t = 100)]
+    lora_stats_every: usize,
+    /// Scale LoRA B matrices only when writing weights-only exports. The
+    /// in-memory train state and full checkpoints remain raw so resume math is
+    /// unchanged. 0.25 is the current HiDream-O1 safe export default from the
+    /// 2026-05-20 validation run.
+    #[arg(long, default_value_t = 0.25)]
+    export_scale: f32,
 }
 
-/// Distribution mode for `t` sampling. `Linear` mirrors the current
-/// ai-toolkit HiDream-O1 UI default. `Shift` is retained for the older
-/// flowmatch-shift ablation, and `Uniform` is retained as the continuous
-/// unshifted ablation.
+/// Distribution mode for `t` sampling. `Shift` mirrors the reference
+/// HiDream-O1 configs. `Linear` and `Uniform` are retained for
+/// ablations.
 #[derive(Clone, Copy, Debug)]
 enum TstepMode {
     Linear,
     Uniform,
     Shift,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LossObjective {
+    X0,
+    Velocity,
+}
+
+fn parse_loss_objective(s: &str) -> anyhow::Result<LossObjective> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "x0" | "clean" | "clean-patch" | "clean_patch" => Ok(LossObjective::X0),
+        "velocity" | "vel" | "reference" | "parity" => Ok(LossObjective::Velocity),
+        other => anyhow::bail!(
+            "--loss-objective: expected `x0` or `velocity`, got `{other}`"
+        ),
+    }
 }
 
 fn parse_tstep_mode(s: &str) -> anyhow::Result<TstepMode> {
@@ -222,7 +274,7 @@ fn parse_tstep_mode(s: &str) -> anyhow::Result<TstepMode> {
 /// Sample `t in (t_eps, 1 - t_eps)` from the configured distribution.
 fn sample_t<R: rand::Rng>(rng: &mut R, mode: TstepMode, shift: f32) -> f32 {
     match mode {
-        // ai-toolkit `CustomFlowMatchScheduler.set_train_timesteps(linear)`
+        // edv2-reference `CustomFlowMatchScheduler.set_train_timesteps(linear)`
         // creates timesteps 1000..1, then the balanced sampler draws integer
         // indices in [0, 999). This gives sigma/t in [1.0, 0.002].
         TstepMode::Linear => {
@@ -230,15 +282,98 @@ fn sample_t<R: rand::Rng>(rng: &mut R, mode: TstepMode, shift: f32) -> f32 {
             (1000.0 - idx as f32) / 1000.0
         }
         TstepMode::Uniform => rng.r#gen::<f32>().clamp(T_EPS_AT, 1.0 - T_EPS_AT),
-        // Flow-matching shift mapping. Continuous CDF-inverse equivalent of
-        // ai-toolkit `custom_flowmatch_sampler.py:161`:
+        // Flow-matching shift mapping over the same discrete 1000-entry grid
+        // edv2-reference builds in `custom_flowmatch_sampler.py:136-178`.
+        // Balanced sampling then draws indices in [0, 999), so the smallest
+        // reachable raw sigma is 0.002, not 0.001.
+        //
+        // Mapping (`custom_flowmatch_sampler.py:161`):
         //   sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-        // applied per-sample instead of vectorized over the 1000-bucket grid.
         TstepMode::Shift => {
-            let u: f32 = rng.r#gen::<f32>();
-            (shift * u / (1.0 + (shift - 1.0) * u)).clamp(T_EPS_AT, 1.0 - T_EPS_AT)
+            let idx: usize = rng.gen_range(0..999);
+            let raw = (1000.0 - idx as f32) / 1000.0;
+            (shift * raw / (1.0 + (shift - 1.0) * raw)).clamp(T_EPS_AT, 1.0 - T_EPS_AT)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoraMagnitudeStats {
+    adapters: usize,
+    a_mean_abs: f64,
+    b_mean_abs: f64,
+    a_max_abs: f32,
+    b_max_abs: f32,
+}
+
+fn tensor_abs_stats(t: &Tensor) -> anyhow::Result<(f64, f32, usize)> {
+    let values = t.to_dtype(DType::F32)?.to_vec_f32()?;
+    let mut sum = 0.0f64;
+    let mut max = 0.0f32;
+    for v in values.iter().copied() {
+        let a = v.abs();
+        sum += a as f64;
+        max = max.max(a);
+    }
+    Ok((sum, max, values.len()))
+}
+
+fn lora_magnitude_stats(lora: &LoraRegistry) -> anyhow::Result<LoraMagnitudeStats> {
+    let mut a_sum = 0.0f64;
+    let mut b_sum = 0.0f64;
+    let mut a_max = 0.0f32;
+    let mut b_max = 0.0f32;
+    let mut a_count = 0usize;
+    let mut b_count = 0usize;
+    let mut adapters = 0usize;
+
+    for (_key, a, b) in lora.iter_trainable() {
+        let (s, m, n) = tensor_abs_stats(&a.tensor()?)?;
+        a_sum += s;
+        a_max = a_max.max(m);
+        a_count += n;
+
+        let (s, m, n) = tensor_abs_stats(&b.tensor()?)?;
+        b_sum += s;
+        b_max = b_max.max(m);
+        b_count += n;
+        adapters += 1;
+    }
+
+    Ok(LoraMagnitudeStats {
+        adapters,
+        a_mean_abs: if a_count > 0 {
+            a_sum / a_count as f64
+        } else {
+            0.0
+        },
+        b_mean_abs: if b_count > 0 {
+            b_sum / b_count as f64
+        } else {
+            0.0
+        },
+        a_max_abs: a_max,
+        b_max_abs: b_max,
+    })
+}
+
+fn log_lora_magnitude_stats(label: &str, lora: &LoraRegistry) -> anyhow::Result<()> {
+    let s = lora_magnitude_stats(lora)?;
+    log::info!(
+        "[lora-stats] {label}: adapters={} A.mean_abs={:.6e} B.mean_abs={:.6e} \
+         A.max_abs={:.6e} B.max_abs={:.6e} B/A={:.4}",
+        s.adapters,
+        s.a_mean_abs,
+        s.b_mean_abs,
+        s.a_max_abs,
+        s.b_max_abs,
+        if s.a_mean_abs > 0.0 {
+            s.b_mean_abs / s.a_mean_abs
+        } else {
+            0.0
+        },
+    );
+    Ok(())
 }
 
 /// Validate the cache's `_meta.json` header.  Mirrors `prepare_hidream_o1`'s
@@ -379,6 +514,12 @@ fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
     env_logger::init();
     let args = Args::parse();
+    if !args.export_scale.is_finite() || args.export_scale <= 0.0 {
+        anyhow::bail!(
+            "--export-scale must be finite and > 0 for weights-only LoRA exports, got {}",
+            args.export_scale
+        );
+    }
     std::fs::create_dir_all(&args.output_dir)?;
     validate_meta(&args.cache_dir)?;
 
@@ -410,29 +551,46 @@ fn main() -> anyhow::Result<()> {
     }
 
     let tstep_mode = parse_tstep_mode(&args.timestep_distribution)?;
+    let loss_objective = parse_loss_objective(&args.loss_objective)?;
+    let include_resident_lora = !args.no_resident_lora;
+    if args.include_resident_lora {
+        log::info!(
+            "[hidream_o1] --include-resident-lora is now the default; use --no-resident-lora to disable"
+        );
+    }
     log::info!(
-        "[hidream_o1] tstep_mode={:?} flow_shift={} noise_scale={} t_eps={} max_loss={}",
+        "[hidream_o1] tstep_mode={:?} flow_shift={} noise_scale={} t_eps={} max_loss={} loss_objective={:?} resident_heads={} export_scale={}",
         tstep_mode,
         args.flow_shift,
         NOISE_SCALE,
         T_EPS_AT,
         args.max_loss,
+        loss_objective,
+        include_resident_lora,
+        args.export_scale,
     );
 
     let save_mode_full = match args.save_mode.as_str() {
         "weights" => false,
-        "full" => {
-            // BUG-3: fail loudly instead of silently degrading. Once
-            // TODO(O1-M3.1) AdamW state save lands, switch this back to a
-            // capable path. Until then, the user gets an honest error rather
-            // than a checkpoint that looks `full` on disk but isn't.
-            anyhow::bail!(
-                "--save-mode=full is not yet implemented (TODO O1-M3.1: \
-                 AdamW state + step counter). Re-run with --save-mode=weights."
-            );
-        }
+        "full" => true,
         other => anyhow::bail!("--save-mode must be `weights` or `full`, got `{other}`"),
     };
+    let opt_kind =
+        OptimizerKind::parse(&args.optimizer).map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    if save_mode_full && opt_kind != OptimizerKind::AdamW {
+        anyhow::bail!(
+            "--save-mode=full is implemented only for --optimizer adamw, got `{}`. \
+             Re-run with --save-mode=weights or switch to --optimizer adamw.",
+            opt_kind.as_str()
+        );
+    }
+    if args.resume_full.is_some() && opt_kind != OptimizerKind::AdamW {
+        anyhow::bail!(
+            "--resume-full restores AdamW optimizer state and requires --optimizer adamw, got `{}`. \
+             Use --resume-lora to resume weights only with a fresh optimizer.",
+            opt_kind.as_str()
+        );
+    }
 
     // ── Load model + tokenizer (the tokenizer is unused at training time but
     //    the weight loader needs the model dir laid out beside it).
@@ -451,39 +609,64 @@ fn main() -> anyhow::Result<()> {
         .load_model(&hd_cfg, &device)
         .map_err(|e| anyhow::anyhow!("HiDreamO1WeightLoader::load_model: {e}"))?;
 
-    // BUG-4: fail loudly on --resume-full until AdamW state restore lands.
-    if args.resume_full.is_some() {
-        anyhow::bail!(
-            "--resume-full is not yet implemented (TODO O1-M3.1: AdamW state \
-             restore). Use --resume-lora to restore LoRA weights only."
-        );
-    }
-
-    // ── Build LoRA registry: 7 suffixes × 36 layers = 252 adapters for 8B.
+    // ── Build LoRA registry. The reference LoRA code keeps adapter weights and
+    // branch math in F32, then casts the residual back to base dtype.
     let mut lora = if let Some(resume) = args.resume_lora.as_ref() {
         log::info!(
             "[hidream_o1] resuming LoRA registry from {}",
             resume.display()
         );
-        LoraRegistry::from_safetensors(resume, &hd_cfg, &device)
+        LoraRegistry::from_safetensors_with_dtype(resume, &hd_cfg, &device, DType::F32)
             .map_err(|e| anyhow::anyhow!("LoraRegistry::from_safetensors: {e}"))?
     } else {
-        LoraRegistry::new(
+        LoraRegistry::new_with_dtype_and_resident(
             &hd_cfg,
             args.rank,
             args.lora_alpha,
             default_target_suffixes(),
             SEED,
             &device,
+            DType::F32,
+            include_resident_lora,
         )
         .map_err(|e| anyhow::anyhow!("LoraRegistry::new: {e}"))?
     };
     log::info!(
-        "[hidream_o1] LoRA registry: {} adapters, rank={}, alpha={}",
+        "[hidream_o1] LoRA registry: {} adapters, rank={}, alpha={}, dtype=F32, resident_heads={}",
         lora.len(),
         lora.rank,
         lora.alpha,
+        include_resident_lora,
     );
+    if args.lora_stats_every > 0 {
+        log_lora_magnitude_stats("init", &lora)?;
+    }
+
+    // HiDream-O1 uses boundary checkpointing in inference-flame's decoder
+    // loop. Keep the grow cache alive for the full run so checkpointed
+    // block I/O can spill to pinned host memory instead of retaining every
+    // streamed block in the backward tape. The cursor must still be reset
+    // after every backward pass, otherwise pinned slabs grow monotonically
+    // across steps until the process gets host-OOM killed.
+    let activation_cache = {
+        use eridiffusion_core::training::offload::setup_grow_activation_cache;
+        let slab_bytes = 1usize << 30;
+        match setup_grow_activation_cache(&device, slab_bytes) {
+            Ok(cache) => {
+                log::info!(
+                    "[activation_offload] grow cache installed (slab={} MB); HiDream-O1 decoder boundary checkpointing active",
+                    slab_bytes / (1024 * 1024)
+                );
+                Some(cache)
+            }
+            Err(e) => {
+                log::warn!(
+                    "[activation_offload] grow cache setup failed ({e}); falling back to plain checkpoint"
+                );
+                None
+            }
+        }
+    };
 
     // ── Flatten registry into a Vec<Parameter> for the optimizer.
     let params: Vec<Parameter> = lora.parameters();
@@ -492,8 +675,6 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("LoRA registry produced no trainable parameters");
     }
 
-    let opt_kind =
-        OptimizerKind::parse(&args.optimizer).map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
     log::info!(
         "[hidream_o1] optimizer={} lr={} betas=({}, {}) eps={} wd={}",
         opt_kind.as_str(),
@@ -503,12 +684,8 @@ fn main() -> anyhow::Result<()> {
         args.adamw_eps,
         args.adamw_weight_decay,
     );
-    // DIVERGENCE from ai-toolkit: our default optimizer is `adamw` (full F32
-    // state), NOT `adamw8bit` as the ai-toolkit yaml prescribes. flame-core's
-    // AdamW8bit kernel has bnb 0.49.2 block-wise parity in isolated tests, but
-    // the HiDream-O1 trainer integration is still not launch-safe: G2 overfit
-    // showed late loss/grad spikes with `adamw8bit`, while plain AdamW
-    // recovered. Pass `--optimizer adamw8bit` only for explicit parity probes.
+    // Default is reference-style AdamW8bit. Keep `--optimizer adamw` available
+    // for ablations and for full-state checkpoints.
     let mut opt = Optimizer::new(
         opt_kind,
         args.lr,
@@ -517,6 +694,42 @@ fn main() -> anyhow::Result<()> {
         args.adamw_eps,
         args.adamw_weight_decay,
     );
+
+    let mut start_step = args.start_step;
+    if let Some(resume_path) = args.resume_full.as_ref() {
+        if args.start_step != 0 {
+            anyhow::bail!(
+                "--resume-full already carries the step counter; omit --start-step \
+                 or use --resume-lora for weights-only resume"
+            );
+        }
+        log::info!("[hidream_o1] full-resume from {}", resume_path.display());
+        let loaded = checkpoint::load_full(resume_path, &device)?;
+        if loaded.header.rank != args.rank {
+            anyhow::bail!(
+                "checkpoint rank={} but --rank={} — LoRA shapes are incompatible",
+                loaded.header.rank,
+                args.rank
+            );
+        }
+        if (loaded.header.alpha - args.lora_alpha).abs() > 1e-6 {
+            anyhow::bail!(
+                "checkpoint alpha={} but --lora-alpha={} — LoRA scale would diverge",
+                loaded.header.alpha,
+                args.lora_alpha
+            );
+        }
+        let named = lora.named_parameters();
+        checkpoint::apply_lora_weights(&loaded, &named)?;
+        if let Optimizer::AdamW(ref mut adam) = opt {
+            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha)?;
+        }
+        start_step = loaded.header.step as usize;
+        log::info!(
+            "[hidream_o1] continuing from step {start_step}; running {} additional steps",
+            args.steps
+        );
+    }
 
     // ── Index cache files.
     // BUG-6 fix: only `sample_NNNNNN.safetensors` to avoid picking up
@@ -588,9 +801,9 @@ fn main() -> anyhow::Result<()> {
     let mut max_loss_clamps = 0usize;
     let mut max_raw_loss = 0f32;
 
-    let total_target_steps = args.start_step + args.steps;
+    let total_target_steps = start_step + args.steps;
     for local_step in 0..args.steps {
-        let step = args.start_step + local_step;
+        let step = start_step + local_step;
         flame_core::debug_finite::reset();
 
         let cache_idx = step % cache_files.len();
@@ -638,7 +851,7 @@ fn main() -> anyhow::Result<()> {
         // ── Sample timestep (flowmatch shift by default, see TstepMode).
         let t_scalar = sample_t(&mut rng, tstep_mode, args.flow_shift);
         // Noise ~ N(0, 1), then SCALED by NOISE_SCALE before use in both the
-        // noisy input and the loss target — see ai-toolkit
+        // noisy input and the loss target — see edv2-reference
         // `hidream_o1_model.py:53-56` (`scaled_noise = noise * noise_scale`)
         // and `:520-521` (`target = noise*noise_scale - latents`).
         let noise = Tensor::randn(patches.shape().clone(), 0.0, 1.0, device.clone())?
@@ -653,20 +866,16 @@ fn main() -> anyhow::Result<()> {
         flame_core::debug_finite::check("g2.noisy", &noisy)?;
         // HiDream-O1's model expects timestep as denoising PROGRESS
         // (1=clean, 0=noisy) — inverted from the canonical convention used
-        // for `noisy`. Mirror ai-toolkit `hidream_o1_model.py:439, 446`:
+        // for `noisy`. Mirror edv2-reference `hidream_o1_model.py:439, 446`:
         //   t_pixeldit = (1.0 - timestep / 1000.0)
         // Our `t_scalar` is already in canonical [eps, 1-eps] continuous
         // (not `/1000` discrete), so the equivalent is `1.0 - t_scalar`.
         let t_pixeldit = 1.0 - t_scalar;
-        let timestep = Tensor::from_vec(
-            vec![t_pixeldit],
-            Shape::from_dims(&[1]),
-            device.clone(),
-        )?
-        .to_dtype(DType::BF16)?;
+        let timestep = Tensor::from_vec(vec![t_pixeldit], Shape::from_dims(&[1]), device.clone())?
+            .to_dtype(DType::BF16)?;
 
         // Loss target = `(scaled_noise - patches).detach()` — the
-        // ai-toolkit flow-matching velocity with scaled noise.
+        // edv2-reference flow-matching velocity with scaled noise.
         // `hidream_o1_model.py:517-521 get_loss_target`.
         let target_full = scaled_noise.sub(&patches)?.detach()?;
         flame_core::debug_finite::check("g2.target_full", &target_full)?;
@@ -716,8 +925,20 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        // ── Convert model x0-style output to velocity, then MSE against
-        // (scaled_noise - patches). Per ai-toolkit
+        // ── Loss. HiDream-O1 emits x0-style clean-patch predictions.
+        // The stable EDv2 objective trains that native output directly.
+        // The velocity path is retained for reference parity/debugging.
+        let x0_pred_f32 = x_rows.to_dtype(DType::F32)?;
+        let clean_f32 = patches.to_dtype(DType::F32)?;
+        let x0_loss = x0_pred_f32.sub(&clean_f32)?.square()?.mean()?;
+        flame_core::debug_finite::check("g2.x0_loss", &x0_loss)?;
+        let x0_loss_val = x0_loss.to_vec()?[0];
+        if !x0_loss_val.is_finite() {
+            anyhow::bail!("NaN/Inf x0 loss at step {step}: {x0_loss_val}");
+        }
+
+        // Convert model x0-style output to velocity, then MSE against
+        // (scaled_noise - patches). Per reference Python
         // `hidream_o1_model.py:467-473`:
         //   sigma = max(t, T_EPS)
         //   pred  = (latent_model_input.float() - x0_pred.float()) / sigma
@@ -726,7 +947,7 @@ fn main() -> anyhow::Result<()> {
         // The BF16 round-trip TRUNCATES the 1/sigma-amplified F32 difference
         // into BF16 mantissa precision. Skipping that cast leaves the full
         // F32 amplification in `pred`, blowing up the MSE (and lora_B grad)
-        // when sigma is small. Mirror AIT exactly: F32 sub+div → BF16 → F32.
+        // when sigma is small. Mirror the reference exactly: F32 sub+div → BF16 → F32.
         // Pred has the same shape as target_full ([1, L, 3072]).
         let sigma = t_scalar.max(T_EPS_AT);
         // noisy was built from `patches` + `scaled_noise` (both BF16); gather
@@ -735,15 +956,25 @@ fn main() -> anyhow::Result<()> {
         // exactly to image rows.
         let pred_f32 = noisy
             .to_dtype(DType::F32)?
-            .sub(&x_rows.to_dtype(DType::F32)?)?
+            .sub(&x0_pred_f32)?
             .mul_scalar(1.0 / sigma)?
-            // AIT parity: round-trip through in_dtype=BF16 before MSE.
+            // Reference parity: round-trip through in_dtype=BF16 before MSE.
             .to_dtype(DType::BF16)?
             .to_dtype(DType::F32)?;
         flame_core::debug_finite::check("g2.pred_f32", &pred_f32)?;
         let target_f32 = target_full.to_dtype(DType::F32)?;
         flame_core::debug_finite::check("g2.target_f32", &target_f32)?;
-        let raw_loss = pred_f32.sub(&target_f32)?.square()?.mean()?;
+        let velocity_loss = pred_f32.sub(&target_f32)?.square()?.mean()?;
+        flame_core::debug_finite::check("g2.velocity_loss", &velocity_loss)?;
+        let velocity_loss_val = velocity_loss.to_vec()?[0];
+        if !velocity_loss_val.is_finite() {
+            anyhow::bail!("NaN/Inf velocity loss at step {step}: {velocity_loss_val}");
+        }
+
+        let raw_loss = match loss_objective {
+            LossObjective::X0 => x0_loss,
+            LossObjective::Velocity => velocity_loss,
+        };
         flame_core::debug_finite::check("g2.raw_loss", &raw_loss)?;
         let raw_loss_val = raw_loss.to_vec()?[0];
         if !raw_loss_val.is_finite() {
@@ -785,20 +1016,15 @@ fn main() -> anyhow::Result<()> {
                 named.iter().map(|(n, p)| (n.as_str(), p)).collect();
             let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
             if report.is_clean() {
-                log::info!(
-                    "[grad-flow] step 1 clean ({} params)",
-                    report.ok_count
-                );
+                log::info!("[grad-flow] step 1 clean ({} params)", report.ok_count);
             } else {
                 log::warn!("{}", report.summary());
             }
         }
 
         // ── Global L2 grad clip = 1.0.
-        let grad_refs: Vec<&Tensor> =
-            params.iter().filter_map(|p| grads.get(p.id())).collect();
-        let total_norm =
-            flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
+        let grad_refs: Vec<&Tensor> = params.iter().filter_map(|p| grads.get(p.id())).collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
         let scale = if total_norm > CLIP_GRAD_NORM {
             CLIP_GRAD_NORM / total_norm
         } else {
@@ -829,10 +1055,23 @@ fn main() -> anyhow::Result<()> {
         // optimizer-replaces-storage path stays obvious.
         let _ = &mut lora;
 
+        device.synchronize().ok();
+        if let Some(cache) = &activation_cache {
+            let mut cache = cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grow activation cache mutex poisoned"))?;
+            let in_flight = cache.in_flight();
+            if in_flight != 0 {
+                log::warn!(
+                    "[activation_offload] resetting grow cache with {in_flight} in-flight entries"
+                );
+            }
+            cache.reset();
+        }
         AutogradContext::clear();
         flame_core::cuda_alloc_pool::clear_pool_cache();
-        device.synchronize().ok();
 
+        let step_num = step + 1;
         eridiffusion_core::training::progress::log_step(
             "HiDreamO1-lora",
             step,
@@ -845,25 +1084,65 @@ fn main() -> anyhow::Result<()> {
             t_start,
             board.as_ref(),
         );
+        if let Some(b) = &board {
+            b.log_scalars(
+                step_num as u64,
+                &[
+                    ("hidream_o1/sigma", sigma as f64),
+                    ("hidream_o1/loss_x0", x0_loss_val as f64),
+                    ("hidream_o1/loss_velocity", velocity_loss_val as f64),
+                ],
+            );
+        }
+        if args.lora_stats_every > 0 && (step_num == 1 || step_num % args.lora_stats_every == 0) {
+            log_lora_magnitude_stats(&format!("step {step_num}"), &lora)?;
+        }
 
         // ── Periodic save.
-        let step_num = step + 1;
-        if args.save_every > 0
-            && step_num % args.save_every == 0
-            && step_num < total_target_steps
-        {
+        if args.save_every > 0 && step_num % args.save_every == 0 && step_num < total_target_steps {
             let mid_ckpt = args
                 .output_dir
                 .join(format!("hidream_o1_lora_step{step_num}.safetensors"));
-            if let Err(e) = lora.save_safetensors(&mid_ckpt) {
+            if save_mode_full {
+                if let Optimizer::AdamW(ref adam) = opt {
+                    let header = CkptHeader::from_adamw(
+                        "train_hidream_o1",
+                        step_num as u64,
+                        adam,
+                        args.rank,
+                        args.lora_alpha,
+                        SEED,
+                        String::new(),
+                    );
+                    let named = lora.named_parameters();
+                    if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, adam, &header) {
+                        log::warn!("[save step {step_num}] full save failed: {e}");
+                    } else {
+                        log::info!("[save step {step_num}] full checkpoint {}", mid_ckpt.display());
+                    }
+                } else {
+                    log::warn!(
+                        "[save step {step_num}] full-state save is not implemented for {:?}; saving weights only",
+                        opt.kind()
+                    );
+                    if let Err(e) =
+                        lora.save_safetensors_with_export_scale(&mid_ckpt, args.export_scale)
+                    {
+                        log::warn!("[save step {step_num}] weights-only save failed: {e}");
+                    } else {
+                        log::info!("[save step {step_num}] weights-only {}", mid_ckpt.display());
+                    }
+                }
+            } else if let Err(e) =
+                lora.save_safetensors_with_export_scale(&mid_ckpt, args.export_scale)
+            {
                 log::warn!("[save step {step_num}] failed: {e}");
             } else {
-                log::info!("[save step {step_num}] {}", mid_ckpt.display());
-            }
-            if save_mode_full {
-                // TODO(O1-M3.1): also dump AdamW state + step counter as
-                // `*_full.safetensors`. Optimizer enum lacks a uniform
-                // `state_dict` accessor today.
+                log::info!(
+                    "[save step {step_num}] {} (export_scale={})",
+                    mid_ckpt.display(),
+                    args.export_scale
+                );
             }
         }
     }
@@ -884,13 +1163,54 @@ fn main() -> anyhow::Result<()> {
         b.set_status("completed");
     }
 
-    let final_ckpt = args
-        .output_dir
-        .join(format!("hidream_o1_lora_{}steps.safetensors", total_target_steps));
-    if let Err(e) = lora.save_safetensors(&final_ckpt) {
+    let final_ckpt = args.output_dir.join(format!(
+        "hidream_o1_lora_{}steps.safetensors",
+        total_target_steps
+    ));
+    if save_mode_full {
+        if let Optimizer::AdamW(ref adam) = opt {
+            let header = CkptHeader::from_adamw(
+                "train_hidream_o1",
+                total_target_steps as u64,
+                adam,
+                args.rank,
+                args.lora_alpha,
+                SEED,
+                String::new(),
+            );
+            let named = lora.named_parameters();
+            if let Err(e) = checkpoint::save_full(&final_ckpt, &named, adam, &header) {
+                log::warn!("save_full failed: {e}");
+            } else {
+                log::info!("Saved final full checkpoint to {}", final_ckpt.display());
+            }
+        } else {
+            log::warn!(
+                "[final] full-state save is not implemented for {:?}; saving weights only",
+                opt.kind()
+            );
+            if let Err(e) =
+                lora.save_safetensors_with_export_scale(&final_ckpt, args.export_scale)
+            {
+                log::warn!("weights-only save failed: {e}");
+            } else {
+                log::info!(
+                    "Saved final weights-only LoRA to {} (export_scale={})",
+                    final_ckpt.display(),
+                    args.export_scale
+                );
+            }
+        }
+    } else if let Err(e) =
+        lora.save_safetensors_with_export_scale(&final_ckpt, args.export_scale)
+    {
         log::warn!("save_safetensors returned: {e}");
     } else {
-        log::info!("Saved final LoRA to {}", final_ckpt.display());
+        log::info!(
+            "Saved final LoRA to {} (export_scale={})",
+            final_ckpt.display(),
+            args.export_scale
+        );
     }
     Ok(())
 }

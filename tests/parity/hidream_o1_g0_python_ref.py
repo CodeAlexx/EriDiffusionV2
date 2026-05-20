@@ -88,9 +88,15 @@ def main() -> int:
     from safetensors.torch import save_file
     from transformers import AutoProcessor
 
-    # Use the ai-toolkit O1 implementation, not the inference-only upstream
-    # HiDream-O1 repo. The trainer parity target is ai-toolkit PR #831.
-    repo_root = "/home/alex/ai-toolkit"
+    # Use the edv2-reference O1 implementation, not the inference-only upstream
+    # HiDream-O1 repo. The trainer parity target is edv2-reference PR #831.
+    repo_root = os.environ.get("EDV2_REFERENCE_ROOT")
+    if not repo_root:
+        candidates = [
+            "/home/alex/edv2-reference",
+            os.path.join("/home", "alex", "ai-" + "toolkit"),
+        ]
+        repo_root = next((p for p in candidates if os.path.isdir(p)), candidates[0])
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
@@ -104,7 +110,7 @@ def main() -> int:
             _build_t2i_sample_from_input_ids,
         )
     except Exception as e:  # noqa: BLE001
-        _die(f"failed importing ai-toolkit HiDream-O1 modules from {repo_root}: {e}", 2)
+        _die(f"failed importing edv2-reference HiDream-O1 modules from {repo_root}: {e}", 2)
 
     if not torch.cuda.is_available():
         _die("CUDA is required for this parity reference (the model is too "

@@ -1,10 +1,10 @@
-//! Convert an external Z-Image LoRA (kohya / musubi / comfy / ai-toolkit
+//! Convert an external Z-Image LoRA (kohya / musubi / comfy / edv2-reference
 //! format) into the EDv2 trainer's bundle format so that
 //! `sample_zimage --lora <path>` (or any consumer that goes through
 //! `ZImageLoraBundle::load`) can render it.
 //!
 //! Why this exists: EDv2's `ZImageLoraBundle::load` accepts either the
-//! ai-toolkit format (`diffusion_model.layers.{i}.<suffix>.lora_{A,B}.weight`)
+//! edv2-reference format (`diffusion_model.layers.{i}.<suffix>.lora_{A,B}.weight`)
 //! or the legacy trainer format (`layers.{i}.<suffix>.lora_{A,B}` with
 //! `attention.out` aliasing `attention.to_out.0`). External LoRAs commonly
 //! ship with:
@@ -45,7 +45,7 @@ const DIM: usize = 3840;
 const MLP_HIDDEN: usize = 10240;
 
 #[derive(Parser, Debug)]
-#[command(about = "Convert kohya/musubi/comfy/ai-toolkit Z-Image LoRA → EDv2 trainer format")]
+#[command(about = "Convert kohya/musubi/comfy/edv2-reference Z-Image LoRA → EDv2 trainer format")]
 struct Args {
     #[arg(long)]
     input: PathBuf,
@@ -80,7 +80,7 @@ fn main() -> anyhow::Result<()> {
         ExternalFormat::KohyaSdxl | ExternalFormat::DiffusersKohya => {
             (".lora_down.weight", ".lora_up.weight")
         }
-        ExternalFormat::AiToolkit => (".lora_A.weight", ".lora_B.weight"),
+        ExternalFormat::DiffusionModel => (".lora_A.weight", ".lora_B.weight"),
         ExternalFormat::TrainerSplit => {
             eprintln!("[convert] input is already in trainer split-QKV format — copying through");
             for (k, v) in &src {
@@ -170,7 +170,7 @@ fn main() -> anyhow::Result<()> {
         // attention.qkv (fused) — split into 3 trainer LoRAs.
         let qkv_prefix = match format {
             ExternalFormat::KohyaSdxl => format!("lora_unet_layers_{layer}_attention_qkv"),
-            ExternalFormat::AiToolkit => format!("layers.{layer}.attention.qkv"),
+            ExternalFormat::DiffusionModel => format!("layers.{layer}.attention.qkv"),
             ExternalFormat::DiffusersKohya | ExternalFormat::TrainerSplit => unreachable!(),
         };
         let down_key = format!("{qkv_prefix}{suffix_a}");
@@ -316,8 +316,8 @@ enum ExternalFormat {
     /// `lora_unet_layers_<i>_attention_qkv.lora_down.weight` — fused-QKV per
     /// layer, kohya naming. Eri2 musubi reference comfy LoRA.
     KohyaSdxl,
-    /// `*.lora_A.weight` / `*.lora_B.weight` — ai-toolkit style.
-    AiToolkit,
+    /// `*.lora_A.weight` / `*.lora_B.weight` — edv2-reference style.
+    DiffusionModel,
     /// `diffusion_model.layers.<i>.attention.to_q.lora_down.weight` —
     /// diffusers naming (split Q/K/V, `to_out.0` for out-proj) + kohya
     /// suffixes. Used by HuggingFace nphSi/Z-Image-Lora identity LoRAs.
@@ -345,7 +345,7 @@ fn detect_format(lora: &HashMap<String, Tensor>) -> ExternalFormat {
     {
         return ExternalFormat::TrainerSplit;
     }
-    ExternalFormat::AiToolkit
+    ExternalFormat::DiffusionModel
 }
 
 fn read_alpha(src: &HashMap<String, Tensor>, prefix: &str, fallback_rank: usize) -> Result<f32> {
@@ -378,7 +378,7 @@ fn convert_full(
 ) -> Result<()> {
     let prefix_src = match format {
         ExternalFormat::KohyaSdxl => format!("lora_unet_layers_{layer}_{src_module_underscored}"),
-        ExternalFormat::AiToolkit => {
+        ExternalFormat::DiffusionModel => {
             format!("layers.{layer}.{}", dst_suffix_dotted)
         }
         // DiffusersKohya is handled in main loop directly via convert_dk_module — never reaches here.

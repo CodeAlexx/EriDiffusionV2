@@ -1,8 +1,8 @@
 //! Llama-3.1-8B-Instruct text encoder for HiDream-I1 training/inference.
 //!
-//! Pure flame-core implementation, mirrors the encoder used by ai-toolkit's
+//! Pure flame-core implementation, mirrors the encoder used by edv2-reference's
 //! HiDream-I1 model
-//! (`ai-toolkit/extensions_built_in/diffusion_models/hidream/hidream_model.py`).
+//! (`edv2-reference/extensions_built_in/diffusion_models/hidream/hidream_model.py`).
 //!
 //! # What HiDream actually consumes
 //!

@@ -1,6 +1,6 @@
 //! Gemma-3 12B text encoder (LTX-2 caption path).
 //!
-//! Status: **STUB / placeholder**. Per LTX2_PORT_AUDIT_AITOOLKIT.md §5 row
+//! Status: **STUB / placeholder**. Per LTX2_PORT_AUDIT_REFERENCE.md §5 row
 //! "Gemma3-12B text encoder", a full Rust port is ~1500 LoC and
 //! the audit explicitly recommends NOT porting it for the trainer:
 //!

@@ -16,20 +16,22 @@ As of 2026-05-15, on a 24 GB consumer GPU, Klein 9B (FLUX.2-klein-base-9B) LoRA 
 This also applies to flame-inference, some may work some may not. a massive speed gains across the entire engine.
 ## Trainers
 
-> **⚠ Status note (2026-05-15):** the May 15 flame-core redesign (R1a–R2c)
+> **⚠ Status note (2026-05-20):** the May 15 flame-core redesign (R1a–R2c)
 > introduced breaking changes to the launcher, dispatcher, and autograd —
 > static-slab allocator, range-aware BF16 trap, frozen-weight gradient
 > skip in `Op::MatMul` / `Op::Mul` / `RmsNorm`, resident-set conductor offload
 > policy, checkpoint-recompute prefetch hook, raw-CudaSlice drop wiring,
-> and several BF16 alloc routing fixes. Only **Klein 9B** has been
-> re-verified end-to-end against the new stack. Every other trainer in
-> the table below worked against the pre-R1a flame-core; their status is
+> and several BF16 alloc routing fixes. **Klein 9B** has been re-verified
+> end-to-end. **HiDream-O1** has only short current-stack smoke coverage and
+> remains under audit. Every other trainer in the table below worked against
+> the pre-R1a flame-core; their status is
 > **carry-over and untested under the current flame-core**. Re-verification
 > per model is the next round of work.
 
 | Model | Binaries (under `crates/eridiffusion-cli/src/bin/`) | Last known status | Verified against current flame-core? |
 | --- | --- | --- | --- |
 | **Klein (FLUX.2)** | `train_klein`, `prepare_klein`, `sample_klein` | 100-step Klein 9B + offload, May 15 | ✅ verified |
+| HiDream-O1 | `train_hidream_o1`, `prepare_hidream_o1`; sample via `inference-flame/src/bin/hidream_o1_infer` | 512 smoke fits on current flame-core, but about 3.5 s/step; speed bottleneck is decoder recompute/model kernels, not resident-window tuning | ⚠ smoke only |
 | Z-Image | `train_zimage`, `prepare_zimage`, `sample_zimage` | end-to-end (pre-R1a) | ❓ untested |
 | ERNIE-Image | `train_ernie`, `prepare_ernie`, `sample_ernie` | end-to-end (pre-R1a) | ❓ untested |
 | FLUX.1 | `train_flux`, `prepare_flux`, `sample_flux` | works (pre-R1a) | ❓ untested |
@@ -61,7 +63,7 @@ crates/
                             #   per-step prewarm, gradient clip
     src/data/               # bucketed latent dataset reader (eats prepare_*
                             #   output, hands batches to the trainer)
-    src/lora/               # LoRA wrapper, save format = PEFT/ai-toolkit
+    src/lora/               # LoRA wrapper, save format = PEFT/edv2-reference
     src/lycoris.rs          # LoCon/LoHa/LoKr port (in-tree)
   eridiffusion-cli/         # the binaries
     src/bin/                # train_*, prepare_*, sample_*, convert_* tools
@@ -149,6 +151,15 @@ Adam `m`/`v` is **pre-warmed** before the slab env-flag activates so optimizer s
 - Lazy eviction via `cudaStreamWaitEvent` on previous `compute_done` — no host-side `cudaEventSynchronize`.
 
 Telemetry on a 6-step run: 258 AwaitHit / 0 AwaitMiss.
+
+HiDream-O1 note (2026-05-20): moving it to the same flame-core
+`BlockOffloader` + `.with_native_layout(true)` + `FLAME_LAYER_OFFLOAD_FRACTION`
+shape as Klein is required for VRAM headroom, but it did not make 512 training
+fast. Default `0.77` and wider `0.50` resident windows both stayed around
+3.5 s/step. `checkpoint_offload_boundary` stores boundary inputs and recomputes
+the 36 Qwen decoder blocks during backward, so the remaining speed work is
+partial checkpointing or a true no-recompute activation/sub-tape offload path,
+not more block-loader retuning.
 
 ### 3. Frozen-weight gradient skip (autograd, May 15)
 

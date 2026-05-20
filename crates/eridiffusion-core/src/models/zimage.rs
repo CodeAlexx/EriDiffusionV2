@@ -188,7 +188,7 @@ impl ZImageLoraBundle {
     ///
     /// `block_weights[block_idx]` is the per-block weight map populated by
     /// `ZImageModel::load`. Base key format: `layers.{block_idx}.{suffix}.weight`
-    /// where `suffix` matches `ai_toolkit_suffix(target)`.
+    /// where `suffix` matches `peft_suffix(target)`.
     ///
     /// Returns the number of slots whose init was skipped (missing weight,
     /// adapter declined). Logged but non-fatal.
@@ -200,11 +200,11 @@ impl ZImageLoraBundle {
         if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
             return Ok(0);
         }
-        // On-disk Z-Image base weight keys (NOT the ai-toolkit save keys):
+        // On-disk Z-Image base weight keys (NOT the edv2-reference save keys):
         //   attention.qkv.weight    — fused [3*dim, dim], chunk(3, 0) into Q/K/V
         //   attention.out.weight    — output projection [dim, dim]
         //   feed_forward.w{1,2,3}.weight
-        // ai-toolkit save format (`to_q`/`to_out.0`) is for the LoRA file, not the model.
+        // edv2-reference save format (`to_q`/`to_out.0`) is for the LoRA file, not the model.
         let mut applied = 0usize;
         let mut skipped = 0usize;
         let mut qkv_slice_cache: HashMap<usize, [Tensor; 3]> = HashMap::new();
@@ -350,7 +350,7 @@ impl ZImageLoraBundle {
             Vec::with_capacity((self.adapters.len() + self.lycoris_adapters.len()) * 2);
         for &(block_idx, target) in keys {
             let lora = &self.adapters[&(block_idx, target)];
-            let suffix = Self::ai_toolkit_suffix(target);
+            let suffix = Self::peft_suffix(target);
             let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
             out.push((format!("{prefix}.lora_A.weight"), lora.lora_a().clone()));
             out.push((format!("{prefix}.lora_B.weight"), lora.lora_b().clone()));
@@ -367,7 +367,7 @@ impl ZImageLoraBundle {
         lyc_keys.sort_by_key(|(b, t)| (*b, *t as usize));
         for &(block_idx, target) in lyc_keys {
             let adapter = &self.lycoris_adapters[&(block_idx, target)];
-            let suffix = Self::ai_toolkit_suffix(target);
+            let suffix = Self::peft_suffix(target);
             let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
             let params = adapter.to_parameters();
             let named = adapter.named_tensors();
@@ -395,11 +395,11 @@ impl ZImageLoraBundle {
         }
     }
 
-    /// Per-target ai-toolkit module suffix. Matches the key naming in
-    /// `/home/alex/ai-toolkit/output/zimage/zimage.safetensors`:
+    /// Per-target edv2-reference module suffix. Matches the key naming in
+    /// `/home/alex/edv2-reference/output/zimage/zimage.safetensors`:
     /// `attention.to_{q,k,v}`, `attention.to_out.0` (ModuleList index),
     /// `feed_forward.w{1,2,3}`.
-    fn ai_toolkit_suffix(target: LoraTarget) -> &'static str {
+    fn peft_suffix(target: LoraTarget) -> &'static str {
         match target {
             LoraTarget::AttnQ => "attention.to_q",
             LoraTarget::AttnK => "attention.to_k",
@@ -411,9 +411,9 @@ impl ZImageLoraBundle {
         }
     }
 
-    /// Save in ai-toolkit's PEFT-style format:
+    /// Save in edv2-reference's PEFT-style format:
     ///   `diffusion_model.layers.{i}.{module}.lora_{A,B}.weight`
-    /// Verified against `ai-toolkit/output/zimage/zimage.safetensors` — same
+    /// Verified against `edv2-reference/output/zimage/zimage.safetensors` — same
     /// prefix, same dotted path, same suffix, no `.alpha`. Per-module alpha
     /// is implicitly `alpha=rank` → `scale=1.0` (matches `LoraStack::load`'s
     /// fallback in `inference-flame/src/lora.rs:255`).
@@ -422,9 +422,9 @@ impl ZImageLoraBundle {
         // Legacy plain-LoRA path (used when --algo lora). Empty when a
         // LyCORIS algo is active.
         for (&(block_idx, target), lora) in &self.adapters {
-            let suffix = Self::ai_toolkit_suffix(target);
+            let suffix = Self::peft_suffix(target);
             let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
-            // ai-toolkit uses `.lora_A.weight` / `.lora_B.weight`.
+            // edv2-reference uses `.lora_A.weight` / `.lora_B.weight`.
             let lora_a = lora.lora_a().tensor()?;
             let lora_b = lora.lora_b().tensor()?;
             tensors.insert(format!("{prefix}.lora_A.weight"), lora_a);
@@ -436,7 +436,7 @@ impl ZImageLoraBundle {
         // `named_tensors()`: LoKr → (lokr_w1, lokr_w2 or lokr_w2_a/b),
         // LoCon → (lora_down/up), LoHa → (hada_*), etc.
         for (&(block_idx, target), adapter) in &self.lycoris_adapters {
-            let suffix = Self::ai_toolkit_suffix(target);
+            let suffix = Self::peft_suffix(target);
             let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
             for (leaf, t) in adapter.named_tensors() {
                 tensors.insert(format!("{prefix}.{leaf}"), t);
@@ -449,11 +449,11 @@ impl ZImageLoraBundle {
         )
     }
 
-    /// Load ai-toolkit-format Z-Image LoRA. Accepts either the new format
+    /// Load edv2-reference-format Z-Image LoRA. Accepts either the new format
     /// (`diffusion_model.<...>.lora_A.weight`) or the legacy trainer format
     /// (`layers.{i}.<...>.lora_A`) for back-compat with previously-saved
     /// checkpoints. `attention.out` (legacy) is also accepted as an alias
-    /// for `attention.to_out.0` (ai-toolkit) on load.
+    /// for `attention.to_out.0` (edv2-reference) on load.
     pub fn load(
         &self,
         path: &std::path::Path,
@@ -464,7 +464,7 @@ impl ZImageLoraBundle {
             let mut applied = 0usize;
             let mut missing = 0usize;
             for (&(block_idx, target), adapter) in &self.lycoris_adapters {
-                let suffix = Self::ai_toolkit_suffix(target);
+                let suffix = Self::peft_suffix(target);
                 let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
                 let params = adapter.to_parameters();
                 let named = adapter.named_tensors();
@@ -512,8 +512,8 @@ impl ZImageLoraBundle {
         }
 
         for (&(block_idx, target), lora) in &self.adapters {
-            let suffix = Self::ai_toolkit_suffix(target);
-            // Try ai-toolkit format first.
+            let suffix = Self::peft_suffix(target);
+            // Try edv2-reference format first.
             let new_prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
             let a_key = format!("{new_prefix}.lora_A.weight");
             let b_key = format!("{new_prefix}.lora_B.weight");
@@ -542,7 +542,7 @@ impl ZImageLoraBundle {
 }
 
 /// Helper for `load`: synthesizes the legacy `<prefix>.lora_A`/`.lora_B`
-/// keys from the ai-toolkit `<prefix>.lora_A.weight`/`.lora_B.weight`
+/// keys from the edv2-reference `<prefix>.lora_A.weight`/`.lora_B.weight`
 /// keys so `LoRALinear::load_tensors` (which expects bare suffixes) can
 /// consume them. Returns a map containing only the two synthesized
 /// entries — `load_tensors` only reads those exact keys for the given
@@ -1947,7 +1947,7 @@ fn sinusoidal_embedding(t: &Tensor, dim: usize) -> Result<Tensor> {
 }
 
 /// Resolve `(block_idx, target)` into the dotted-path adapter name used by
-/// the LyCORIS wiring (Phase 2b). Mirrors `ZImageLoraBundle::ai_toolkit_suffix`
+/// the LyCORIS wiring (Phase 2b). Mirrors `ZImageLoraBundle::peft_suffix`
 /// + the saved-key prefix scheme so both code paths agree on adapter names.
 pub(crate) fn lycoris_target_name(block_idx: usize, target: LoraTarget) -> String {
     let suffix = match target {

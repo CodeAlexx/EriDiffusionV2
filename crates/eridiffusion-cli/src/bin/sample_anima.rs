@@ -72,7 +72,7 @@ struct Args {
     flow_shift: f32,
     #[arg(long, default_value = "42")]
     seed: u64,
-    /// Optional safetensors of a trained LoRA (ai-toolkit/PEFT format).
+    /// Optional safetensors of a trained LoRA (edv2-reference/PEFT format).
     #[arg(long)]
     lora_path: Option<PathBuf>,
     #[arg(long, default_value = "16")]

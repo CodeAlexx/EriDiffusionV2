@@ -315,7 +315,7 @@ pub struct LycorisBundleConfig {
     /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1 kernels.
     pub use_tucker: bool,
     /// Per-LyCORIS conv-layer rank override. `0` (default) → fall back to
-    /// the top-level `rank` for conv targets. Mirrors ai-toolkit /
+    /// the top-level `rank` for conv targets. Mirrors edv2-reference /
     /// SimpleTuner `network.conv` setting.
     pub conv_rank: usize,
     /// Per-LyCORIS conv-layer alpha override. `0.0` (default) → fall back

@@ -5,7 +5,7 @@
 //!
 //! ## Audio excision strategy (T2V-only)
 //!
-//! Per LTX2_PORT_AUDIT_AITOOLKIT.md §8.2 risk #1, naively dropping audio
+//! Per LTX2_PORT_AUDIT_REFERENCE.md §8.2 risk #1, naively dropping audio
 //! sub-modules silently desyncs per-block modulation tensor shapes. The
 //! safe excision is:
 //!

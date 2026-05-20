@@ -358,13 +358,13 @@ struct Args {
     /// and returns Ok(()) on LoKr. Phase 2c follow-up.
     #[arg(long, default_value_t = 0.0)]
     init_lokr_norm: f32,
-    /// SimpleTuner / ai-toolkit `network.conv` — per-LyCORIS rank for
+    /// SimpleTuner / edv2-reference `network.conv` — per-LyCORIS rank for
     /// CONV-layer targets (separate from linear `--rank`). `0` (default)
     /// = fall back to linear rank. Inert when no conv targets are wired
     /// in the model bundle (current state on all EDv2 trainers).
     #[arg(long, default_value_t = 0)]
     conv_rank: usize,
-    /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
+    /// SimpleTuner / edv2-reference `network.conv_alpha` — alpha for CONV
     /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
     #[arg(long, default_value_t = 0.0)]
     conv_alpha: f32,

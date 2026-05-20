@@ -1145,7 +1145,7 @@ impl TrainableModel for SD35Model {
     /// Save LoRA adapters in PEFT/diffusers convention with a per-module
     /// `.alpha` scalar (matches `train_sdxl` save format and is what
     /// `inference-flame/sd3_lora_infer` expects via `LoraStack::load`'s
-    /// AiToolkit-compatible path: bare `<prefix>.lora_{A,B}` keys whose
+    /// DiffusionModel-compatible path: bare `<prefix>.lora_{A,B}` keys whose
     /// `<prefix>.weight` matches a base key).
     ///
     /// HIGH-3 audit (2026-05-08): OT/kohya/ComfyUI ecosystem expects

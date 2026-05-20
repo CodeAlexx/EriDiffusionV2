@@ -16,9 +16,9 @@
 //!
 //! ## Save format
 //!
-//! Mirror of `train_klein` — PEFT/ai-toolkit safetensors keyed
+//! Mirror of `train_klein` — PEFT/edv2-reference safetensors keyed
 //! `double_blocks.{i}.{slot}.lora_{A,B}.weight` etc. (memory:
-//! `feedback_save_format_peft_aitoolkit`). The 3 non-LoRA modified weights
+//! `feedback_save_format_peft_peft`). The 3 non-LoRA modified weights
 //! (`x_embedder`, `proj_out`, `norm_out`) are NOT yet emitted alongside the
 //! LoRA — see TODO §A3-non-lora below.
 //!

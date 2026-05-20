@@ -38,9 +38,9 @@
 //! LLM adapter linears are TODO and explicitly listed at the bottom of this
 //! file.
 //!
-//! Save key naming follows ai-toolkit / PEFT (`diffusion_model.<...>.lora_A.weight`)
+//! Save key naming follows edv2-reference / PEFT (`diffusion_model.<...>.lora_A.weight`)
 //! exactly as Z-Image does, so trained LoRAs route through the inference-flame
-//! `LoraStack` `AiToolkit` mapper without conversion.
+//! `LoraStack` `DiffusionModel` mapper without conversion.
 
 use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::config::TrainConfig;

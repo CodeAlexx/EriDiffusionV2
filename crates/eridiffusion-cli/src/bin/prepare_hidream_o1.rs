@@ -132,7 +132,7 @@ struct Args {
     /// analysis-recommended single-bucket default for 24 GB (see
     /// `docs/hidream_o1_trainer_analysis.md` §8 risk #4).
     ///
-    /// Multi-bucket: `--resolution 512,768,1024` matches the ai-toolkit
+    /// Multi-bucket: `--resolution 512,768,1024` matches the edv2-reference
     /// convention (`config/examples/train_lora_hidream_48.yaml` `datasets.
     /// resolution: [512, 768, 1024]`). Each source image is assigned to
     /// the bucket whose pixel count is closest to the source pixel count
@@ -143,7 +143,7 @@ struct Args {
     /// batching is a separate trainer-side M3 concern).
     ///
     /// The resampling mode (Lanczos3) is the project-wide convention; the
-    /// ai-toolkit reference path uses `Image.BICUBIC` — see the
+    /// edv2-reference reference path uses `Image.BICUBIC` — see the
     /// `_meta.json` `resampler` field for cross-loader diagnostic.
     #[arg(long, default_value = "512", value_delimiter = ',')]
     resolution: Vec<u32>,
@@ -163,7 +163,7 @@ struct Args {
     aug_seed: u64,
 }
 
-/// Canonical 1024-base rectangular bucket list, mirroring ai-toolkit's
+/// Canonical 1024-base rectangular bucket list, mirroring edv2-reference's
 /// `toolkit/buckets.py:resolutions_1024`. Each entry is a (W, H) target
 /// computed so that W*H ≈ 1024² with aspect ratios spanning extreme wide
 /// (16:1) through square (1:1) through extreme portrait (1:16).
@@ -195,7 +195,7 @@ const RESOLUTIONS_1024: &[(u32, u32)] = &[
 ];
 
 /// Scale the 1024-base bucket list to a target resolution R and snap to
-/// `divisibility`. Mirrors ai-toolkit `buckets.py:get_bucket_sizes` lines
+/// `divisibility`. Mirrors edv2-reference `buckets.py:get_bucket_sizes` lines
 /// 59-74. For HiDream-O1, divisibility is 32 (PATCH_SIZE).
 fn bucket_list_for_resolution(resolution: u32, divisibility: u32) -> Vec<(u32, u32)> {
     let scaler = resolution as f64 / 1024.0;
@@ -217,7 +217,7 @@ fn bucket_list_for_resolution(resolution: u32, divisibility: u32) -> Vec<(u32, u
 }
 
 /// Pick the bucket that minimizes removed (cropped) pixels after an
-/// AR-preserving "fit larger" scale. Mirrors ai-toolkit
+/// AR-preserving "fit larger" scale. Mirrors edv2-reference
 /// `buckets.py:get_bucket_for_image_size` lines 101-127:
 ///   scale = max(bucket_w/w, bucket_h/h)  → both dims ≥ bucket dims
 ///   removed_pixels = (new_w - bucket_w) * new_h + (new_h - bucket_h) * new_w
@@ -277,7 +277,7 @@ fn main() -> anyhow::Result<()> {
     resolutions.sort_unstable();
     resolutions.dedup();
     // Build the union of AR-preserving rectangular buckets across all
-    // requested resolutions. Mirrors ai-toolkit's behaviour where each
+    // requested resolutions. Mirrors edv2-reference's behaviour where each
     // `--resolution R` produces ~40 rectangular (W, H) candidates spanning
     // ARs from 16:1 → 1:1 → 1:16. Per-image assignment then picks the
     // bucket with the smallest cropped-pixel count. Divisibility = 32 to
@@ -382,7 +382,7 @@ fn main() -> anyhow::Result<()> {
     //       caches are NOT readable by any trainer that asserts a global
     //       resolution. The trainer's per-step `load_file` already pulls
     //       per-sample shapes, so this is transparent at the trainer level.
-    //       Aligns with ai-toolkit `train_lora_hidream_48.yaml`
+    //       Aligns with edv2-reference `train_lora_hidream_48.yaml`
     //       `datasets.resolution: [512, 768, 1024]`.
     const CACHE_VERSION: u32 = 3;
     let resolutions_json = resolutions
@@ -428,7 +428,7 @@ fn main() -> anyhow::Result<()> {
 
         // ── Image → AR-preserving bucket fit → center crop → [-1, 1] → patchify ──
         //
-        // Mirrors ai-toolkit's `AspectRatioBucketMixin.setup_buckets`
+        // Mirrors edv2-reference's `AspectRatioBucketMixin.setup_buckets`
         // (`dataloader_mixins.py:262-295`) + `get_bucket_for_image_size`
         // (`buckets.py:101-127`):
         //   1. Pick the rectangular bucket (bw, bh) that minimizes
@@ -436,7 +436,7 @@ fn main() -> anyhow::Result<()> {
         //   2. scale = max(bw/sw, bh/sh) → both dims ≥ bucket dims.
         //   3. Resize to (ceil(sw*scale), ceil(sh*scale)).
         //   4. Center-crop to exactly (bw, bh). (Random-crop variant is
-        //      a future flag; ai-toolkit defaults to center.)
+        //      a future flag; edv2-reference defaults to center.)
         // Aspect ratio is preserved — no square stretch.
         let probe = image::open(img_path)?;
         let (src_w, src_h) = (probe.width(), probe.height());
