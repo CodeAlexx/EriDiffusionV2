@@ -69,12 +69,18 @@
 //! HiDream-O1 now uses the Klein-style flame-core `BlockOffloader` path:
 //! native `[Cout, Cin]` weights, `FLAME_LAYER_OFFLOAD_FRACTION=0.77` by
 //! default, `plan_layer_access` in forward and checkpoint replay, and
-//! `checkpoint_offload_boundary` around each decoder block. A 512 smoke still
-//! measured about 3.5 s/step; widening the resident target to `0.50` did not
-//! materially change it. Future speed work should treat boundary recompute of
-//! all 36 Qwen decoder blocks as the bottleneck and look at partial checkpoint
-//! coverage or true no-recompute activation/sub-tape offload. Retuning the
-//! block-loader window alone is not expected to reach Klein-like step time.
+//! `checkpoint_offload_boundary` around each decoder block. A 512 validation
+//! run measured about 3.1 s/step after warmup.
+//!
+//! Speed probe, 2026-05-20: `FLAME_LOG_SDPA_BWD=1` reported
+//! `108 [sdpa-bwd] bail:mask-present` over 3 O1 steps. The current flame-core
+//! fused cuDNN SDPA backward supports unmasked BF16 shapes only, so O1's
+//! causal AR/text attention replays through the decomposed masked backward.
+//! That explains the ai-toolkit speed gap together with boundary checkpoint
+//! replay. It does NOT explain weak style application; masked SDPA fallback is
+//! still the math path, just slower. Style weakness should be debugged via
+//! export/runtime LoRA strength, trigger/caption binding, and x0-vs-velocity
+//! training objective, not by retuning block-loader slots.
 
 use clap::Parser;
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};

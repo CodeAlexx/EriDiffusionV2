@@ -78,8 +78,29 @@ O1 training uses the flame-core `BlockOffloader` path and `checkpoint_offload_bo
 
 The observed EDV2 O1 rate is about 3.1 s/step at 512 after warmup. The 800-step run took `41:34`, with host RSS flat around 15.4 GB and VRAM plateaued at `11202 MiB`. AI-toolkit's O1 implementation uses PyTorch/HF checkpointing and, when not in `low_vram` layer-offload mode, keeps the transformer resident on GPU. A near-1 s/step AI-toolkit O1 run is therefore not apples-to-apples against EDV2's conservative BF16 block-streaming path.
 
+Speed probe, 2026-05-20:
+
+```text
+FLAME_LOG_SDPA_BWD=1 train_hidream_o1 --steps 3 ...
+108 [sdpa-bwd] bail:mask-present
+```
+
+This means every O1 decoder layer hit flame-core's masked SDPA backward fallback for the causal AR/text pass. The fallback is slower but should still be mathematically valid; it is not evidence that Giger style failed to train.
+
+## Style Strength Notes
+
+The 800-step Giger LoRA rendered cleanly but weakly. The speed issue above does not explain weak style application. More likely suspects:
+
+- The validated LoRA was exported with `--export-scale 0.25`, so inference applies one-quarter of the trained delta.
+- The test prompt used `gigver3` but also a long list of competing style/content tokens. That can bury a weak trigger.
+- The dataset captions are mostly trigger-tagged (`gigver3` in 67/70 text files), but the captions are long and 50/70 also spell out `Giger`, `Alien`, or biomechanical terms. Trigger binding is therefore not proven by one busy prompt.
+- The 800-step validation run used the velocity objective for parity/stress testing. x0 remains the cleaner production objective because velocity weights low-sigma samples harder.
+
+A useful next debug is a no-training scale sweep: re-export or rescale the 800-step LoRA to effective strengths `0.25`, `0.5`, `1.0`, and `2.0`, then render a simple `gigver3, portrait...` prompt and the same prompt without LoRA. If full-strength shows style but artifacts, the issue is strength/stability. If full-strength still lacks style, debug captions/objective/training.
+
 ## Next Work
 
 1. Compare raw EDV2 O1 deltas against the public O1 LoRA per layer to explain why raw full-strength EDV2 output is overpowered.
-2. Add a high-memory O1 speed probe that reduces checkpoint coverage where VRAM allows.
-3. Keep using x0 telemetry as the main stability signal and velocity telemetry as the parity/debug signal.
+2. Add an O1 LoRA scale-sweep export path or inference runtime scale so style strength can be tested without retraining.
+3. Add a high-memory O1 speed probe that reduces checkpoint coverage where VRAM allows.
+4. Keep using x0 telemetry as the main stability signal and velocity telemetry as the parity/debug signal.
