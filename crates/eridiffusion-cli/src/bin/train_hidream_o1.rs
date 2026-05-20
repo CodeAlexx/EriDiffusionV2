@@ -72,14 +72,15 @@
 //! `checkpoint_offload_boundary` around each decoder block. A 512 validation
 //! run measured about 3.1 s/step after warmup.
 //!
-//! Speed probe, 2026-05-20: `FLAME_LOG_SDPA_BWD=1` reported
-//! `108 [sdpa-bwd] bail:mask-present` over 3 O1 steps. The current flame-core
-//! fused cuDNN SDPA backward supports unmasked BF16 shapes only, so O1's
-//! causal AR/text attention replays through the decomposed masked backward.
-//! That explains the ai-toolkit speed gap together with boundary checkpoint
-//! replay. It does NOT explain weak style application; masked SDPA fallback is
-//! still the math path, just slower. Style weakness should be debugged via
-//! export/runtime LoRA strength, trigger/caption binding, and x0-vs-velocity
+//! O1 attention is now structured instead of materialized: the decoder uses
+//! flame-core `sdpa_prefix_causal_full`, so the AR/text prefix is causal and
+//! image rows are full-attention without building the old `[B, 1, S, S]` mask.
+//! The full unmasked pass can use padded cuDNN SDPA backward; the small causal
+//! prefix pass remains on the fallback unless `FLAME_CUDNN_SDPA_BWD_CAUSAL=1`
+//! proves faster for a specific model. This removes the old
+//! `[sdpa-bwd] bail:mask-present` O1 hot path. Remaining speed gap is boundary
+//! checkpoint replay/model kernels. Weak style application should be debugged
+//! via export/runtime LoRA strength, trigger/caption binding, and x0-vs-velocity
 //! training objective, not by retuning block-loader slots.
 
 use clap::Parser;
@@ -832,8 +833,8 @@ fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("missing `vinput_mask` in {path_disp}"))?
             .to_dtype(DType::BF16)?;
         // Cache v2 (2026-05-17): `token_types_bin = (raw > 0)`. Drives the
-        // attention-mask construction so the TMS row gets full-attention,
-        // matching `qwen3_vl_transformers.py:1501`.
+        // structured prefix-causal/full attention split so the TMS/image rows
+        // get full-attention, matching `qwen3_vl_transformers.py:1501`.
         let token_types_bin = sample
             .get("token_types")
             .ok_or_else(|| {
@@ -1031,6 +1032,9 @@ fn main() -> anyhow::Result<()> {
         // ── Global L2 grad clip = 1.0.
         let grad_refs: Vec<&Tensor> = params.iter().filter_map(|p| grads.get(p.id())).collect();
         let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
+        if !total_norm.is_finite() {
+            anyhow::bail!("NaN/Inf grad_norm at step {step}: {total_norm}");
+        }
         let scale = if total_norm > CLIP_GRAD_NORM {
             CLIP_GRAD_NORM / total_norm
         } else {

@@ -32,9 +32,9 @@
 //!   - `token_types`  F32 [1, S_total]   1.0 at image slots AND the TMS row,
 //!                                       0.0 elsewhere (`token_types > 0`,
 //!                                       added in cache v2, 2026-05-17).
-//!                                       Used by the trainer for attention
-//!                                       mask construction so the TMS row
-//!                                       gets full-attention (matches
+//!                                       Used by the trainer for the structured
+//!                                       prefix-causal/full attention split so
+//!                                       the TMS row gets full-attention (matches
 //!                                       `qwen3_vl_transformers.py:1501`).
 //!   - `image_grid`   F32 [3]            (1.0, H/32, W/32)
 //!

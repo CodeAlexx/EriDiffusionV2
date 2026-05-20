@@ -31,7 +31,7 @@ This also applies to flame-inference, some may work some may not. a massive spee
 | Model | Binaries (under `crates/eridiffusion-cli/src/bin/`) | Last known status | Verified against current flame-core? |
 | --- | --- | --- | --- |
 | **Klein (FLUX.2)** | `train_klein`, `prepare_klein`, `sample_klein` | 100-step Klein 9B + offload, May 15 | ✅ verified |
-| HiDream-O1 | `train_hidream_o1`, `prepare_hidream_o1`; sample via `inference-flame/src/bin/hidream_o1_infer` | 512 smoke fits on current flame-core, but about 3.5 s/step; speed bottleneck is decoder recompute/model kernels, not resident-window tuning | ⚠ smoke only |
+| HiDream-O1 | `train_hidream_o1`, `prepare_hidream_o1`; sample via `inference-flame/src/bin/hidream_o1_infer` | 512 smoke fits on current flame-core. O1 now uses structured prefix-causal/full SDPA instead of a materialized mixed mask; remaining speed bottleneck is decoder recompute/model kernels, not resident-window tuning | ⚠ smoke only |
 | Z-Image | `train_zimage`, `prepare_zimage`, `sample_zimage` | end-to-end (pre-R1a) | ❓ untested |
 | ERNIE-Image | `train_ernie`, `prepare_ernie`, `sample_ernie` | end-to-end (pre-R1a) | ❓ untested |
 | FLUX.1 | `train_flux`, `prepare_flux`, `sample_flux` | works (pre-R1a) | ❓ untested |
@@ -155,11 +155,15 @@ Telemetry on a 6-step run: 258 AwaitHit / 0 AwaitMiss.
 HiDream-O1 note (2026-05-20): moving it to the same flame-core
 `BlockOffloader` + `.with_native_layout(true)` + `FLAME_LAYER_OFFLOAD_FRACTION`
 shape as Klein is required for VRAM headroom, but it did not make 512 training
-fast. Default `0.77` and wider `0.50` resident windows both stayed around
-3.5 s/step. `checkpoint_offload_boundary` stores boundary inputs and recomputes
-the 36 Qwen decoder blocks during backward, so the remaining speed work is
-partial checkpointing or a true no-recompute activation/sub-tape offload path,
-not more block-loader retuning.
+fast by itself. After flame-core added padded unmasked cuDNN SDPA backward and
+O1 switched to structured prefix-causal/full attention, the full image-token
+pass no longer falls back because token counts are not 64-aligned or because
+the old mixed mask was materialized. A 10-step probe still measured about
+3.0 s/step.
+`checkpoint_offload_boundary` stores boundary inputs and recomputes the
+36 Qwen decoder blocks during backward, so the remaining speed work is partial
+checkpointing or a true no-recompute activation/sub-tape offload path, not more
+block-loader retuning.
 
 ### 3. Frozen-weight gradient skip (autograd, May 15)
 
