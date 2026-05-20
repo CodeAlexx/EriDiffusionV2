@@ -1,7 +1,38 @@
 # HiDream-O1 Project Status
 
 **Updated:** 2026-05-20
-**Phase:** O1 trainer launch fix landed and freshly validated at 256 and 800 steps; deeper raw-weight parity remains open.
+**Phase:** Structured-attention O1 validation in progress. The north star is valid LoRAs with speed beating, matching, or close to ai-toolkit.
+
+## North Star / Hard Gates
+
+Do not call HiDream-O1 training "fixed" just because the trainer runs, loss is
+finite, or a short LoRA file saves. The two gates are:
+
+1. **Valid LoRA gate**: train a real LoRA, then render a matched pair with
+   Flame O1 inference: same seed, prompt, resolution, one image with no LoRA
+   and one image with the trained LoRA. The LoRA image must stay clean and show
+   the trigger-bound dataset style. For the active Giger run, the trigger is
+   `gigver3`; do not rely on prompts that spell out Giger/biomechanical terms
+   as the only proof.
+2. **Speed gate**: measure EDV2 step time against the ai-toolkit O1 trainer
+   reference. EDV2 does not need to copy every internal implementation detail,
+   but a 3x gap is not acceptable unless the run is explicitly trading speed
+   for memory through block streaming/checkpoint recompute. Record pure
+   training s/step, setup time, and whether the model is resident or offloaded
+   before comparing.
+
+ai-toolkit is the behavior/config/speed reference. Exported EDV2 LoRA metadata
+must still identify this trainer as `edv2 trainer` and must not write
+ai-toolkit/aitoolkit strings into the weights.
+
+Active validation run started 2026-05-20:
+
+```text
+output/hidream_o1_gigerver3_structured_800_20260520/
+cache: cache/gigerver3_hidream_o1_512_mropefix
+command: train_hidream_o1 --steps 800 --lr 2e-4 --save-every 200 --lora-stats-every 25
+post-run required: 1024x1024 no-LoRA vs LoRA render with trigger prompt
+```
 
 ## Scope
 
