@@ -8,6 +8,10 @@
 //! `EriDiffusion-v2/docs/hidream_o1_trainer_analysis.md` §1 for the full
 //! refresher.
 //!
+//! Production training targets the **HiDream-O1-Image-Full** checkpoint. Older
+//! local notes and Dev-weight defaults came from an accidental download of a
+//! non-training/dev variant and should not be used for trainer parity.
+//!
 //! ## Cache contract (consumed from `prepare_hidream_o1` output)
 //!
 //! Each `sample_NNNNNN.safetensors` carries (all F32 on disk per
@@ -74,13 +78,12 @@
 //! O1 attention is now structured instead of materialized: the decoder uses
 //! flame-core `sdpa_prefix_causal_full`, so the AR/text prefix is causal and
 //! image rows are full-attention without building the old `[B, 1, S, S]` mask.
-//! The full unmasked pass can use padded cuDNN SDPA backward; the small causal
-//! prefix pass remains on the fallback unless `FLAME_CUDNN_SDPA_BWD_CAUSAL=1`
-//! proves faster for a specific model. This removes the old
-//! `[sdpa-bwd] bail:mask-present` O1 hot path. Remaining speed gap is boundary
-//! checkpoint replay/model kernels. Weak style application should be debugged
-//! via export/runtime LoRA strength, trigger/caption binding, and x0-vs-velocity
-//! training objective, not by retuning block-loader slots.
+//! Flame records the mixed attention as one custom autograd op: forward uses
+//! prefix causal + suffix masked attention, while backward recomputes once as
+//! the exact prefix-causal/full mask. This avoids the old two-SDPA shared-K/V
+//! gradient collapse and the cuDNN plan failures seen on O1's non-aligned
+//! suffix shape. Remaining speed/parity gaps are lower-layer/model-kernel
+//! issues, not this SDPA mask path.
 
 use clap::Parser;
 use eridiffusion_core::config::{TrainConfig, TrainingMethod};
@@ -97,7 +100,7 @@ use std::path::{Path, PathBuf};
 
 const SEED: u64 = 42;
 const CLIP_GRAD_NORM: f32 = 1.0;
-const DEFAULT_MODEL_PATH: &str = "/home/alex/HiDream-O1-Image-Dev-weights";
+const DEFAULT_MODEL_PATH: &str = "/home/alex/HiDream-O1-Image-Full-weights";
 /// Reference `DEFAULT_NOISE_SCALE` (pipeline.py:15). Noise is scaled by this
 /// factor in both add_noise and the loss target.
 const NOISE_SCALE: f32 = 8.0;

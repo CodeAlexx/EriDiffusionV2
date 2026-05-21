@@ -19,12 +19,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-const DEFAULT_MODEL_PATH: &str = "/home/alex/HiDream-O1-Image-Dev-weights";
+const DEFAULT_MODEL_PATH: &str = "/home/alex/HiDream-O1-Image-Full-weights";
 const DEFAULT_REF_PATH: &str = "/tmp/hidream_o1_train_step_ref.safetensors";
 const DEFAULT_LORA_REF_PATH: &str = "/tmp/hidream_o1_lora_step_ref.safetensors";
 const LORA_RANK: usize = 32;
 const LORA_ALPHA: f32 = 32.0;
-const LORA_ADAPTERS: usize = 252;
+// 252 decoder + 5 resident heads = 257 (matches Python ref with transformer_only=False).
+const LORA_ADAPTERS: usize = 257;
 const CLIP_GRAD_NORM: f32 = 1.0;
 
 #[derive(Parser)]
@@ -300,13 +301,50 @@ fn compare_per_layer_dump(
         .map_err(|e| anyhow::anyhow!("load Rust per-layer dump {path}: {e}"))?;
     let mut keys = Vec::with_capacity(cfg.num_layers + 2);
     keys.push("hidden_input_layer_00".to_string());
+    for key in [
+        "layer00.normed",
+        "layer00.q_proj",
+        "layer00.k_proj",
+        "layer00.v_proj",
+        "layer00.q_heads",
+        "layer00.k_heads",
+        "layer00.v_heads",
+        "layer00.cos_half",
+        "layer00.sin_half",
+        "layer00.q_mean_sq",
+        "layer00.k_mean_sq",
+        "layer00.q_inv",
+        "layer00.k_inv",
+        "layer00.q_unit",
+        "layer00.k_unit",
+        "layer00.q_normed",
+        "layer00.k_normed",
+        "layer00.q_rope",
+        "layer00.k_rope",
+        "layer00.k_repeat",
+        "layer00.v_repeat",
+        "layer00.sdpa_out",
+        "layer00.o_proj_in",
+        "layer00.attn_out",
+        "layer00.after_attn",
+        "layer00.normed2",
+        "layer00.gate",
+        "layer00.up",
+        "layer00.mlp_inner",
+        "layer00.mlp_out",
+        "layer00.hidden_out",
+    ] {
+        keys.push(key.to_string());
+    }
     for i in 0..cfg.num_layers {
         keys.push(format!("hidden_layer_{i:02}"));
     }
     keys.push("hidden_final_norm".to_string());
 
     println!();
-    println!("per-layer forward parity:");
+    println!("per-layer forward parity (all layers, no early exit):");
+    let mut all_ok = true;
+    let mut first_fail: Option<String> = None;
     for key in keys {
         let ours_t = ours
             .get(&key)
@@ -318,11 +356,16 @@ fn compare_per_layer_dump(
         let ok = forward_pass(&m, args);
         print_metric("forward", &key, &m, ok);
         if !ok {
-            println!("[o1-train-step] first failing stage: forward::{key}");
-            return Ok(false);
+            all_ok = false;
+            if first_fail.is_none() {
+                first_fail = Some(key.clone());
+            }
         }
     }
-    Ok(true)
+    if let Some(k) = first_fail {
+        println!("[o1-train-step] first failing per-layer stage: forward::{k}");
+    }
+    Ok(all_ok)
 }
 
 fn scatter_tms_token_for_predecoder(
@@ -476,11 +519,37 @@ fn run_predecoder_only(
     let t_emb = timestep_embedder.forward_lora(timestep, None)?;
     let text_emb_with_t =
         scatter_tms_token_for_predecoder(&cfg, &text_emb_ref, input_ids, &t_emb, device)?;
+    let patch_proj1 = flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
+        noisy,
+        &patch_embed.proj1.weight,
+        patch_embed.proj1.bias.as_ref(),
+    )?;
+    let patch_proj1_native = flame_core::ops::fused_inference::fused_linear3d_native(
+        noisy,
+        &patch_embed.proj1.weight,
+        patch_embed.proj1.bias.as_ref(),
+    )?;
+    let patch_proj1_matmul = {
+        let wt = patch_embed.proj1.weight.transpose()?;
+        noisy.matmul(&wt)?
+    };
+    let patch_proj2_nobias =
+        flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
+            &patch_proj1,
+            &patch_embed.proj2.weight,
+            None,
+        )?;
     let patch_emb = patch_embed.forward_lora(noisy, None)?;
     let inputs_embeds = Tensor::cat(&[&text_emb_with_t, &patch_emb], 1)?;
 
     println!();
     println!("pre-decoder parity:");
+    for (label, tensor) in [
+        ("pre.native", &patch_proj1_native),
+        ("pre.matmul", &patch_proj1_matmul),
+    ] {
+        let _ = compare_ref_tensor(label, "pre.patch_proj1", &tensor.to_dtype(DType::F32)?, ref_tensors, args)?;
+    }
     for (key, tensor) in [
         ("pre.t_freq_bf16", &t_freq_bf16),
         ("pre.t_mlp0_out", &t_mlp0_out),
@@ -488,6 +557,8 @@ fn run_predecoder_only(
         ("pre.t_mlp2_nobias", &t_mlp2_nobias),
         ("pre.t_emb", &t_emb),
         ("pre.text_emb_with_t", &text_emb_with_t),
+        ("pre.patch_proj1", &patch_proj1),
+        ("pre.patch_proj2_nobias", &patch_proj2_nobias),
         ("pre.patch_emb", &patch_emb),
         ("pre.inputs_embeds", &inputs_embeds),
         ("hidden_input_layer_00", &inputs_embeds),
@@ -620,7 +691,9 @@ fn run() -> anyhow::Result<bool> {
 
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
-    let activation_cache = if args.lora_step {
+    let disable_grow_activation_cache =
+        std::env::var("FLAME_DISABLE_GROW_ACTIVATION_CACHE").ok().as_deref() == Some("1");
+    let activation_cache = if args.lora_step && !disable_grow_activation_cache {
         let slab_bytes = 1usize << 30;
         let cache = setup_grow_activation_cache(&device, slab_bytes)
             .map_err(|e| anyhow::anyhow!("setup_grow_activation_cache: {e}"))?;
@@ -630,6 +703,9 @@ fn run() -> anyhow::Result<bool> {
         );
         Some(cache)
     } else {
+        if args.lora_step {
+            log::info!("[o1-train-step] grow activation cache disabled by env");
+        }
         None
     };
     let _no_grad = if args.lora_step {
@@ -726,7 +802,7 @@ fn run() -> anyhow::Result<bool> {
             0,
             &device,
             DType::F32,
-            false,
+            true, // include 5 resident O1 head adapters (matches Python ref)
         )
         .map_err(|e| anyhow::anyhow!("LoraRegistry::new: {e}"))?;
         load_lora_init(&lora, st, &device)?;
@@ -796,17 +872,22 @@ fn run() -> anyhow::Result<bool> {
 
     println!();
     if !args.per_layer_dump.is_empty() {
-        if !compare_per_layer_dump(
+        let per_layer_ok = compare_per_layer_dump(
             &args.per_layer_dump,
             &ref_tensors,
             &cfg,
             &device,
             &args,
-        )? {
-            return Ok(false);
+        )?;
+        if !per_layer_ok {
+            println!("[o1-train-step] per-layer dump showed drift (continuing for backward diag)");
         }
     }
 
+    // DIAGNOSTIC MODE 2026-05-21: continue past forward failure so we can
+    // see LoRA backward / grad parity numbers even when forward drift exceeds
+    // tolerance. Original early-return logic preserved as "tag noting which
+    // gate would have failed" without bailing.
     let x_full_ok = compare_ref_tensor(
         "forward",
         "x_pred_full",
@@ -815,22 +896,19 @@ fn run() -> anyhow::Result<bool> {
         &args,
     )?;
     if !x_full_ok {
-        println!("[o1-train-step] first failing stage: forward::x_pred_full");
-        return Ok(false);
+        println!("[o1-train-step] forward::x_pred_full FAILED (continuing for backward diag)");
     }
 
     let x_rows_ok = forward_pass(&x_metrics, &args);
     print_metric("forward", "x_pred_rows", &x_metrics, x_rows_ok);
     if !x_rows_ok {
-        println!("[o1-train-step] first failing stage: forward::x_pred_rows");
-        return Ok(false);
+        println!("[o1-train-step] forward::x_pred_rows FAILED (continuing for backward diag)");
     }
 
     let pred_velocity_ok = forward_pass(&v_metrics, &args);
     print_metric("objective", "pred_velocity", &v_metrics, pred_velocity_ok);
     if !pred_velocity_ok {
-        println!("[o1-train-step] first failing stage: objective::pred_velocity");
-        return Ok(false);
+        println!("[o1-train-step] objective::pred_velocity FAILED (continuing for backward diag)");
     }
 
     println!(
@@ -838,8 +916,7 @@ fn run() -> anyhow::Result<bool> {
         loss_velocity_val, loss_velocity_ref, loss_abs, loss_rel
     );
     if loss_rel > args.max_loss_rel {
-        println!("[o1-train-step] first failing stage: objective::loss_velocity");
-        return Ok(false);
+        println!("[o1-train-step] objective::loss_velocity FAILED (continuing for backward diag)");
     }
 
     let lora_passed = if args.lora_step {

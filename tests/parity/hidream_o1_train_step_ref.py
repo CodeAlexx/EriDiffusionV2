@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-MODEL_PATH = "/home/alex/HiDream-O1-Image-Dev-weights"
+MODEL_PATH = "/home/alex/HiDream-O1-Image-Full-weights"
 DEFAULT_CACHE_DIR = (
     "/home/alex/EriDiffusion/EriDiffusion-v2/cache/"
     "gigerver3_hidream_o1_512_mropefix"
@@ -28,11 +28,11 @@ NOISE_SCALE = 8.0
 T_EPS = 1.0e-3
 LORA_RANK = 32
 LORA_ALPHA = 32
-LORA_ADAPTERS = 252
+LORA_ADAPTERS = 257  # 252 decoder + 5 resident heads (x_embedder.proj{1,2}, t_embedder1.mlp.{0,2}, final_layer2.linear)
 MAX_GRAD_NORM = 1.0
 ADAMW_LR = 1.0e-4
 ADAMW_EPS = 1.0e-6
-ADAMW_WEIGHT_DECAY = 1.0e-2
+ADAMW_WEIGHT_DECAY = 1.0e-4  # matches current Rust trainer + V67's bnb default
 
 
 def _die(msg: str, code: int = 2) -> None:
@@ -81,7 +81,16 @@ def _registry_key_from_lora_name(name: str) -> str:
                 changed = True
     if clean.startswith("language_model."):
         clean = clean[len("language_model."):]
-    if not clean.startswith("layers."):
+    # Accept decoder-layer adapters AND the 5 O1 resident head adapters
+    # (matches Rust registry default_resident_target_keys).
+    _RESIDENT_HEADS = (
+        "x_embedder.proj1",
+        "x_embedder.proj2",
+        "t_embedder1.mlp.0",
+        "t_embedder1.mlp.2",
+        "final_layer2.linear",
+    )
+    if not (clean.startswith("layers.") or clean in _RESIDENT_HEADS):
         _die(f"unexpected O1 LoRA target name: {name} -> {clean}")
     return clean
 
@@ -162,7 +171,11 @@ def main() -> int:
 
     try:
         from extensions_built_in.diffusion_models.hidream.src.hidream_o1.qwen3_vl_transformers import (
+            ALL_ATTENTION_FUNCTIONS,
             Qwen3VLForConditionalGeneration,
+            apply_rotary_pos_emb,
+            eager_attention_forward,
+            repeat_kv,
         )
     except Exception as e:  # noqa: BLE001
         _die(f"failed importing ai-toolkit HiDream-O1 modules from {repo_root}: {e}")
@@ -245,7 +258,7 @@ def main() -> int:
             train_unet=True,
             target_lin_modules=["Qwen3VLForConditionalGeneration"],
             ignore_if_contains=["lm_head", "patch_embed", "visual"],
-            transformer_only=True,
+            transformer_only=False,  # include 5 resident O1 head adapters (matches Rust --include-resident-lora)
             is_transformer=True,
             base_model=_O1BaseForLora(),
         )
@@ -407,11 +420,125 @@ def main() -> int:
                 pre_t_emb_expanded,
                 pre_text_emb,
             )
+            pre_patch_proj1 = model.model.x_embedder.proj1(noisy)
+            pre_patch_proj2_nobias = torch.nn.functional.linear(
+                pre_patch_proj1, model.model.x_embedder.proj2.weight, None
+            )
+            pre_patch_proj2_manual_bias = (
+                pre_patch_proj2_nobias + model.model.x_embedder.proj2.bias
+            )
             pre_patch_emb = model.model.x_embedder(noisy).to(pre_text_emb.dtype)
             pre_inputs_embeds = torch.cat(
                 [pre_text_emb_with_t, pre_patch_emb],
                 dim=1,
             )
+            text_model = model.model.language_model
+            layer00 = text_model.layers[0]
+            attn00 = layer00.self_attn
+            position_embeddings00 = text_model.rotary_emb(pre_inputs_embeds, position_ids)
+            cos00, sin00 = position_embeddings00
+            layer00_cos_half = cos00[..., : attn00.head_dim // 2].contiguous()
+            layer00_sin_half = sin00[..., : attn00.head_dim // 2].contiguous()
+            idx_ar00 = torch.nonzero(~token_types[0].bool(), as_tuple=False).squeeze(-1)
+            input_shape00 = pre_inputs_embeds.shape[:-1]
+            hidden_shape_q00 = (*input_shape00, -1, attn00.head_dim)
+
+            layer00_normed = layer00.input_layernorm(pre_inputs_embeds)
+            layer00_q_proj = attn00.q_proj(layer00_normed)
+            layer00_k_proj = attn00.k_proj(layer00_normed)
+            layer00_v_proj = attn00.v_proj(layer00_normed)
+            layer00_q_heads = layer00_q_proj.view(hidden_shape_q00).transpose(1, 2).contiguous()
+            layer00_k_heads = layer00_k_proj.view(hidden_shape_q00).transpose(1, 2).contiguous()
+            layer00_v_heads = layer00_v_proj.view(hidden_shape_q00).transpose(1, 2).contiguous()
+            def _rms_unit(x, eps):
+                y = x.to(torch.float32)
+                variance = y.pow(2).mean(-1, keepdim=True)
+                y = y * torch.rsqrt(variance + eps)
+                return y.to(x.dtype)
+            def _rms_inv(x, eps):
+                y = x.to(torch.float32)
+                variance = y.pow(2).mean(-1, keepdim=True)
+                return torch.rsqrt(variance + eps)
+            def _rms_mean_sq(x):
+                y = x.to(torch.float32)
+                return y.pow(2).mean(-1, keepdim=True)
+            layer00_q_mean_sq = _rms_mean_sq(
+                layer00_q_proj.view(hidden_shape_q00),
+            ).squeeze(-1).transpose(1, 2).contiguous()
+            layer00_k_mean_sq = _rms_mean_sq(
+                layer00_k_proj.view(hidden_shape_q00),
+            ).squeeze(-1).transpose(1, 2).contiguous()
+            layer00_q_inv = _rms_inv(
+                layer00_q_proj.view(hidden_shape_q00),
+                attn00.q_norm.variance_epsilon,
+            ).squeeze(-1).transpose(1, 2).contiguous()
+            layer00_k_inv = _rms_inv(
+                layer00_k_proj.view(hidden_shape_q00),
+                attn00.k_norm.variance_epsilon,
+            ).squeeze(-1).transpose(1, 2).contiguous()
+            layer00_q_unit = _rms_unit(
+                layer00_q_proj.view(hidden_shape_q00),
+                attn00.q_norm.variance_epsilon,
+            ).transpose(1, 2).contiguous()
+            layer00_k_unit = _rms_unit(
+                layer00_k_proj.view(hidden_shape_q00),
+                attn00.k_norm.variance_epsilon,
+            ).transpose(1, 2).contiguous()
+            layer00_q_normed = attn00.q_norm(
+                layer00_q_proj.view(hidden_shape_q00)
+            ).transpose(1, 2).contiguous()
+            layer00_k_normed = attn00.k_norm(
+                layer00_k_proj.view(hidden_shape_q00)
+            ).transpose(1, 2).contiguous()
+            layer00_q_rope, layer00_k_rope = apply_rotary_pos_emb(
+                layer00_q_normed, layer00_k_normed, cos00, sin00
+            )
+            layer00_q_rope = layer00_q_rope.contiguous()
+            layer00_k_rope = layer00_k_rope.contiguous()
+            layer00_k_repeat = repeat_kv(
+                layer00_k_rope, attn00.num_key_value_groups
+            ).contiguous()
+            layer00_v_repeat = repeat_kv(
+                layer00_v_heads, attn00.num_key_value_groups
+            ).contiguous()
+
+            attention_interface00 = eager_attention_forward
+            if attn00.config._attn_implementation != "eager":
+                attention_interface00 = ALL_ATTENTION_FUNCTIONS[
+                    attn00.config._attn_implementation
+                ]
+            layer00_out_ar, _ = attention_interface00(
+                attn00,
+                layer00_q_rope[:, :, idx_ar00].contiguous(),
+                layer00_k_rope[:, :, idx_ar00].contiguous(),
+                layer00_v_heads[:, :, idx_ar00].contiguous(),
+                attention_mask=None,
+                dropout=0.0,
+                scaling=attn00.head_dim**-0.5,
+                is_causal=True,
+            )
+            layer00_out_full, _ = attention_interface00(
+                attn00,
+                layer00_q_rope,
+                layer00_k_rope,
+                layer00_v_heads,
+                attention_mask=None,
+                dropout=0.0,
+                scaling=attn00.head_dim**-0.5,
+                is_causal=False,
+            )
+            layer00_out_full = layer00_out_full.clone()
+            layer00_out_full[:, idx_ar00] = layer00_out_ar
+            layer00_sdpa_out = layer00_out_full.transpose(1, 2).contiguous()
+            layer00_o_proj_in = layer00_out_full.reshape(*input_shape00, -1).contiguous()
+            layer00_attn_out = attn00.o_proj(layer00_o_proj_in)
+            layer00_after_attn = pre_inputs_embeds + layer00_attn_out
+            layer00_normed2 = layer00.post_attention_layernorm(layer00_after_attn)
+            layer00_gate = layer00.mlp.gate_proj(layer00_normed2)
+            layer00_up = layer00.mlp.up_proj(layer00_normed2)
+            layer00_mlp_inner = layer00.mlp.act_fn(layer00_gate) * layer00_up
+            layer00_mlp_out = layer00.mlp.down_proj(layer00_mlp_inner)
+            layer00_hidden_out = layer00_after_attn + layer00_mlp_out
         layer_dump["pre.text_emb"] = pre_text_emb.detach().float().contiguous().cpu()
         layer_dump["pre.t_freq_fp32"] = pre_t_freq_fp32.detach().float().contiguous().cpu()
         layer_dump["pre.t_freq_bf16"] = pre_t_freq_bf16.detach().float().contiguous().cpu()
@@ -423,10 +550,51 @@ def main() -> int:
         layer_dump["pre.text_emb_with_t"] = (
             pre_text_emb_with_t.detach().float().contiguous().cpu()
         )
+        layer_dump["pre.patch_proj1"] = pre_patch_proj1.detach().float().contiguous().cpu()
+        layer_dump["pre.patch_proj2_nobias"] = (
+            pre_patch_proj2_nobias.detach().float().contiguous().cpu()
+        )
+        layer_dump["pre.patch_proj2_manual_bias"] = (
+            pre_patch_proj2_manual_bias.detach().float().contiguous().cpu()
+        )
         layer_dump["pre.patch_emb"] = pre_patch_emb.detach().float().contiguous().cpu()
         layer_dump["pre.inputs_embeds"] = (
             pre_inputs_embeds.detach().float().contiguous().cpu()
         )
+        for key, tensor in {
+            "layer00.normed": layer00_normed,
+            "layer00.q_proj": layer00_q_proj,
+            "layer00.k_proj": layer00_k_proj,
+            "layer00.v_proj": layer00_v_proj,
+            "layer00.q_heads": layer00_q_heads,
+            "layer00.k_heads": layer00_k_heads,
+            "layer00.v_heads": layer00_v_heads,
+            "layer00.cos_half": layer00_cos_half,
+            "layer00.sin_half": layer00_sin_half,
+            "layer00.q_mean_sq": layer00_q_mean_sq,
+            "layer00.k_mean_sq": layer00_k_mean_sq,
+            "layer00.q_inv": layer00_q_inv,
+            "layer00.k_inv": layer00_k_inv,
+            "layer00.q_unit": layer00_q_unit,
+            "layer00.k_unit": layer00_k_unit,
+            "layer00.q_normed": layer00_q_normed,
+            "layer00.k_normed": layer00_k_normed,
+            "layer00.q_rope": layer00_q_rope,
+            "layer00.k_rope": layer00_k_rope,
+            "layer00.k_repeat": layer00_k_repeat,
+            "layer00.v_repeat": layer00_v_repeat,
+            "layer00.sdpa_out": layer00_sdpa_out,
+            "layer00.o_proj_in": layer00_o_proj_in,
+            "layer00.attn_out": layer00_attn_out,
+            "layer00.after_attn": layer00_after_attn,
+            "layer00.normed2": layer00_normed2,
+            "layer00.gate": layer00_gate,
+            "layer00.up": layer00_up,
+            "layer00.mlp_inner": layer00_mlp_inner,
+            "layer00.mlp_out": layer00_mlp_out,
+            "layer00.hidden_out": layer00_hidden_out,
+        }.items():
+            layer_dump[key] = tensor.detach().float().contiguous().cpu()
     if args.lora_step:
         x_pred_full.retain_grad()
     x_pred_rows = x_pred_full[0, vinput_mask[0]].unsqueeze(0)
