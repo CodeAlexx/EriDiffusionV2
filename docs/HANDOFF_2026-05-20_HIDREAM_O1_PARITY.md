@@ -675,9 +675,19 @@ This supersedes the earlier "1000-step run is next" status above.
   moved toward that path inside `flame-core`.
 - Flame's in-tree FA2 BF16 forward now supports head dimensions `{64, 96, 128}`
   plus a runtime causal flag. The current HiDream-focused patch uses raw
-  logits, `exp2`/log2 softmax scaling, reverse K/V tile traversal, and causal
-  masking. This is still the existing Flame shared-memory accumulator kernel,
-  not the full PyTorch CUTLASS/CUTE tile layout.
+  logits, PyTorch-style `UNFUSE_FMA` `exp2(score * scale - max_scaled)`
+  softmax scaling, reverse K/V tile traversal, causal masking, and HD128
+  non-causal `64x32` tiling. This is still the existing Flame shared-memory
+  accumulator kernel, not the full PyTorch CUTLASS/CUTE tile layout.
+- Direct FA2 traps are green after fixing a stale test-reference bug where
+  F32 `bmm` read a non-contiguous transposed K view as raw storage:
+  `fa2_parity_naive` passes for `N={512,4096}, HD={64,128}` and
+  `sdpa_ragged_sk` passes for `Sk={64,71,72,128,200}`.
+- The production gate now fails honestly instead of printing PASS when only
+  the LoRA sub-gate passes. Current Full-model pinned run:
+  `layer00.sdpa_out` OK (`max_abs=1.953125e-3`), first failure
+  `forward::layer00.attn_out`, final loss rel `~8.0e-5` vs the strict
+  `1e-5` gate.
 - Exact PyTorch tile parity is deferred until after the trainer gate unless
   the smoke still proves it is required. PyTorch's useful SM8x reference
   targets are HD64 non-causal `128x128`, HD96 non-causal `128x64`,

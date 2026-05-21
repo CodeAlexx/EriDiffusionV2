@@ -871,8 +871,9 @@ fn run() -> anyhow::Result<bool> {
     let loss_rel = loss_abs / loss_velocity_ref.abs().max(1.0e-12);
 
     println!();
+    let mut per_layer_ok = true;
     if !args.per_layer_dump.is_empty() {
-        let per_layer_ok = compare_per_layer_dump(
+        per_layer_ok = compare_per_layer_dump(
             &args.per_layer_dump,
             &ref_tensors,
             &cfg,
@@ -915,7 +916,8 @@ fn run() -> anyhow::Result<bool> {
         "loss_velocity: ours={:.9} ref={:.9} abs={:.6e} rel={:.6e}",
         loss_velocity_val, loss_velocity_ref, loss_abs, loss_rel
     );
-    if loss_rel > args.max_loss_rel {
+    let loss_ok = loss_rel <= args.max_loss_rel;
+    if !loss_ok {
         println!("[o1-train-step] objective::loss_velocity FAILED (continuing for backward diag)");
     }
 
@@ -1148,7 +1150,15 @@ fn run() -> anyhow::Result<bool> {
         true
     };
 
-    if lora_passed {
+    let forward_passed = per_layer_ok && x_full_ok && x_rows_ok;
+    let objective_passed = pred_velocity_ok && loss_ok;
+    let passed = forward_passed && objective_passed && lora_passed;
+    println!(
+        "[o1-train-step] gates: per_layer={} x_pred_full={} x_pred_rows={} pred_velocity={} loss={} lora={}",
+        per_layer_ok, x_full_ok, x_rows_ok, pred_velocity_ok, loss_ok, lora_passed
+    );
+
+    if passed {
         println!(
             "[o1-train-step] PASS — fixed input, target, prediction and loss are in parity"
         );

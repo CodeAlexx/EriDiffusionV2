@@ -152,13 +152,17 @@ Adam `m`/`v` is **pre-warmed** before the slab env-flag activates so optimizer s
 
 Telemetry on a 6-step run: 258 AwaitHit / 0 AwaitMiss.
 
-HiDream-O1 note (2026-05-20): O1 now uses the same structured
-prefix-causal/full attention route as ai-toolkit's `use_flash_attn=True`
-training path, and the fixed-input parity gate matches ai-toolkit's velocity
-loss within `3.25e-5` relative error on the pinned sample. The production
-trainer defaults are velocity loss, the ai-toolkit/public O1 LoRA surface
-(252 language-layer adapters plus the five O1 head adapters), and
-`--export-scale=1.0`; `--no-resident-lora` is only a transformer-only ablation.
+HiDream-O1 note (2026-05-21): O1 uses the structured prefix-causal/full
+attention route corresponding to ai-toolkit's `use_flash_attn=True` training
+path, but production parity is still red. The fixed-input gate now fails
+honestly when forward/objective/per-layer metrics fail; current first failure
+is `forward::layer00.attn_out` after `layer00.sdpa_out` remains within the
+current threshold. The pinned Full-model loss is close (`rel ~= 8.0e-5`) but
+above the strict `1e-5` gate, so do not treat the trainer as validated or run
+the 1000-step `/eri2` proof yet. Production defaults remain velocity loss,
+the ai-toolkit/public O1 LoRA surface (252 language-layer adapters plus the
+five O1 head adapters), and `--export-scale=1.0`; `--no-resident-lora` is only
+a transformer-only ablation.
 
 The remaining speed gap is not a materialized-mask or block-loader tuning issue:
 `checkpoint_offload_boundary` stores boundary inputs and recomputes the 36 Qwen
