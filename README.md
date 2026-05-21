@@ -152,18 +152,19 @@ Adam `m`/`v` is **pre-warmed** before the slab env-flag activates so optimizer s
 
 Telemetry on a 6-step run: 258 AwaitHit / 0 AwaitMiss.
 
-HiDream-O1 note (2026-05-20): moving it to the same flame-core
-`BlockOffloader` + `.with_native_layout(true)` + `FLAME_LAYER_OFFLOAD_FRACTION`
-shape as Klein is required for VRAM headroom, but it did not make 512 training
-fast by itself. After flame-core added padded unmasked cuDNN SDPA backward and
-O1 switched to structured prefix-causal/full attention, the full image-token
-pass no longer falls back because token counts are not 64-aligned or because
-the old mixed mask was materialized. A 10-step probe still measured about
-3.0 s/step.
-`checkpoint_offload_boundary` stores boundary inputs and recomputes the
-36 Qwen decoder blocks during backward, so the remaining speed work is partial
-checkpointing or a true no-recompute activation/sub-tape offload path, not more
-block-loader retuning.
+HiDream-O1 note (2026-05-20): O1 now uses the same structured
+prefix-causal/full attention route as ai-toolkit's `use_flash_attn=True`
+training path, and the fixed-input parity gate matches ai-toolkit's velocity
+loss within `3.25e-5` relative error on the pinned sample. The production
+trainer defaults are velocity loss, the ai-toolkit/public O1 LoRA surface
+(252 language-layer adapters plus the five O1 head adapters), and
+`--export-scale=1.0`; `--no-resident-lora` is only a transformer-only ablation.
+
+The remaining speed gap is not a materialized-mask or block-loader tuning issue:
+`checkpoint_offload_boundary` stores boundary inputs and recomputes the 36 Qwen
+decoder blocks during backward. Speed work after LoRA validity should reduce
+checkpoint coverage when VRAM allows or add a true no-recompute
+activation/sub-tape offload path.
 
 ### 3. Frozen-weight gradient skip (autograd, May 15)
 

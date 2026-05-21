@@ -45,16 +45,15 @@
 //!   # Convert model x0-style output to velocity to match `target`. From
 //!   # `hidream_o1_model.py:469-473`:
 //!   pred  = (x_t - x_pred) / max(t, t_eps)         # = z_s - patches if perfect
-//!   # Production training defaults to x0 MSE (`--loss-objective x0`) because
-//!   # velocity MSE is algebraically x0 error weighted by 1 / t^2, which makes
-//!   # low-sigma samples dominate O1 LoRA gradients.
+//!   # Production training defaults to velocity MSE because that is the
+//!   # ai-toolkit O1 contract. Low-sigma samples can spike the logged loss
+//!   # through the 1 / t^2 weighting; use the board's x0 loss only as a
+//!   # diagnostic, not as the trained objective.
 //! ```
 //!
 //! The conversion `pred = (x_t - x_pred)/t` (in float32) reproduces the
-//! reference Python implementation's
-//! `get_noise_prediction` exactly and is still available as
-//! `--loss-objective velocity` for reference parity.  The default trains the
-//! model's native x0 prediction directly.
+//! reference Python implementation's `get_noise_prediction` exactly.  The
+//! `x0` objective is retained only for ablation/debug runs.
 //!
 //! ## Diagnostics
 //!
@@ -140,14 +139,14 @@ struct Args {
     /// LoRA alpha. Reference yaml default: 32 (`train_lora_hidream_48.yaml:27`).
     #[arg(long, default_value = "32.0")]
     lora_alpha: f32,
-    /// Compatibility flag retained for old scripts. Resident pixel/timestep
-    /// heads are now enabled by default; use `--no-resident-lora` for the old
-    /// transformer-only 504-tensor layout.
+    /// Explicit ablation: also train O1 head adapters
+    /// (`x_embedder`, `t_embedder1`, `final_layer2`). Disabled by default
+    /// because ai-toolkit's current HiDream-O1 training surface saves 252
+    /// Qwen language-layer adapters.
     #[arg(long, default_value_t = false, conflicts_with = "no_resident_lora")]
     include_resident_lora: bool,
-    /// Disable O1 resident pixel/timestep-head LoRAs and train decoder layers
-    /// only. This is useful for transformer-only parity probes, but the
-    /// known-good public O1 LoRA layout includes these heads.
+    /// Compatibility no-op for older scripts. The default already skips O1
+    /// head adapters to match ai-toolkit training.
     #[arg(long, default_value_t = false, conflicts_with = "include_resident_lora")]
     no_resident_lora: bool,
     /// Learning rate. Kept conservative for O1; override explicitly when
@@ -214,8 +213,9 @@ struct Args {
     /// hard-codes this for every Adam-family path, overriding torch's 1e-8).
     #[arg(long, default_value_t = 1.0e-6)]
     adamw_eps: f32,
-    /// AdamW weight decay.
-    #[arg(long, default_value_t = 1.0e-4)]
+    /// AdamW weight decay. bitsandbytes AdamW8bit default = 0.01, and
+    /// ai-toolkit's O1 config does not override it.
+    #[arg(long, default_value_t = 1.0e-2)]
     adamw_weight_decay: f32,
     /// Clamp scalar loss before backward. Disabled by default; the reference
     /// TrainConfig leaves `max_loss` unset, and clamping a scalar MSE
@@ -223,11 +223,10 @@ struct Args {
     /// no-op optimizer steps.
     #[arg(long, default_value_t = 0.0)]
     max_loss: f32,
-    /// Loss objective. `x0` trains HiDream-O1's native clean-patch prediction
-    /// directly and is the EDv2 default. `velocity` preserves reference parity,
-    /// but weights clean-patch error by 1/sigma^2 and can produce low-sigma
-    /// loss/grad spikes.
-    #[arg(long, default_value = "x0")]
+    /// Loss objective. `velocity` matches ai-toolkit HiDream-O1:
+    /// target = noise * noise_scale - patches and pred = (x_t - x0_pred)/sigma.
+    /// `x0` is retained only as an ablation/debug path.
+    #[arg(long, default_value = "velocity")]
     loss_objective: String,
     /// Log aggregate LoRA A/B magnitudes every N optimizer steps. Set 0 to
     /// disable. This catches A-collapse or B-overgrowth early in long runs.
@@ -235,9 +234,9 @@ struct Args {
     lora_stats_every: usize,
     /// Scale LoRA B matrices only when writing weights-only exports. The
     /// in-memory train state and full checkpoints remain raw so resume math is
-    /// unchanged. 0.25 is the current HiDream-O1 safe export default from the
-    /// 2026-05-20 validation run.
-    #[arg(long, default_value_t = 0.25)]
+    /// unchanged. Production LoRA exports must default to the trained delta
+    /// (`1.0`); use lower values only for explicit debug strength sweeps.
+    #[arg(long, default_value_t = 1.0)]
     export_scale: f32,
 }
 
@@ -559,10 +558,16 @@ fn main() -> anyhow::Result<()> {
 
     let tstep_mode = parse_tstep_mode(&args.timestep_distribution)?;
     let loss_objective = parse_loss_objective(&args.loss_objective)?;
-    let include_resident_lora = !args.no_resident_lora;
+    let include_resident_lora = args.include_resident_lora;
     if args.include_resident_lora {
+        log::warn!(
+            "[hidream_o1] --include-resident-lora selected 257-adapter O1-head ablation; \
+             this does not match ai-toolkit's current 252-adapter O1 training surface"
+        );
+    }
+    if args.no_resident_lora {
         log::info!(
-            "[hidream_o1] --include-resident-lora is now the default; use --no-resident-lora to disable"
+            "[hidream_o1] --no-resident-lora is already the default for ai-toolkit O1 parity"
         );
     }
     log::info!(

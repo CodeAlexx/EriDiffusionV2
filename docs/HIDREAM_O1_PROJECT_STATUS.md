@@ -1,137 +1,182 @@
 # HiDream-O1 Project Status
 
 **Updated:** 2026-05-20
-**Phase:** Structured-attention O1 validation in progress. The north star is valid LoRAs with speed beating, matching, or close to ai-toolkit.
+**Phase:** parity-first O1 validation. The north star is a valid LoRA, not just
+finite loss or a saved safetensors file.
 
-## North Star / Hard Gates
+## Hard Gates
 
-Do not call HiDream-O1 training "fixed" just because the trainer runs, loss is
-finite, or a short LoRA file saves. The two gates are:
+1. **Exact fixed-input gates first.** Compare ai-toolkit and EDV2 on the same
+   cached sample, same noise, same sigma, same target, same BF16 velocity
+   conversion, and same scalar loss before judging stochastic training runs.
+2. **Valid LoRA gate.** Train a real LoRA, then render a matched no-LoRA and
+   with-LoRA pair in Flame O1 inference using the same seed, prompt, resolution,
+   and sampler. The LoRA image must stay clean and show trigger-bound dataset
+   style. For the active Giger dataset, the trigger is `gigver3`; do not prove
+   style by spelling out Giger/biomechanical terms in the prompt.
+3. **Speed sanity.** Record step time and memory, but do not let speed obscure
+   the validity gate. A fast broken LoRA is still broken.
 
-1. **Valid LoRA gate**: train a real LoRA, then render a matched pair with
-   Flame O1 inference: same seed, prompt, resolution, one image with no LoRA
-   and one image with the trained LoRA. The LoRA image must stay clean and show
-   the trigger-bound dataset style. For the active Giger run, the trigger is
-   `gigver3`; do not rely on prompts that spell out Giger/biomechanical terms
-   as the only proof.
-2. **Speed gate**: measure EDV2 step time against the ai-toolkit O1 trainer
-   reference. EDV2 does not need to copy every internal implementation detail,
-   but a 3x gap is not acceptable unless the run is explicitly trading speed
-   for memory through block streaming/checkpoint recompute. Record pure
-   training s/step, setup time, and whether the model is resident or offloaded
-   before comparing.
+ai-toolkit is the behavior reference for HiDream-O1. EDV2 saved LoRAs must keep
+EDV2 metadata (`ss_training_comment = edv2 trainer`) and must not write
+`ai-toolkit` / `aitoolkit` strings into EDV2 weights.
 
-ai-toolkit is the behavior/config/speed reference. Exported EDV2 LoRA metadata
-must still identify this trainer as `edv2 trainer` and must not write
-ai-toolkit/aitoolkit strings into the weights.
+## Current Defaults
 
-Active validation run started 2026-05-20:
-
-```text
-output/hidream_o1_gigerver3_structured_800_20260520/
-cache: cache/gigerver3_hidream_o1_512_mropefix
-command: train_hidream_o1 --steps 800 --lr 2e-4 --save-every 200 --lora-stats-every 25
-post-run required: 1024x1024 no-LoRA vs LoRA render with trigger prompt
-```
-
-## Scope
-
-HiDream-O1 is the Open-1 pixel model, not HiDream-I1. It has no VAE and no external text encoder. EDV2 training and Flame inference both use the same HiDream-O1 Dev weights at:
+`train_hidream_o1` production defaults are now aligned to ai-toolkit's O1
+training contract:
 
 ```text
-/home/alex/HiDream-O1-Image-Dev-weights
+loss objective:      velocity
+LoRA surface:        ai-toolkit/public O1 surface, 257 adapters
+rank/alpha:          32/32
+optimizer:           AdamW8bit
+export scale:        1.0
+resident O1 heads:   on by default
 ```
 
-The production trainer is:
+The 257-adapter surface is 252 Qwen language-layer adapters plus these five
+O1 heads:
 
 ```text
-/home/alex/EriDiffusion/EriDiffusion-v2/crates/eridiffusion-cli/src/bin/train_hidream_o1.rs
+diffusion_model.x_embedder.proj1
+diffusion_model.x_embedder.proj2
+diffusion_model.t_embedder1.mlp.0
+diffusion_model.t_embedder1.mlp.2
+diffusion_model.final_layer2.linear
 ```
 
-The inference path used for validation is:
+Use `--no-resident-lora` only for transformer-only ablations. It is not the
+ai-toolkit O1 public-LoRA surface.
+
+## Exact Parity Evidence
+
+The new fixed training-step parity fixture is:
 
 ```text
-/home/alex/EriDiffusion/inference-flame/src/bin/hidream_o1_infer.rs
+tests/parity/hidream_o1_train_step_ref.py
+crates/eridiffusion-cli/src/bin/parity_hidream_o1_train_step.rs
 ```
 
-## Current Answer
+It pins the first cached Giger sample, `seed=4242`, `sigma=0.5`, scaled noise
+`noise * 8`, ai-toolkit's training-style `use_flash_attn=True` forward, the
+BF16-rounded velocity prediction, and scalar MSE.
 
-The old O1 loss spikes came from the velocity objective:
+Current result:
 
 ```text
-velocity_loss = x0_error / sigma^2
+ai-toolkit loss_velocity = 0.386822551
+EDV2 loss_velocity       = 0.386835128
+relative diff            = 3.25e-5
 ```
 
-Low-sigma samples naturally create large velocity loss and grad-norm spikes even when the clean-patch x0 error is small. The trainer now logs both x0 and velocity losses so the board shows whether a spike is objective math or real x0 failure.
+The direct `x_pred_rows` element max differs slightly more than a strict
+elementwise cap because PyTorch and Flame use different BF16 attention kernels,
+but the target conversion and scalar objective match tightly enough to rule out
+the old data/noise/timestep/loss mismatch.
 
-The current usable export path is:
+The existing G0/G1 gates still matter:
 
 ```text
-resident-head F32 LoRA training + weights-only export_scale=0.25
+G0: Python vs Flame base forward parity
+G1: Flame no-LoRA forward vs Flame zero-LoRA forward self-consistency
 ```
 
-`--export-scale` scales B matrices only in the exported safetensors. Full checkpoints stay raw for resume.
+## Active Validation Run
 
-The 800-step validation proved the spike diagnosis directly: max velocity loss was `12.0565`, but the corresponding x0 loss was only `0.008483` at sigma `0.0265`. The exported LoRA still rendered a clean image through Flame O1 inference.
+Public-style resident-head run started 2026-05-20:
 
-## Validated Artifacts
+```bash
+LD_LIBRARY_PATH=/opt/libtorch-cu121/libtorch/lib:$LD_LIBRARY_PATH \
+RUST_LOG=info \
+target/release/train_hidream_o1 \
+  --cache-dir cache/gigerver3_hidream_o1_512_mropefix \
+  --steps 1000 \
+  --save-every 500 \
+  --lora-stats-every 50 \
+  --output-dir output/hidream_o1_gigerver3_resident_1000_20260520 \
+  --export-scale 1.0
+```
 
-| Artifact | Meaning |
-|---|---|
-| `output/hidream_o1_gigerver3_x0_resident_768_20260520/hidream_o1_lora_768steps.safetensors` | Stable x0 training metrics, but full-strength render was flat. |
-| `output/hidream_o1_gigerver3_velocity_resident_256_validrun_20260520/hidream_o1_lora_256steps.safetensors` | Fresh committed-trainer run with `--export-scale 0.25`; rendered valid. |
-| `output/hidream_o1_gigerver3_velocity_resident_800_rerun_20260520/hidream_o1_lora_800steps.safetensors` | 800-step committed-trainer run with `--export-scale 0.25`; rendered valid. |
-| `inference-flame/output/o1_validrun_20260520/velocity_256_exportscale025_seed42.png` | Clean render from the fresh committed-trainer LoRA. |
-| `inference-flame/output/o1_800_rerun_20260520/velocity_800_exportscale025_seed42.png` | Clean render from the 800-step committed-trainer LoRA. |
-| `inference-flame/output/o1_velocity_validation_20260520/known_good_steampunk_gigver_prompt_seed42.png` | Public O1 LoRA rendered valid at full strength, so Flame O1 LoRA loading is not generally broken. |
-
-Fresh 800-step validation hashes:
+Render both no-LoRA and with-LoRA at 1024x1024 using:
 
 ```text
-LoRA: 2b8e9e938ff8495fe52341899bc0fb0e8e96c1595b81afbded69ce67a28e5df7
-PNG:  cd0d31351db4b4dcc7048bc78ffbebef9c67e69499692ddd398fed1fd211b54e
+gigver3, Male anime character centered, oni mask, glitch art, glitchcore, organic, forest druid, dark souls boss, cyber punk, hellscape, portrait, male anime character, robot, masterpiece, intricate, highly detailed, sharp, technological rings
 ```
 
-The LoRA metadata has `ss_training_comment = edv2 trainer`, `edv2.export_scale = 0.25`, and no `ai-toolkit` / `aitoolkit` strings.
+Keep the user's longer prompt available for the final comparison, but the short
+trigger prompt is the cleaner style-binding test.
 
-## Code Decisions
+## Stability Notes
 
-- O1 LoRA tensors train in F32.
-- Flame O1 LoRA residuals accept BF16 or F32 adapter tensors.
-- Resident O1 heads are trained by default; `--no-resident-lora` is only for old transformer-only probes.
-- Weights-only safetensors use EDV2 metadata and include `edv2.export_scale`.
-- `--save-mode full` requires `--optimizer adamw`; other optimizers fail loudly.
-- No in-trainer sampling yet. Render saved LoRAs with `hidream_o1_infer`.
-
-## Flame-Core Dependency
-
-O1 training uses the flame-core `BlockOffloader` path and `checkpoint_offload_boundary` around decoder blocks. Flame docs now record that this buys memory headroom but still recomputes the 36 Qwen decoder blocks during backward, so O1 should not be expected to match Klein speed until checkpoint coverage or activation offload changes.
-
-The observed EDV2 O1 rate is about 3.1 s/step at 512 after warmup. The 800-step run took `41:34`, with host RSS flat around 15.4 GB and VRAM plateaued at `11202 MiB`. AI-toolkit's O1 implementation uses PyTorch/HF checkpointing and, when not in `low_vram` layer-offload mode, keeps the transformer resident on GPU. A near-1 s/step AI-toolkit O1 run is therefore not apples-to-apples against EDV2's conservative BF16 block-streaming path.
-
-Speed probe, 2026-05-20:
+HiDream-O1 emits clean-patch `x0`. ai-toolkit trains velocity:
 
 ```text
-FLAME_LOG_SDPA_BWD=1 train_hidream_o1 --steps 3 ...
-108 [sdpa-bwd] bail:mask-present
+x_t = (1 - sigma) * patches + sigma * (noise * 8)
+target_velocity = noise * 8 - patches
+pred_velocity = (x_t - x0_pred) / sigma
+velocity_loss = mse(pred_velocity, target_velocity)
 ```
 
-This means every O1 decoder layer hit flame-core's masked SDPA backward fallback for the causal AR/text pass. The fallback is slower but should still be mathematically valid; it is not evidence that Giger style failed to train.
+Low-sigma samples amplify x0 error by `1 / sigma^2`, so velocity loss spikes
+are expected. EDV2 logs both `hidream_o1/loss_x0` and
+`hidream_o1/loss_velocity`; use x0 telemetry to distinguish real model failure
+from velocity weighting.
 
-## Style Strength Notes
+## Speed Notes
 
-The 800-step Giger LoRA rendered cleanly but weakly. The speed issue above does not explain weak style application. More likely suspects:
+O1 uses the same flame-core resident-set `BlockOffloader` and structured
+prefix-causal/full attention path as the current trainer stack. The full image
+token pass is now on the fast two-pass path, but O1 still wraps all 36 Qwen
+decoder blocks in `checkpoint_offload_boundary`, so backward recomputes the
+decoder. Speed work after validity should reduce checkpoint coverage when VRAM
+allows or add a true no-recompute activation/sub-tape offload path.
 
-- The validated LoRA was exported with `--export-scale 0.25`, so inference applies one-quarter of the trained delta.
-- The test prompt used `gigver3` but also a long list of competing style/content tokens. That can bury a weak trigger.
-- The dataset captions are mostly trigger-tagged (`gigver3` in 67/70 text files), but the captions are long and 50/70 also spell out `Giger`, `Alien`, or biomechanical terms. Trigger binding is therefore not proven by one busy prompt.
-- The 800-step validation run used the velocity objective for parity/stress testing. x0 remains the cleaner production objective because velocity weights low-sigma samples harder.
+## Structural Fixes Landed 2026-05-20 (Uncommitted)
 
-A useful next debug is a no-training scale sweep: re-export or rescale the 800-step LoRA to effective strengths `0.25`, `0.5`, `1.0`, and `2.0`, then render a simple `gigver3, portrait...` prompt and the same prompt without LoRA. If full-strength shows style but artifacts, the issue is strength/stability. If full-strength still lacks style, debug captions/objective/training.
+Three structural correctness fixes landed in the working tree across
+flame-core / inference-flame / EriDiffusion-v2. Full inventory in
+[`HANDOFF_2026-05-20_HIDREAM_O1_PARITY.md`](./HANDOFF_2026-05-20_HIDREAM_O1_PARITY.md)
+§"2026-05-20 Evening Update".
+
+1. **`Op::RoPePrecomputed` now carries an explicit
+   `autograd::RopeLayout` tag** (`Interleaved` / `Halfsplit`).
+   Replaces the backward shape-sniffer that mis-classified HiDream-O1
+   MRoPE cos `[1, S, half]` (rank-3 but Halfsplit forward) as
+   Interleaved — a Q/K LoRA-B grad-direction silent corrupter.
+   Forward sites in `flame-core/src/bf16_ops.rs` and trainer-level
+   call sites (`EriDiffusion-v2/.../chroma.rs:2332`) now pass the
+   correct tag.
+
+2. **`fused_linear3d_native_pytorch_parity`** — new bit-exact PyTorch
+   `gemm_and_bias<BF16>` mirror, ~1% perf overhead. HiDream-O1's
+   `timestep_embedder` and `bottleneck_patch_embed` no-LoRA paths now
+   use it. Result: `pre.t_emb` is bit-exact; `pre.patch_emb` mean_abs
+   dropped from 3e-3 to 5.7e-5 (53× improvement).
+
+3. **`AutogradContext::retain_intermediate_grads_add`** — additive
+   retain-set API so probe IDs registered *during* checkpoint
+   recompute are honored by the sub-tape walk. Enables the soul.md
+   trap meta-pattern under gradient checkpointing.
+
+Next-step bisect uncovered that the localized trap-probe site
+("dV out of SDPA bwd cos = 0.012") is **autograd-clean in
+single-layer isolation** — see
+`flame-core/tests/sdpa_prefix_causal_full_grad.rs` reproducing the
+exact HiDream-O1 attention chain at exact shapes with cos = 1.0 /
+max_abs = 0. The end-to-end cos gap is either a parity-comparison
+artifact (Python forward-hooks vs Rust TensorId capture) or a
+multi-layer cascade. Structural fixes above are correctness wins
+regardless and stay.
 
 ## Next Work
 
-1. Compare raw EDV2 O1 deltas against the public O1 LoRA per layer to explain why raw full-strength EDV2 output is overpowered.
-2. Add an O1 LoRA scale-sweep export path or inference runtime scale so style strength can be tested without retraining.
-3. Add a high-memory O1 speed probe that reduces checkpoint coverage where VRAM allows.
-4. Keep using x0 telemetry as the main stability signal and velocity telemetry as the parity/debug signal.
+1. Finish the resident-head validation run kicked off 2026-05-20 and
+   render no-LoRA / with-LoRA samples.
+2. If LoRA validity holds, commit all three repos with the structural
+   fixes from 2026-05-20.
+3. If style is weak at full strength, add a fixed-input LoRA
+   backward/update parity gate against ai-toolkit and re-run the
+   per-layer parity sweep past `hidden_input_layer_00` end-to-end.
+4. Commit only after docs, parity gates, and at least one valid sample
+   pair are recorded.

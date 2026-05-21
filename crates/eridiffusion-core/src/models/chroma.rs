@@ -2319,16 +2319,17 @@ fn rope_with_grad(x: &Tensor, pe_cos: &Tensor, pe_sin: &Tensor) -> Result<Tensor
         output = output.requires_grad_(true);
         AutogradContext::record_op(
             output.id(),
-            // flame-core HEAD's `Op::RoPePrecomputed` no longer carries an
-            // explicit layout; backward dispatches by saved cos shape
-            // (broadcast `[1,_,_,_]` / `[1,1,_,_]` / `[1,_,_]` →
-            // fused/Interleaved). Chroma's pe_cos is `[1,1,N,half]`, so
-            // this routes to `rope_fused_bf16` on backward — same kernel
-            // family used in forward, no behavior change.
+            // Chroma forward uses `rope_fused_bf16` (Interleaved layout: pairs
+            // (2d, 2d+1)). Backward must match — pass the explicit layout tag
+            // so flame-core's autograd dispatches to the same kernel, regardless
+            // of pe_cos shape. (Replaces a previous shape-sniff dispatch that
+            // was correct for Chroma's `[1,1,N,half]` but mis-classified
+            // HiDream-O1's `[1,S,half]` Halfsplit case.)
             Op::RoPePrecomputed {
                 input: x.id(),
                 cos: pe_cos.id(),
                 sin: pe_sin.id(),
+                layout: flame_core::autograd::RopeLayout::Interleaved,
             },
             vec![
                 (x.id(), x.clone()),
