@@ -8,6 +8,14 @@ description = "EriDiffusion Rust port — CLI"
 name = "eridiffusion"
 path = "src/main.rs"
 
+[[bin]]
+name = "prepare_l2p"
+path = "src/bin/prepare_l2p.rs"
+
+[[bin]]
+name = "train_l2p"
+path = "src/bin/train_l2p.rs"
+
 [dependencies]
 eridiffusion-core = { path = "../eridiffusion-core" }
 # inference-flame is sibling to EriDiffusion-v2 in the EriDiffusion repo.
