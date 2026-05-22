@@ -48,11 +48,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use eridiffusion_core::training::board::BoardWriter;
-use eridiffusion_core::training::training_features::timestep_dist::{
-    TimestepConfig, TimestepDistribution,
-};
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
-use std::str::FromStr as _;
+use rand::Rng as _;
 
 use inference_flame::lora::{LoraStack, Slot, TrainEntry};
 use inference_flame::models::l2p::{weight_loader::translate_l2p_keys, L2pDiT};
@@ -61,7 +58,6 @@ use inference_flame::models::l2p::{weight_loader::translate_l2p_keys, L2pDiT};
 // Hyperparameters mirroring Z-Image preset / L2P train_run.sh
 // -------------------------------------------------------------------------
 
-const NUM_TRAIN_TIMESTEPS: usize = 1000;
 const SEED: u64 = 42;
 
 // DiT dimensions — pinned from L2pDiTConfig::default() in
@@ -118,37 +114,28 @@ struct Args {
     /// SQLite scalars DB for the BoardWriter (per-step loss / grad_norm).
     #[arg(long, default_value = "./l2p_train.board.db")]
     log_db: PathBuf,
-    /// Timestep sampling distribution. Default matches Z-Image's released
-    /// preset (LOGIT_NORMAL).
-    #[arg(long, default_value = "logit_normal")]
-    timestep_distribution: String,
-    /// LOGIT_NORMAL bias (mu). 0.0 matches Z-Image.
-    #[arg(long, default_value_t = 0.0)]
-    noising_bias: f32,
-    /// LOGIT_NORMAL weight (sigma offset). 0.0 matches Z-Image (`scale = 1.0`).
-    #[arg(long, default_value_t = 0.0)]
-    noising_weight: f32,
+    /// Number of training-time scheduler steps. Per Python
+    /// `train_L2P.py:89` (`num_inference_steps: 500` in inputs_shared)
+    /// L2P trains with a 500-step FLUX-shift schedule. The trainer
+    /// uniform-samples an index in `[0, train_num_steps)` and reads the
+    /// shift-warped sigma from that index. Audit F3+F4 fix
+    /// (`MATH_AUDIT_2026-05-22.md`).
+    #[arg(long, default_value_t = 500)]
+    train_num_steps: usize,
+    /// FlowMatch sigma shift used to warp the training schedule. Must match
+    /// the inference shift (default 3.0 per L2P pipeline preset). Same
+    /// formula as `build_l2p_sigma_schedule`: `shift·s/(1 + (shift-1)·s)`.
+    #[arg(long, default_value_t = 3.0)]
+    train_shift: f32,
     /// Optimizer family. `adamw` is the canonical project default (BF16
     /// grad → F32 moments via the default `GradDtypePolicy::CastToF32`).
     #[arg(long, default_value = "adamw")]
     optimizer: String,
 }
 
-fn build_timestep_config(
-    distribution: &str,
-    weight: f32,
-    bias: f32,
-) -> anyhow::Result<TimestepConfig> {
-    let dist = TimestepDistribution::from_str(distribution)
-        .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
-    Ok(TimestepConfig {
-        distribution: dist,
-        noising_weight: weight,
-        noising_bias: bias,
-        min_strength: 0.0,
-        max_strength: 1.0,
-    })
-}
+// (build_timestep_config removed 2026-05-22 — L2P uses uniform-over-warped-schedule
+//  sampling per Python `FlowMatchSFTLoss`, not LOGIT_NORMAL. See
+//  build_l2p_training_sigma_table in inference_flame::sampling::l2p_sampling.)
 
 // -------------------------------------------------------------------------
 // LoRA target table — per-block weight keys + (in, out) dims
@@ -326,11 +313,16 @@ fn main() -> anyhow::Result<()> {
     log::info!("[3/5] Optimizer: {} lr={}", opt_kind.as_str(), args.lr);
     let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
 
-    let timestep_cfg = build_timestep_config(
-        &args.timestep_distribution,
-        args.noising_weight,
-        args.noising_bias,
-    )?;
+    // Training-time sigma table — uniform-over-FLUX-warped per Python L2P.
+    // Audit F3+F4 fix: replaces the LOGIT_NORMAL sampling that was inherited
+    // from Z-Image's preset but doesn't match what L2P actually does.
+    let train_sigmas = inference_flame::sampling::l2p_sampling::
+        build_l2p_training_sigma_table(args.train_num_steps, args.train_shift);
+    log::info!(
+        "[3/5] Training sigma table: {} steps × shift={} (FLUX-shift, matches Python FlowMatchScheduler 'Z-Image')",
+        args.train_num_steps,
+        args.train_shift,
+    );
 
     let board = BoardWriter::open(
         &args.output,
@@ -395,12 +387,21 @@ fn main() -> anyhow::Result<()> {
             .to_dtype(DType::BF16)?;
 
         // ── Sample timestep + build noisy / target ───────────────────
-        let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
-        let sigma_idx = (raw_t.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
-        let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32; // ∈ (0, 1]
-        // L2P's forward_inner takes `v ∈ [0, 1]` and applies `(1 - v) *
-        // time_scale` internally (PORT_SPEC Special #2 + dit.rs:686-696).
-        // So we pass sigma directly as `v`.
+        //
+        // Python L2P (loss.py:6-13 with train_L2P.py:89 `num_inference_steps=500`):
+        //   timestep_id = randint(0, len(scheduler.timesteps))     # uniform [0, 500)
+        //   sigma       = scheduler.sigmas[timestep_id]            # FLUX-shifted
+        //   noisy       = (1 - sigma) * clean + sigma * noise
+        //   target      = noise - clean
+        //   pred        = -DiT(noisy, timestep=sigma*1000 → forward divides by 1000)
+        //   loss        = MSE(pred, target)
+        //
+        // Our path mirrors exactly: uniform idx → lookup shift-warped sigma →
+        // pass that sigma as `v ∈ [0,1]` to L2pDiT.forward (which applies
+        // `(1-v)*time_scale` internally — net effect identical to Python's
+        // `timestep / 1000` pre-divide).
+        let train_idx: usize = (rng.gen::<u32>() as usize) % args.train_num_steps;
+        let sigma = train_sigmas[train_idx]; // shift-warped, in (0, 1]
         let v_in = sigma;
 
         let noise = Tensor::randn(pixel.shape().clone(), 0.0, 1.0, device.clone())?
