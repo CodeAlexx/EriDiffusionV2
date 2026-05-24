@@ -97,12 +97,8 @@ pub fn log_step_with_resume(
     } else {
         format!("[{tag}] ")
     };
-    // Use scientific notation for loss + grad_norm so values in the e-5/e-6
-    // range stay readable. Fixed-precision (`{:.4}`) printed everything below
-    // 5e-5 as `0.0000`, masking real-but-small gradient signal — a recurring
-    // source of "is the trainer dead?" confusion.
     println!(
-        "{prefix}step {}/{} | epoch {}/{} | loss {:.3e} | grad_norm {:.3e} | {:.1}s/step | elapsed {}:{:02}:{:02} | ETA {}:{:02}:{:02}",
+        "{prefix}step {}/{} | epoch {}/{} | loss {:.4} | grad_norm {:.4} | {:.1}s/step | elapsed {}:{:02}:{:02} | ETA {}:{:02}:{:02}",
         absolute_step_1based, total, cur_epoch, total_epochs,
         loss, grad_norm, sec_per_step,
         eh, em, es, ah, am, as_,
