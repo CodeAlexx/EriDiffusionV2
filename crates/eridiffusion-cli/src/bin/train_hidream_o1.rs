@@ -1077,7 +1077,8 @@ fn main() -> anyhow::Result<()> {
             .to_dtype(DType::I32)?;
         let mut position_ids = sample
             .get("position_ids")
-            .ok_or_else(|| anyhow::anyhow!("missing `position_ids` in {path_disp}"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing `position_ids` in {path_disp}"))?
+            .to_dtype(DType::F32)?;
         let mut vinput_mask = sample
             .get("vinput_mask")
             .ok_or_else(|| anyhow::anyhow!("missing `vinput_mask` in {path_disp}"))?
@@ -1132,7 +1133,7 @@ fn main() -> anyhow::Result<()> {
         flame_core::debug_finite::check("g2.vinput_mask", &vinput_mask)?;
         flame_core::debug_finite::check("g2.token_types", &token_types_bin)?;
 
-        let (t_pos, h_pos, w_pos) = decode_position_ids(position_ids)?;
+        let (t_pos, h_pos, w_pos) = decode_position_ids(&position_ids)?;
         let pos_view = MRopePositions {
             t: &t_pos,
             h: &h_pos,
