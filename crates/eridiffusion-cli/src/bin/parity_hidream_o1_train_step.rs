@@ -27,6 +27,51 @@ const LORA_ALPHA: f32 = 32.0;
 // 252 decoder + 5 resident heads = 257 (matches Python ref with transformer_only=False).
 const LORA_ADAPTERS: usize = 257;
 const CLIP_GRAD_NORM: f32 = 1.0;
+const FORWARD_PROBE_KEYS: &[&str] = &[
+    "normed",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "q_heads",
+    "k_heads",
+    "v_heads",
+    "cos_half",
+    "sin_half",
+    "q_mean_sq",
+    "k_mean_sq",
+    "q_inv",
+    "k_inv",
+    "q_unit",
+    "k_unit",
+    "q_normed",
+    "k_normed",
+    "q_rope",
+    "k_rope",
+    "k_repeat",
+    "v_repeat",
+    "sdpa_out",
+    "o_proj_in",
+    "attn_out",
+    "after_attn",
+    "normed2",
+    "gate",
+    "up",
+    "mlp_inner",
+    "mlp_out",
+    "hidden_out",
+];
+const FORWARD_TRAP_KEYS: &[&str] = &[
+    "sdpa_out",
+    "o_proj_in",
+    "attn_out",
+    "after_attn",
+    "normed2",
+    "gate",
+    "up",
+    "mlp_inner",
+    "mlp_out",
+    "hidden_out",
+];
 
 #[derive(Parser)]
 #[command(name = "parity_hidream_o1_train_step")]
@@ -132,6 +177,104 @@ struct Metrics {
     rel: f32,
 }
 
+fn parity_trap_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HIDREAM_O1_PARITY_TRAP")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+fn parity_trap_key(name: &str) -> bool {
+    if let Ok(patterns) = std::env::var("HIDREAM_O1_DIFF_TRAP") {
+        if patterns
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .any(|part| name.contains(part))
+        {
+            return true;
+        }
+    }
+
+    let Some((prefix, suffix)) = name.split_once('.') else {
+        return false;
+    };
+    prefix.starts_with("layer") && FORWARD_TRAP_KEYS.contains(&suffix)
+}
+
+fn dump_probe_layers_from_env() -> Vec<usize> {
+    let mut out: Vec<usize> = std::env::var("HIDREAM_DUMP_PROBE_LAYERS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|part| part.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![0]);
+    if out.is_empty() {
+        out.push(0);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn unravel_index(mut idx: usize, shape: &[usize]) -> Vec<usize> {
+    let mut out = vec![0; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        let dim = shape[axis].max(1);
+        out[axis] = idx % dim;
+        idx /= dim;
+    }
+    out
+}
+
+fn print_offender_trap(name: &str, shape: &[usize], ours: &[f32], reference: &[f32]) {
+    if !(parity_trap_enabled() || std::env::var("HIDREAM_O1_DIFF_TRAP").is_ok())
+        || !parity_trap_key(name)
+    {
+        return;
+    }
+
+    let mut nonzero = 0usize;
+    let mut top: Vec<(f32, usize, f32, f32)> = Vec::with_capacity(8);
+    for (idx, (&x, &y)) in ours.iter().zip(reference.iter()).enumerate() {
+        let abs = (x - y).abs();
+        if abs == 0.0 {
+            continue;
+        }
+        nonzero += 1;
+        if top.len() < 8 {
+            top.push((abs, idx, x, y));
+            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        } else if abs > top.last().map(|v| v.0).unwrap_or(0.0) {
+            *top.last_mut().unwrap() = (abs, idx, x, y);
+            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+
+    eprintln!(
+        "[o1-trap] {name}: shape={shape:?} nonzero_diff={} / {}",
+        nonzero,
+        ours.len()
+    );
+    for (rank, (abs, idx, x, y)) in top.iter().enumerate() {
+        let coord = unravel_index(*idx, shape);
+        eprintln!(
+            "[o1-trap] {name}: top#{:<2} flat={} coord={coord:?} ours={:.9e} ref={:.9e} delta={:.9e} abs={:.9e}",
+            rank + 1,
+            idx,
+            x,
+            y,
+            x - y,
+            abs
+        );
+    }
+}
+
 fn compare_slices(name: &str, a: &[f32], b: &[f32]) -> anyhow::Result<Metrics> {
     if a.len() != b.len() {
         anyhow::bail!("{name}: len mismatch ours={} ref={}", a.len(), b.len());
@@ -181,6 +324,7 @@ fn compare_vec(name: &str, ours: &Tensor, reference: &Tensor) -> anyhow::Result<
     }
     let a = ours.to_dtype(DType::F32)?.to_vec_f32()?;
     let b = reference.to_dtype(DType::F32)?.to_vec_f32()?;
+    print_offender_trap(name, ours.shape().dims(), &a, &b);
     compare_slices(name, &a, &b)
 }
 
@@ -248,6 +392,7 @@ fn compare_tensor_to_st(
         );
     }
     let ours = ours.to_dtype(DType::F32)?.to_vec_f32()?;
+    print_offender_trap(key, &shape, &ours, &reference);
     compare_slices(key, &ours, &reference)
 }
 
@@ -299,42 +444,13 @@ fn compare_per_layer_dump(
 ) -> anyhow::Result<bool> {
     let ours = flame_core::serialization::load_file(std::path::Path::new(path), device)
         .map_err(|e| anyhow::anyhow!("load Rust per-layer dump {path}: {e}"))?;
-    let mut keys = Vec::with_capacity(cfg.num_layers + 2);
+    let probe_layers = dump_probe_layers_from_env();
+    let mut keys = Vec::with_capacity(cfg.num_layers + 2 + probe_layers.len() * FORWARD_PROBE_KEYS.len());
     keys.push("hidden_input_layer_00".to_string());
-    for key in [
-        "layer00.normed",
-        "layer00.q_proj",
-        "layer00.k_proj",
-        "layer00.v_proj",
-        "layer00.q_heads",
-        "layer00.k_heads",
-        "layer00.v_heads",
-        "layer00.cos_half",
-        "layer00.sin_half",
-        "layer00.q_mean_sq",
-        "layer00.k_mean_sq",
-        "layer00.q_inv",
-        "layer00.k_inv",
-        "layer00.q_unit",
-        "layer00.k_unit",
-        "layer00.q_normed",
-        "layer00.k_normed",
-        "layer00.q_rope",
-        "layer00.k_rope",
-        "layer00.k_repeat",
-        "layer00.v_repeat",
-        "layer00.sdpa_out",
-        "layer00.o_proj_in",
-        "layer00.attn_out",
-        "layer00.after_attn",
-        "layer00.normed2",
-        "layer00.gate",
-        "layer00.up",
-        "layer00.mlp_inner",
-        "layer00.mlp_out",
-        "layer00.hidden_out",
-    ] {
-        keys.push(key.to_string());
+    for layer_idx in probe_layers {
+        for suffix in FORWARD_PROBE_KEYS {
+            keys.push(format!("layer{layer_idx:02}.{suffix}"));
+        }
     }
     for i in 0..cfg.num_layers {
         keys.push(format!("hidden_layer_{i:02}"));
@@ -774,6 +890,21 @@ fn run() -> anyhow::Result<bool> {
         Some(buf) => Some(SafeTensors::deserialize(buf)?),
         None => None,
     };
+    let sdpa_bwd_ref_path = std::env::var("HIDREAM_SDPA_BWD_REF")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
+    let sdpa_bwd_ref_buf = match sdpa_bwd_ref_path.as_ref() {
+        Some(path) => Some(
+            std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("read HIDREAM_SDPA_BWD_REF {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
+    let sdpa_bwd_ref = match sdpa_bwd_ref_buf.as_ref() {
+        Some(buf) => Some(SafeTensors::deserialize(buf)?),
+        None => None,
+    };
 
     let (t_pos, h_pos, w_pos) = decode_position_ids(&position_ids)?;
     let pos_view = MRopePositions {
@@ -825,12 +956,16 @@ fn run() -> anyhow::Result<bool> {
         );
     }
 
-    // Soul.md trap: arm layer-0 attention probes BEFORE forward. The decoder
-    // hot path records v_proj's output and SDPA's output tensor IDs into
-    // a static registry; we pull them out after forward and add them to the
-    // intermediate-grad retain set so the gradients survive backward and can
-    // be compared against the Python ref's `grad_probe.layers.{probe_layer_idx:02}.{name}` dumps.
-    inference_flame::models::hidream_o1::trap::arm_probes();
+    // Diagnostic trap: only arm/retain internal backward probes when explicitly
+    // requested. Leaving this on for normal parity changes the retained autograd
+    // set and can perturb tiny BF16 backward roundoff enough for Adam's first
+    // step to amplify it.
+    let bwd_trap_enabled = parity_trap_enabled() || sdpa_bwd_ref.is_some();
+    if bwd_trap_enabled {
+        inference_flame::models::hidream_o1::trap::arm_probes();
+    } else {
+        inference_flame::models::hidream_o1::trap::disarm_probes();
+    }
 
     log::info!("[o1-train-step] running Rust forward ...");
     let start = std::time::Instant::now();
@@ -984,7 +1119,11 @@ fn run() -> anyhow::Result<bool> {
         let n_kv = cfg.num_kv_heads;
         let head_dim = cfg.head_dim;
         let n_rep = n_q / n_kv;
-        let probe_layer_idx = cfg.num_layers - 1;
+        let probe_layer_idx = std::env::var("HIDREAM_BWD_PROBE_LAYER")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|&idx| idx < cfg.num_layers)
+            .unwrap_or(cfg.num_layers - 1);
         for (name, id) in trap_probe_ids.iter() {
             let key = format!("grad_probe.layers.{probe_layer_idx:02}.{name}");
             let grad = match retained.get(id) {
@@ -1028,16 +1167,36 @@ fn run() -> anyhow::Result<bool> {
                 }
                 _ => (grad.clone(), key.clone()),
             };
-            let m = match compare_tensor_to_st(&compare_key, &rearranged_grad, st) {
-                Ok(m) => m,
-                Err(e) => {
-                    println!("{key:<40}: SKIPPED ({e})");
-                    continue;
+            let fixture_key = match name.as_str() {
+                "q_sdpa_in" => Some("dq"),
+                "k_sdpa_in" => Some("dk"),
+                "v_sdpa_in" => Some("dv"),
+                _ => None,
+            };
+            let (m, note_extra) = if let (Some(sdpa_st), Some(fixture_key)) =
+                (sdpa_bwd_ref.as_ref(), fixture_key)
+            {
+                match tensor_from_st(sdpa_st, fixture_key, &device)
+                    .and_then(|reference| compare_vec(&compare_key, &rearranged_grad, &reference))
+                {
+                    Ok(m) => (m, format!(" (vs HIDREAM_SDPA_BWD_REF::{fixture_key})")),
+                    Err(e) => {
+                        println!("{key:<40}: SKIPPED ({e})");
+                        continue;
+                    }
+                }
+            } else {
+                match compare_tensor_to_st(&compare_key, &rearranged_grad, st) {
+                    Ok(m) => (m, String::new()),
+                    Err(e) => {
+                        println!("{key:<40}: SKIPPED ({e})");
+                        continue;
+                    }
                 }
             };
             let note = if compare_key != key { format!(" (vs {compare_key})") } else { String::new() };
             println!(
-                "{key:<40}: cos={:.8} max_abs={:.6e} mean_abs={:.6e} rel={:.6e}{note}",
+                "{key:<40}: cos={:.8} max_abs={:.6e} mean_abs={:.6e} rel={:.6e}{note}{note_extra}",
                 m.cos, m.max_abs, m.mean_abs, m.rel
             );
         }
@@ -1123,6 +1282,18 @@ fn run() -> anyhow::Result<bool> {
             st,
             &args,
         )?;
+
+        if std::env::var("HIDREAM_USE_REF_GRADS_FOR_OPT")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            println!("[o1-train-step] diagnostic: using reference grad_post tensors for optimizer step");
+            for (name, p) in &named {
+                let key = format!("grad_post.{name}");
+                p.set_grad(tensor_from_st(st, &key, &device)?)?;
+            }
+        }
 
         let lr = st_scalar(st, "adamw_lr")?;
         let wd = st_scalar(st, "adamw_weight_decay")?;

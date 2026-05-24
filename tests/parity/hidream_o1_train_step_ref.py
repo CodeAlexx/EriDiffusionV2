@@ -95,6 +95,23 @@ def _registry_key_from_lora_name(name: str) -> str:
     return clean
 
 
+def _parse_probe_layers(raw: str, max_layers: int) -> list[int]:
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            idx = int(part)
+        except ValueError:
+            _die(f"invalid --probe-layers entry {part!r}")
+        if idx < 0 or idx >= max_layers:
+            _die(f"--probe-layers entry {idx} out of range [0,{max_layers})")
+        if idx not in out:
+            out.append(idx)
+    return out or [0]
+
+
 def _lora_named_params(network):
     out = {}
     for lora in network.unet_loras:
@@ -142,6 +159,11 @@ def main() -> int:
         action="store_true",
         help="also dump decoder input/layer/final-norm tensors into --out",
     )
+    ap.add_argument(
+        "--probe-layers",
+        default=os.environ.get("HIDREAM_DUMP_PROBE_LAYERS", "0"),
+        help="comma-separated decoder layers for detailed probe dumps when --dump-layers is set",
+    )
     ap.add_argument("--lr", type=float, default=ADAMW_LR)
     ap.add_argument("--max-grad-norm", type=float, default=MAX_GRAD_NORM)
     ap.add_argument("--weight-decay", type=float, default=ADAMW_WEIGHT_DECAY)
@@ -150,6 +172,12 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="ai-toolkit training calls HiDream-O1 with use_flash_attn=True",
+    )
+    ap.add_argument(
+        "--deterministic-attn",
+        action="store_true",
+        default=os.environ.get("HIDREAM_REF_DETERMINISTIC_ATTN") == "1",
+        help="enable torch deterministic algorithms for Flash Attention backward parity runs",
     )
     args = ap.parse_args()
 
@@ -194,6 +222,7 @@ def main() -> int:
     print(f"[train-step-ref] t_pixeldit     = {1.0 - args.t_scalar}")
     print(f"[train-step-ref] lora_step      = {args.lora_step}")
     print(f"[train-step-ref] use_flash_attn = {args.use_flash_attn}")
+    print(f"[train-step-ref] deterministic = {args.deterministic_attn}")
     print(f"[train-step-ref] repo_root      = {repo_root}")
 
     sample = load_file(str(sample_path), device="cpu")
@@ -308,7 +337,14 @@ def main() -> int:
             # upstream-of-attention grads are clean here (o_proj LoRA-B
             # cos≈0.999 at layer 35) while downstream attention LoRA-B
             # grads collapse (cos≈0.05). Matches Rust's probe location.
-            probe_layer_idx = model.config.text_config.num_hidden_layers - 1
+            probe_layer_idx = int(
+                os.environ.get(
+                    "HIDREAM_BWD_PROBE_LAYER",
+                    str(model.config.text_config.num_hidden_layers - 1),
+                )
+            )
+            if probe_layer_idx < 0 or probe_layer_idx >= model.config.text_config.num_hidden_layers:
+                _die(f"HIDREAM_BWD_PROBE_LAYER out of range: {probe_layer_idx}")
             probe_layer = model.model.language_model.layers[probe_layer_idx]
             final_layer = model.model.final_layer2
         except Exception as e:  # noqa: BLE001
@@ -328,25 +364,69 @@ def main() -> int:
         hooks.append(final_layer.register_forward_pre_hook(_capture_final_norm_input))
 
         if args.lora_step:
+            def _retain_probe(name, t):
+                if isinstance(t, (tuple, list)):
+                    if not t:
+                        return
+                    t = t[0]
+                if t.requires_grad:
+                    t.retain_grad()
+                    layer0_probes[name] = t
+
             def _trap_oproj_input(_module, module_args):
                 # o_proj's INPUT is attn_out after reshape — gradient here is what
                 # enters SDPA's backward from the output side.
-                t = module_args[0]
-                if t.requires_grad:
-                    t.retain_grad()
-                    layer0_probes["attn_out"] = t
+                _retain_probe("attn_out", module_args[0])
+
+            def _trap_oproj_output(_module, _input, output):
+                _retain_probe("o_proj_out", output)
+
+            def _trap_post_attn_input(_module, module_args):
+                _retain_probe("after_attn", module_args[0])
+
+            def _trap_post_attn_output(_module, _input, output):
+                _retain_probe("normed2", output)
+
+            def _trap_layer_output(_module, _input, output):
+                _retain_probe("hidden_out", output)
 
             def _trap_vproj_output(_module, _input, output):
                 # v_proj's OUTPUT is V before reshape/permute/repeat_kv.
                 # Gradient here is the last point upstream of V's LoRA-B grad
                 # ascent — if this is correct and LoRA-B is collapsed, the bug
                 # is in the LoRA backward path.
-                if output.requires_grad:
-                    output.retain_grad()
-                    layer0_probes["v_proj_out"] = output
+                _retain_probe("v_proj_out", output)
+
+            def _trap_qproj_output(_module, _input, output):
+                _retain_probe("q_proj_out", output)
+
+            def _trap_kproj_output(_module, _input, output):
+                _retain_probe("k_proj_out", output)
+
+            def _trap_mlp_gate_output(_module, _input, output):
+                _retain_probe("mlp_gate_out", output)
+
+            def _trap_mlp_up_output(_module, _input, output):
+                _retain_probe("mlp_up_out", output)
+
+            def _trap_downproj_input(_module, module_args):
+                _retain_probe("mlp_inner", module_args[0])
+
+            def _trap_downproj_output(_module, _input, output):
+                _retain_probe("mlp_out", output)
 
             hooks.append(probe_layer.self_attn.o_proj.register_forward_pre_hook(_trap_oproj_input))
+            hooks.append(probe_layer.self_attn.o_proj.register_forward_hook(_trap_oproj_output))
+            hooks.append(probe_layer.post_attention_layernorm.register_forward_pre_hook(_trap_post_attn_input))
+            hooks.append(probe_layer.post_attention_layernorm.register_forward_hook(_trap_post_attn_output))
+            hooks.append(probe_layer.register_forward_hook(_trap_layer_output))
+            hooks.append(probe_layer.self_attn.q_proj.register_forward_hook(_trap_qproj_output))
+            hooks.append(probe_layer.self_attn.k_proj.register_forward_hook(_trap_kproj_output))
             hooks.append(probe_layer.self_attn.v_proj.register_forward_hook(_trap_vproj_output))
+            hooks.append(probe_layer.mlp.gate_proj.register_forward_hook(_trap_mlp_gate_output))
+            hooks.append(probe_layer.mlp.up_proj.register_forward_hook(_trap_mlp_up_output))
+            hooks.append(probe_layer.mlp.down_proj.register_forward_pre_hook(_trap_downproj_input))
+            hooks.append(probe_layer.mlp.down_proj.register_forward_hook(_trap_downproj_output))
 
     return_layers = (
         list(range(model.config.text_config.num_hidden_layers))
@@ -539,6 +619,133 @@ def main() -> int:
             layer00_mlp_inner = layer00.mlp.act_fn(layer00_gate) * layer00_up
             layer00_mlp_out = layer00.mlp.down_proj(layer00_mlp_inner)
             layer00_hidden_out = layer00_after_attn + layer00_mlp_out
+
+            def _replay_probe_layer(layer_idx: int, hidden_in):
+                layer = text_model.layers[layer_idx]
+                attn = layer.self_attn
+                position_embeddings = text_model.rotary_emb(hidden_in, position_ids)
+                cos, sin = position_embeddings
+                cos_half = cos[..., : attn.head_dim // 2].contiguous()
+                sin_half = sin[..., : attn.head_dim // 2].contiguous()
+                idx_ar = torch.nonzero(~token_types[0].bool(), as_tuple=False).squeeze(-1)
+                input_shape = hidden_in.shape[:-1]
+                hidden_shape = (*input_shape, -1, attn.head_dim)
+
+                normed = layer.input_layernorm(hidden_in)
+                q_proj = attn.q_proj(normed)
+                k_proj = attn.k_proj(normed)
+                v_proj = attn.v_proj(normed)
+                q_heads = q_proj.view(hidden_shape).transpose(1, 2).contiguous()
+                k_heads = k_proj.view(hidden_shape).transpose(1, 2).contiguous()
+                v_heads = v_proj.view(hidden_shape).transpose(1, 2).contiguous()
+                q_mean_sq = _rms_mean_sq(q_proj.view(hidden_shape)).squeeze(-1).transpose(1, 2).contiguous()
+                k_mean_sq = _rms_mean_sq(k_proj.view(hidden_shape)).squeeze(-1).transpose(1, 2).contiguous()
+                q_inv = _rms_inv(
+                    q_proj.view(hidden_shape),
+                    attn.q_norm.variance_epsilon,
+                ).squeeze(-1).transpose(1, 2).contiguous()
+                k_inv = _rms_inv(
+                    k_proj.view(hidden_shape),
+                    attn.k_norm.variance_epsilon,
+                ).squeeze(-1).transpose(1, 2).contiguous()
+                q_unit = _rms_unit(
+                    q_proj.view(hidden_shape),
+                    attn.q_norm.variance_epsilon,
+                ).transpose(1, 2).contiguous()
+                k_unit = _rms_unit(
+                    k_proj.view(hidden_shape),
+                    attn.k_norm.variance_epsilon,
+                ).transpose(1, 2).contiguous()
+                q_normed = attn.q_norm(q_proj.view(hidden_shape)).transpose(1, 2).contiguous()
+                k_normed = attn.k_norm(k_proj.view(hidden_shape)).transpose(1, 2).contiguous()
+                q_rope, k_rope = apply_rotary_pos_emb(q_normed, k_normed, cos, sin)
+                q_rope = q_rope.contiguous()
+                k_rope = k_rope.contiguous()
+                k_repeat = repeat_kv(k_rope, attn.num_key_value_groups).contiguous()
+                v_repeat = repeat_kv(v_heads, attn.num_key_value_groups).contiguous()
+
+                attention_interface = eager_attention_forward
+                if attn.config._attn_implementation != "eager":
+                    attention_interface = ALL_ATTENTION_FUNCTIONS[
+                        attn.config._attn_implementation
+                    ]
+                out_ar, _ = attention_interface(
+                    attn,
+                    q_rope[:, :, idx_ar].contiguous(),
+                    k_rope[:, :, idx_ar].contiguous(),
+                    v_heads[:, :, idx_ar].contiguous(),
+                    attention_mask=None,
+                    dropout=0.0,
+                    scaling=attn.head_dim**-0.5,
+                    is_causal=True,
+                )
+                out_full, _ = attention_interface(
+                    attn,
+                    q_rope,
+                    k_rope,
+                    v_heads,
+                    attention_mask=None,
+                    dropout=0.0,
+                    scaling=attn.head_dim**-0.5,
+                    is_causal=False,
+                )
+                out_full = out_full.clone()
+                out_full[:, idx_ar] = out_ar
+                sdpa_out = out_full.transpose(1, 2).contiguous()
+                o_proj_in = out_full.reshape(*input_shape, -1).contiguous()
+                attn_out = attn.o_proj(o_proj_in)
+                after_attn = hidden_in + attn_out
+                normed2 = layer.post_attention_layernorm(after_attn)
+                gate = layer.mlp.gate_proj(normed2)
+                up = layer.mlp.up_proj(normed2)
+                mlp_inner = layer.mlp.act_fn(gate) * up
+                mlp_out = layer.mlp.down_proj(mlp_inner)
+                hidden_out = after_attn + mlp_out
+                prefix = f"layer{layer_idx:02}"
+                return {
+                    f"{prefix}.normed": normed,
+                    f"{prefix}.q_proj": q_proj,
+                    f"{prefix}.k_proj": k_proj,
+                    f"{prefix}.v_proj": v_proj,
+                    f"{prefix}.q_heads": q_heads,
+                    f"{prefix}.k_heads": k_heads,
+                    f"{prefix}.v_heads": v_heads,
+                    f"{prefix}.cos_half": cos_half,
+                    f"{prefix}.sin_half": sin_half,
+                    f"{prefix}.q_mean_sq": q_mean_sq,
+                    f"{prefix}.k_mean_sq": k_mean_sq,
+                    f"{prefix}.q_inv": q_inv,
+                    f"{prefix}.k_inv": k_inv,
+                    f"{prefix}.q_unit": q_unit,
+                    f"{prefix}.k_unit": k_unit,
+                    f"{prefix}.q_normed": q_normed,
+                    f"{prefix}.k_normed": k_normed,
+                    f"{prefix}.q_rope": q_rope,
+                    f"{prefix}.k_rope": k_rope,
+                    f"{prefix}.k_repeat": k_repeat,
+                    f"{prefix}.v_repeat": v_repeat,
+                    f"{prefix}.sdpa_out": sdpa_out,
+                    f"{prefix}.o_proj_in": o_proj_in,
+                    f"{prefix}.attn_out": attn_out,
+                    f"{prefix}.after_attn": after_attn,
+                    f"{prefix}.normed2": normed2,
+                    f"{prefix}.gate": gate,
+                    f"{prefix}.up": up,
+                    f"{prefix}.mlp_inner": mlp_inner,
+                    f"{prefix}.mlp_out": mlp_out,
+                    f"{prefix}.hidden_out": hidden_out,
+                }
+
+            probe_layers = _parse_probe_layers(
+                args.probe_layers,
+                model.config.text_config.num_hidden_layers,
+            )
+            for probe_layer_idx in probe_layers:
+                if probe_layer_idx == 0:
+                    continue
+                hidden_in = mid_results[probe_layer_idx - 1].detach()
+                for key, tensor in _replay_probe_layer(probe_layer_idx, hidden_in).items():
+                    layer_dump[key] = tensor.detach().float().contiguous().cpu()
         layer_dump["pre.text_emb"] = pre_text_emb.detach().float().contiguous().cpu()
         layer_dump["pre.t_freq_fp32"] = pre_t_freq_fp32.detach().float().contiguous().cpu()
         layer_dump["pre.t_freq_bf16"] = pre_t_freq_bf16.detach().float().contiguous().cpu()
@@ -614,6 +821,9 @@ def main() -> int:
     global_grad_norm_pre = None
     clip_scale = None
     if args.lora_step:
+        if args.deterministic_attn:
+            torch.use_deterministic_algorithms(True, warn_only=False)
+            torch.backends.cudnn.benchmark = False
         print("[train-step-ref] backward + clip + AdamW8bit step ...")
         optimizer.zero_grad(set_to_none=True)
         loss_velocity.backward()
@@ -621,7 +831,13 @@ def main() -> int:
         lora_save["grad_mid.x_pred_rows"] = _clone_or_zero_tensor_grad(x_pred_rows)
         lora_save["grad_mid.pred_velocity"] = _clone_or_zero_tensor_grad(pred_velocity)
         # Soul.md trap: probe-layer attention backward chain probes.
-        probe_layer_idx_str = f"{model.config.text_config.num_hidden_layers - 1:02d}"
+        probe_layer_idx = int(
+            os.environ.get(
+                "HIDREAM_BWD_PROBE_LAYER",
+                str(model.config.text_config.num_hidden_layers - 1),
+            )
+        )
+        probe_layer_idx_str = f"{probe_layer_idx:02d}"
         for probe_name, probe_tensor in layer0_probes.items():
             lora_save[f"grad_probe.layers.{probe_layer_idx_str}.{probe_name}"] = (
                 _clone_or_zero_tensor_grad(probe_tensor)

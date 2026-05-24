@@ -83,12 +83,17 @@ struct Args {
     /// Where to write LoRA checkpoints.
     #[arg(long)]
     output: PathBuf,
-    /// Total training steps. 200 = smoke target, 1000 = real LoRA target.
-    #[arg(long, default_value = "200")]
+    /// Total training steps. ai-toolkit UI default = 3000 for ZImage L2P
+    /// (`ui/src/app/jobs/new/jobConfig.ts:69`); 1000 was undertrained on
+    /// the 22-image box1jana dataset (subject identity didn't bind to the
+    /// trigger token). 200 still works as a smoke target via explicit flag.
+    #[arg(long, default_value = "3000")]
     steps: usize,
-    /// Learning rate. Default from L2P's train_run.sh (`5e-5` for fine-
-    /// tuning the merged DiT body).
-    #[arg(long, default_value_t = 5e-5)]
+    /// Learning rate. Default `1e-4` matches Ostris ai-toolkit's ZImage-L2P
+    /// LoRA recipe (their range is 1e-4 .. 4e-4). Earlier `5e-5` from L2P's
+    /// train_run.sh was tuned for full DiT fine-tune, not LoRA — too low
+    /// for rank-16 LoRA training (LoRA needs roughly 5-10× the full-FT LR).
+    #[arg(long, default_value_t = 1e-4)]
     lr: f32,
     /// LoRA rank.
     #[arg(long, default_value_t = 16)]
@@ -109,23 +114,45 @@ struct Args {
     #[arg(long, default_value_t = 42)]
     seed: u64,
     /// Save LoRA every N steps. `0` disables periodic save (final-only).
-    #[arg(long, default_value_t = 500)]
+    /// Default 1000 → checkpoints at 1000, 2000, 3000 — matches the user
+    /// directive "sample every 1000 steps" since post-hoc sampling reads
+    /// these checkpoints.
+    #[arg(long, default_value_t = 1000)]
     save_every: usize,
+    /// Resume from a previously-saved LoRA safetensors (PEFT format produced
+    /// by this trainer's `save_lora_peft`). Copies saved weights into the
+    /// fresh LoRA Parameters; Adam optimizer state is reinitialized (Adam
+    /// recovers in ~50-100 steps so this is acceptable for short runs).
+    /// Pair with `--start-step` so save filenames advance correctly.
+    #[arg(long)]
+    resume: Option<PathBuf>,
+    /// Step counter offset for logging + save filenames when resuming.
+    /// E.g. `--resume step250.safetensors --start-step 250 --steps 500`
+    /// continues for 500 more steps, saving as `l2p_lora_step500.safetensors`
+    /// etc. (Adam state still resets; only weights resume.)
+    #[arg(long, default_value_t = 0)]
+    start_step: usize,
+    /// Enable gradient checkpointing — recompute activations during backward
+    /// to cut peak memory ~3-4×. Required for 512²+ training on 24 GB.
+    /// Adds ~30% compute per step (~2.5 → 3.3 s/step).
+    #[arg(long, default_value_t = false)]
+    grad_checkpoint: bool,
     /// SQLite scalars DB for the BoardWriter (per-step loss / grad_norm).
     #[arg(long, default_value = "./l2p_train.board.db")]
     log_db: PathBuf,
-    /// Number of training-time scheduler steps. Per Python
-    /// `train_L2P.py:89` (`num_inference_steps: 500` in inputs_shared)
-    /// L2P trains with a 500-step FLUX-shift schedule. The trainer
-    /// uniform-samples an index in `[0, train_num_steps)` and reads the
-    /// shift-warped sigma from that index. Audit F3+F4 fix
-    /// (`MATH_AUDIT_2026-05-22.md`).
-    #[arg(long, default_value_t = 500)]
+    /// (RETIRED) Number of training-time scheduler steps. Was used to size
+    /// a shift-warped sigma lookup table; now we sample sigma uniformly in
+    /// `(0, 1]` directly (Ostris ai-toolkit recipe). The flag is kept for
+    /// back-compat and only controls the discrete granularity (t_int in
+    /// `1..=train_num_steps`, sigma = t_int / train_num_steps). Default
+    /// 1000 matches ai-toolkit's `linspace(1000, 1)`.
+    #[arg(long, default_value_t = 1000)]
     train_num_steps: usize,
-    /// FlowMatch sigma shift used to warp the training schedule. Must match
-    /// the inference shift (default 3.0 per L2P pipeline preset). Same
-    /// formula as `build_l2p_sigma_schedule`: `shift·s/(1 + (shift-1)·s)`.
-    #[arg(long, default_value_t = 3.0)]
+    /// (RETIRED) FlowMatch sigma shift. Was used to warp the training
+    /// schedule; now ignored — Ostris ai-toolkit uses unshifted uniform
+    /// sigma sampling. Inference still uses shift=3.0 (see
+    /// `build_l2p_sigma_schedule` in `l2p_sampling.rs`).
+    #[arg(long, default_value_t = 1.0)]
     train_shift: f32,
     /// Optimizer family. `adamw` is the canonical project default (BF16
     /// grad → F32 moments via the default `GradDtypePolicy::CastToF32`).
@@ -138,40 +165,124 @@ struct Args {
 //  build_l2p_training_sigma_table in inference_flame::sampling::l2p_sampling.)
 
 // -------------------------------------------------------------------------
-// LoRA target table — per-block weight keys + (in, out) dims
+// LoRA target table — per-block weight keys + (in, out) dims + slot
 // -------------------------------------------------------------------------
 
-/// Per-block LoRA targets, sized in pre-transposed `[in, out]` orientation.
-/// These exactly match the weights placed in `L2pDiT::resident` after
-/// `translate_l2p_keys` + `new_resident` pre-transpose.
-fn l2p_block_targets() -> &'static [(&'static str, usize, usize)] {
-    &[
-        ("attention.qkv.weight", DIM, QKV_OUT),
-        ("attention.out.weight", DIM, DIM),
-        ("feed_forward.w1.weight", DIM, MLP_HIDDEN),
-        ("feed_forward.w2.weight", MLP_HIDDEN, DIM),
-        ("feed_forward.w3.weight", DIM, MLP_HIDDEN),
+/// adaLN_modulation.0 input dim = `t_embedder` hidden = 256 for Z-Image-Turbo.
+/// Output dim = 4 * DIM (chunks into scale_msa / gate_msa / scale_mlp / gate_mlp).
+const T_EMB_DIM: usize = 256;
+const ADALN_OUT: usize = 4 * DIM; // 15360
+
+/// One LoRA target: where it applies in the model, how it's saved, what
+/// portion of the base output it adds delta to.
+#[derive(Clone)]
+struct L2pLoraTarget {
+    /// Internal model weight key the LoRA delta gets added to.
+    weight_key: String,
+    /// Logical name used in the saved safetensors file. For the Q/K/V split
+    /// across our fused qkv weight, this maps to ai-toolkit's separate
+    /// `attention.to_q/to_k/to_v.weight` keys — `LoraStack::load`
+    /// (`inference-flame/src/lora.rs::map_prefix_diffusion_model`) recognizes
+    /// these and reassembles them onto the fused qkv with the correct
+    /// `Slot::RowRange`. Same trick for `attention.to_out.0` → `attention.out`.
+    save_key: String,
+    in_dim: usize,
+    out_dim: usize,
+    slot: Slot,
+}
+
+/// 8 LoRA modules per `layers.{i}` block, matching ai-toolkit's discovery
+/// (`lora_special.py:367-374` + `z_image.py:386-387`): every `nn.Linear`
+/// under `layers` is hooked. Specifically:
+///   - `attention.to_q` / `to_k` / `to_v` — 3 separate LoRAs targeting
+///     row-partitions of our fused `attention.qkv.weight` via
+///     `Slot::RowRange`. Each gets an independent rank-`R` direction
+///     (effective rank 3R vs the 1R we got from a single LoRA on the
+///     fused weight). This recovers the per-projection expressivity that
+///     ai-toolkit's separate `nn.Linear` modules carry natively.
+///   - `attention.to_out.0` — output projection, saved with the ai-toolkit
+///     key. Loads onto our `attention.out.weight` via the loader mapper.
+///   - `feed_forward.w1 / w2 / w3` — SwiGLU FFN.
+///   - `adaLN_modulation.0` — per-block scale/shift/gate Linear. **The
+///     missing-modulation LoRA was the single biggest convergence gap vs
+///     ai-toolkit** per audit `AITOOLKIT_L2P_GRAD_AUDIT.md` § "wrong-bucket
+///     LoRA target list" — every block's modulation drives all downstream
+///     scale + gate values, so excluding it starved the LoRA of the
+///     strongest per-block adaptation lever.
+fn l2p_block_targets(block_prefix: &str) -> Vec<L2pLoraTarget> {
+    vec![
+        // Q / K / V — three LoRAs on the fused qkv weight, each targeting
+        // a third of the [3*DIM] output via Slot::RowRange.
+        L2pLoraTarget {
+            weight_key: format!("{block_prefix}.attention.qkv.weight"),
+            save_key: format!("{block_prefix}.attention.to_q"),
+            in_dim: DIM,
+            out_dim: DIM,
+            slot: Slot::RowRange { start: 0, len: DIM },
+        },
+        L2pLoraTarget {
+            weight_key: format!("{block_prefix}.attention.qkv.weight"),
+            save_key: format!("{block_prefix}.attention.to_k"),
+            in_dim: DIM,
+            out_dim: DIM,
+            slot: Slot::RowRange { start: DIM, len: DIM },
+        },
+        L2pLoraTarget {
+            weight_key: format!("{block_prefix}.attention.qkv.weight"),
+            save_key: format!("{block_prefix}.attention.to_v"),
+            in_dim: DIM,
+            out_dim: DIM,
+            slot: Slot::RowRange { start: 2 * DIM, len: DIM },
+        },
+        // Output projection.
+        L2pLoraTarget {
+            weight_key: format!("{block_prefix}.attention.out.weight"),
+            save_key: format!("{block_prefix}.attention.to_out.0"),
+            in_dim: DIM,
+            out_dim: DIM,
+            slot: Slot::Full,
+        },
+        // SwiGLU FFN.
+        L2pLoraTarget {
+            weight_key: format!("{block_prefix}.feed_forward.w1.weight"),
+            save_key: format!("{block_prefix}.feed_forward.w1"),
+            in_dim: DIM,
+            out_dim: MLP_HIDDEN,
+            slot: Slot::Full,
+        },
+        L2pLoraTarget {
+            weight_key: format!("{block_prefix}.feed_forward.w2.weight"),
+            save_key: format!("{block_prefix}.feed_forward.w2"),
+            in_dim: MLP_HIDDEN,
+            out_dim: DIM,
+            slot: Slot::Full,
+        },
+        L2pLoraTarget {
+            weight_key: format!("{block_prefix}.feed_forward.w3.weight"),
+            save_key: format!("{block_prefix}.feed_forward.w3"),
+            in_dim: DIM,
+            out_dim: MLP_HIDDEN,
+            slot: Slot::Full,
+        },
+        // Per-block modulation linear — the previously-missing target.
+        L2pLoraTarget {
+            weight_key: format!("{block_prefix}.adaLN_modulation.0.weight"),
+            save_key: format!("{block_prefix}.adaLN_modulation.0"),
+            in_dim: T_EMB_DIM,
+            out_dim: ADALN_OUT,
+            slot: Slot::Full,
+        },
     ]
 }
 
-/// Enumerate every (weight_key, in_dim, out_dim) targeted by the trainer.
-/// 34 blocks × 5 targets = 170 entries.
-fn enumerate_lora_targets() -> Vec<(String, usize, usize)> {
-    let mut out = Vec::with_capacity(170);
-    for i in 0..NUM_NOISE_REFINER {
-        for &(leaf, in_d, out_d) in l2p_block_targets() {
-            out.push((format!("noise_refiner.{i}.{leaf}"), in_d, out_d));
-        }
-    }
-    for i in 0..NUM_CONTEXT_REFINER {
-        for &(leaf, in_d, out_d) in l2p_block_targets() {
-            out.push((format!("context_refiner.{i}.{leaf}"), in_d, out_d));
-        }
-    }
+/// 30 main `layers` blocks × 8 targets = 240 entries. Matches ai-toolkit's
+/// production discovery exactly. Refiner blocks (`noise_refiner.*`,
+/// `context_refiner.*`) remain EXCLUDED per ai-toolkit's
+/// `get_transformer_block_names() == ["layers"]`.
+fn enumerate_lora_targets() -> Vec<L2pLoraTarget> {
+    let mut out = Vec::with_capacity(NUM_LAYERS * 8);
     for i in 0..NUM_LAYERS {
-        for &(leaf, in_d, out_d) in l2p_block_targets() {
-            out.push((format!("layers.{i}.{leaf}"), in_d, out_d));
-        }
+        out.extend(l2p_block_targets(&format!("layers.{i}")));
     }
     out
 }
@@ -182,9 +293,20 @@ fn enumerate_lora_targets() -> Vec<(String, usize, usize)> {
 ///   down: [in,   rank]  — Kaiming-ish small init (1/sqrt(rank) std)
 ///   up:   [rank, out ]  — zero init (canonical LoRA convention)
 ///
-/// Both dtypes BF16 → matches the L2P resident weights and skips dtype-
-/// casts in the apply matmul chain. Both `requires_grad=true` so the
-/// autograd recorder picks them up.
+/// Both dtypes **F32** to match Ostris ai-toolkit's LoRA recipe
+/// (`BaseSDTrainProcess.py:1800` does `self.network.force_to(... dtype=torch.float32)`
+/// before training starts, then the LoRA matmul chain runs in F32, with
+/// the delta cast to the base BF16 dtype only at the final add). BF16
+/// LoRA weights (our prior default) suffered grad-magnitude collapse on
+/// long-sequence reductions: sum-of-~9K-terms with mixed signs in BF16
+/// flushes the gradient signal to ~zero through cancellation. See
+/// `inference-flame/src/models/l2p/AITOOLKIT_L2P_GRAD_AUDIT.md` § "F32 vs
+/// BF16" for the full derivation. `apply_training`
+/// (`inference-flame/src/lora.rs`) auto-detects the F32 dtype on the LoRA
+/// Parameters and (a) casts x to F32 via autograd-tracked `to_dtype`, (b)
+/// runs the matmul chain in F32, (c) casts the delta back to BF16 before
+/// adding to the BF16 base — bit-equivalent to ai-toolkit's
+/// `ToolkitModuleMixin.forward` chain.
 fn make_lora_pair(
     name: &str,
     in_dim: usize,
@@ -193,9 +315,20 @@ fn make_lora_pair(
     device: &Arc<flame_core::CudaDevice>,
     seed: u64,
 ) -> anyhow::Result<(Parameter, Parameter)> {
-    // Kaiming-uniform-ish: std = 1/sqrt(rank). Matches lycoris-rs LoRA
-    // init and OneTrainer (`LoRALinear::init_kaiming` default).
-    let down_std = 1.0_f32 / (rank as f32).sqrt();
+    // Match PyTorch nn.Linear default init = `kaiming_uniform_(a=sqrt(5))`
+    // (which is what ai-toolkit's LoRAModule uses at `lora_special.py:120`).
+    // For uniform(-bound, bound) with bound = sqrt(6 / (in * (1 + a^2)))
+    // and a = sqrt(5), bound = 1/sqrt(in_features). Variance = bound^2/3 =
+    // 1/(3·in_features), so std ≈ 1/sqrt(3·in_features). For in_features
+    // 2560-3840 this gives std ≈ 0.010 — matches the ~0.009 std observed
+    // on ai-toolkit's trained-from-zero baseline. Prior `1/sqrt(rank)` =
+    // 0.25 was ~25x too large, causing the LoRA-A weights to start huge
+    // and the resulting delta to overwhelm the base output by step 1000,
+    // producing a destroyed inference output regardless of training
+    // direction quality. The bug was diagnosed by per-key magnitude diff
+    // vs the ai-toolkit step-1000 baseline (see
+    // `inference-flame/src/models/l2p/AITOOLKIT_L2P_GRAD_AUDIT.md`).
+    let down_std = 1.0_f32 / ((in_dim as f32) * 3.0).sqrt();
     let down = Tensor::randn_seeded(
         Shape::from_dims(&[in_dim, rank]),
         0.0,
@@ -203,11 +336,11 @@ fn make_lora_pair(
         seed,
         device.clone(),
     )?
-    .to_dtype(DType::BF16)?
+    .to_dtype(DType::F32)?
     .requires_grad_(true);
     let up = Tensor::zeros_dtype(
         Shape::from_dims(&[rank, out_dim]),
-        DType::BF16,
+        DType::F32,
         device.clone(),
     )?
     .requires_grad_(true);
@@ -258,49 +391,91 @@ fn main() -> anyhow::Result<()> {
         internal.len()
     );
     let mut model = L2pDiT::new_resident(internal, device.clone());
+    if args.grad_checkpoint {
+        model.set_grad_checkpoint(true);
+        log::info!("[1/5] Gradient checkpointing ENABLED (peak activation memory ~3-4× lower, ~30% compute overhead per step).");
+    }
 
     // -------------------------------------------------------------------
     // 2. Build LoRA Parameters + assemble training-mode LoraStack.
     // -------------------------------------------------------------------
+    let targets = enumerate_lora_targets();
+    let n_targets = targets.len();
     log::info!(
-        "[2/5] Building DiT-only LoRA: rank={} alpha={} → 170 modules",
+        "[2/5] Building DiT-only LoRA: rank={} alpha={} → {} modules",
         args.lora_rank,
-        args.lora_alpha
+        args.lora_alpha,
+        n_targets,
     );
     let scale = args.lora_alpha / args.lora_rank as f32;
     let mut train_map: HashMap<String, Vec<TrainEntry>> = HashMap::new();
     let mut params: Vec<Parameter> = Vec::new();
     let mut named: Vec<(String, Parameter)> = Vec::new();
-    let targets = enumerate_lora_targets();
-    let n_targets = targets.len();
-    for (idx, (key, in_dim, out_dim)) in targets.into_iter().enumerate() {
+    for (idx, target) in targets.into_iter().enumerate() {
         // Per-target seed offset so each module's down init is distinct.
-        let (down, up) =
-            make_lora_pair(&key, in_dim, out_dim, args.lora_rank, &device, args.seed + idx as u64)?;
+        // We seed off the save_key (which is unique across Q/K/V splits)
+        // rather than weight_key (which Q/K/V share).
+        let (down, up) = make_lora_pair(
+            &target.save_key,
+            target.in_dim,
+            target.out_dim,
+            args.lora_rank,
+            &device,
+            args.seed + idx as u64,
+        )?;
         params.push(down.clone());
         params.push(up.clone());
-        // PEFT/ai-toolkit save format names.
-        named.push((format!("diffusion_model.{key}.lora_A.weight"), down.clone()));
-        named.push((format!("diffusion_model.{key}.lora_B.weight"), up.clone()));
-        train_map.entry(key).or_default().push(TrainEntry {
-            slot: Slot::Full,
+        // PEFT/ai-toolkit save format names. Save under the save_key — the
+        // inference loader's `map_prefix_diffusion_model` translates these
+        // ai-toolkit-style names back to internal `attention.qkv.weight` +
+        // `Slot::RowRange` at load time, and `attention.to_out.0` →
+        // `attention.out.weight` + `Slot::Full`. So one safetensors file
+        // is interoperable across both our trainer-built LoRAs AND any
+        // ai-toolkit-trained LoRA placed in the same dir.
+        named.push((
+            format!("diffusion_model.{}.lora_A.weight", target.save_key),
+            down.clone(),
+        ));
+        named.push((
+            format!("diffusion_model.{}.lora_B.weight", target.save_key),
+            up.clone(),
+        ));
+        // Multiple entries can share the same weight_key (Q, K, V all hit
+        // `attention.qkv.weight` with different `Slot::RowRange`s). The Vec
+        // means LoraStack's apply iterates and adds all matching deltas.
+        train_map.entry(target.weight_key.clone()).or_default().push(TrainEntry {
+            slot: target.slot,
             down,
             up,
             scale,
         });
     }
-    if train_map.len() != n_targets {
+    let total_entries: usize = train_map.values().map(|v| v.len()).sum();
+    if total_entries != n_targets {
         anyhow::bail!(
-            "expected {} LoRA target keys, got {} after dedup — duplicate key?",
+            "expected {} total LoRA entries across train_map, got {}",
             n_targets,
-            train_map.len(),
+            total_entries,
         );
     }
     log::info!(
-        "  built {} Parameters ({} train entries × A+B pair)",
+        "  built {} Parameters ({} train entries across {} weight keys; \
+         Q/K/V splits and adaLN_modulation included)",
         params.len(),
-        train_map.len()
+        total_entries,
+        train_map.len(),
     );
+
+    // Optional: resume LoRA weights from a previous checkpoint. Adam state
+    // is NOT restored (acceptable tradeoff — Adam recovers in ~50 steps).
+    if let Some(resume_path) = &args.resume {
+        load_lora_resume(resume_path, &named, &device)?;
+        log::info!(
+            "[2/5] Resumed LoRA weights from {} (start_step={})",
+            resume_path.display(),
+            args.start_step,
+        );
+    }
 
     let stack = Arc::new(LoraStack::new_training(train_map));
     model.set_lora(stack);
@@ -313,16 +488,19 @@ fn main() -> anyhow::Result<()> {
     log::info!("[3/5] Optimizer: {} lr={}", opt_kind.as_str(), args.lr);
     let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
 
-    // Training-time sigma table — uniform-over-FLUX-warped per Python L2P.
-    // Audit F3+F4 fix: replaces the LOGIT_NORMAL sampling that was inherited
-    // from Z-Image's preset but doesn't match what L2P actually does.
-    let train_sigmas = inference_flame::sampling::l2p_sampling::
-        build_l2p_training_sigma_table(args.train_num_steps, args.train_shift);
+    // Training-time sigma sampling: Ostris ai-toolkit ZImage-L2P recipe.
+    // Sample sigma UNIFORMLY in `(0, 1]` (mirrors `linspace(1000, 1)` with
+    // uniform index). The previous FLUX-shift-warped table concentrated
+    // training mass near low sigma (near-clean), biasing the LoRA toward
+    // identity. ai-toolkit's `timestep_type='linear'` is the production-
+    // tested choice (commit 6102370 `Add support for ZImage L2P`).
+    let _ = inference_flame::sampling::l2p_sampling::build_l2p_training_sigma_table; // keep symbol live for callers
     log::info!(
-        "[3/5] Training sigma table: {} steps × shift={} (FLUX-shift, matches Python FlowMatchScheduler 'Z-Image')",
+        "[3/5] Training sigma sampling: uniform t_int in 1..={} → sigma = t_int / {} (unshifted, ai-toolkit recipe)",
         args.train_num_steps,
-        args.train_shift,
+        args.train_num_steps,
     );
+    let _ = args.train_shift; // intentionally unused — see Args::train_shift doc.
 
     let board = BoardWriter::open(
         &args.output,
@@ -400,8 +578,12 @@ fn main() -> anyhow::Result<()> {
         // pass that sigma as `v ∈ [0,1]` to L2pDiT.forward (which applies
         // `(1-v)*time_scale` internally — net effect identical to Python's
         // `timestep / 1000` pre-divide).
-        let train_idx: usize = (rng.gen::<u32>() as usize) % args.train_num_steps;
-        let sigma = train_sigmas[train_idx]; // shift-warped, in (0, 1]
+        // Uniform sigma sampling (Ostris ai-toolkit ZImage-L2P recipe).
+        // t_int ∈ {1, 2, ..., train_num_steps} → sigma = t_int / train_num_steps
+        // gives a discrete uniform distribution on `(0, 1]` with granularity
+        // 1/train_num_steps. Matches `timestep_type='linear'` in ai-toolkit.
+        let t_int: usize = (rng.gen::<u32>() as usize) % args.train_num_steps + 1;
+        let sigma = t_int as f32 / args.train_num_steps as f32;
         let v_in = sigma;
 
         let noise = Tensor::randn(pixel.shape().clone(), 0.0, 1.0, device.clone())?
@@ -477,6 +659,62 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // ── Per-group grad norms (LoRA-A vs LoRA-B) ─────────────────
+        // The global grad_norm hides the typical pattern in LoRA training
+        // where lora_B (zero-init) grads are tiny early on while lora_A
+        // (random-init) grads dominate. Logging the two separately surfaces
+        // whether convergence is actually happening on the B side — the
+        // load-bearing direction since identity (B=0) means no LoRA effect.
+        let mut grad_refs_a: Vec<&Tensor> = Vec::with_capacity(named.len() / 2);
+        let mut grad_refs_b: Vec<&Tensor> = Vec::with_capacity(named.len() / 2);
+        for (name, p) in &named {
+            if let Some(g) = grads.get(p.id()) {
+                if name.ends_with(".lora_A.weight") {
+                    grad_refs_a.push(g);
+                } else if name.ends_with(".lora_B.weight") {
+                    grad_refs_b.push(g);
+                }
+            }
+        }
+        let norm_a = if grad_refs_a.is_empty() {
+            0.0_f32
+        } else {
+            flame_core::ops::grad_norm::global_l2_norm(&grad_refs_a)?.item()? as f32
+        };
+        let norm_b = if grad_refs_b.is_empty() {
+            0.0_f32
+        } else {
+            flame_core::ops::grad_norm::global_l2_norm(&grad_refs_b)?.item()? as f32
+        };
+
+        // ── Per-group grad norms (LoRA-A vs LoRA-B) ─────────────────
+        // The global grad_norm hides the typical pattern in LoRA training
+        // where lora_B (zero-init) grads are tiny early on while lora_A
+        // (random-init) grads dominate. Logging the two separately surfaces
+        // whether convergence is actually happening on the B side — the
+        // load-bearing direction since identity (B=0) means no LoRA effect.
+        let mut grad_refs_a: Vec<&Tensor> = Vec::with_capacity(named.len() / 2);
+        let mut grad_refs_b: Vec<&Tensor> = Vec::with_capacity(named.len() / 2);
+        for (name, p) in &named {
+            if let Some(g) = grads.get(p.id()) {
+                if name.ends_with(".lora_A.weight") {
+                    grad_refs_a.push(g);
+                } else if name.ends_with(".lora_B.weight") {
+                    grad_refs_b.push(g);
+                }
+            }
+        }
+        let norm_a = if grad_refs_a.is_empty() {
+            0.0_f32
+        } else {
+            flame_core::ops::grad_norm::global_l2_norm(&grad_refs_a)?.item()? as f32
+        };
+        let norm_b = if grad_refs_b.is_empty() {
+            0.0_f32
+        } else {
+            flame_core::ops::grad_norm::global_l2_norm(&grad_refs_b)?.item()? as f32
+        };
+
         // ── Grad clip + assign ──────────────────────────────────────
         let grad_refs: Vec<&Tensor> = params.iter().filter_map(|p| grads.get(p.id())).collect();
         let total_norm = if grad_refs.is_empty() {
@@ -510,10 +748,16 @@ fn main() -> anyhow::Result<()> {
         AutogradContext::clear();
 
         // ── Logging ─────────────────────────────────────────────────
-        eridiffusion_core::training::progress::log_step(
+        // `log_step_with_resume` adds `start_step` to the display so the
+        // bar reads `step 501/1500` when resuming from step 500 with
+        // 1000 more steps requested. `total_steps` is the ABSOLUTE target
+        // (start_step + remaining run length). SerenityBoard scalars also
+        // index on the absolute step (continuing the resumed run's chart).
+        eridiffusion_core::training::progress::log_step_with_resume(
             "L2P-lora",
             step,
-            args.steps,
+            args.start_step,
+            args.steps + args.start_step,
             cache_files.len(),
             1,
             loss_val,
@@ -522,6 +766,27 @@ fn main() -> anyhow::Result<()> {
             t_start,
             board.as_ref(),
         );
+        // Per-group breakdown: A = down-projection (random-init), B = up-
+        // projection (zero-init). Watch lora_B/lora_A ratio over time —
+        // healthy LoRA training drives B up from 0 within the first ~100
+        // steps. If lora_B norm stays orders of magnitude below lora_A,
+        // the trainer is identity-stuck regardless of total loss.
+        println!(
+            "[L2P-lora]   grad lora_A={:.3e}  grad lora_B={:.3e}  B/A={:.3e}",
+            norm_a,
+            norm_b,
+            if norm_a > 0.0 { norm_b / norm_a } else { 0.0 },
+        );
+        if let Some(b) = board.as_ref() {
+            let abs_step = (step + 1 + args.start_step) as u64;
+            b.log_scalars(
+                abs_step,
+                &[
+                    ("grad_norm/lora_A", norm_a as f64),
+                    ("grad_norm/lora_B", norm_b as f64),
+                ],
+            );
+        }
 
         // ── LoRA-B nonzero-ratio diagnostic at step 1 (paired with
         //    grad-flow). After one optimizer step, LoRA-B should have
@@ -556,10 +821,13 @@ fn main() -> anyhow::Result<()> {
         }
 
         // ── Periodic save ───────────────────────────────────────────
-        let step_num = step + 1;
+        // `step_num` is the global step (including --start-step offset)
+        // so resumed runs save under filenames continuing from where the
+        // previous run left off.
+        let step_num = step + 1 + args.start_step;
         if args.save_every > 0
             && step_num % args.save_every == 0
-            && step_num < args.steps
+            && (step + 1) < args.steps
         {
             let path = args
                 .output
@@ -573,9 +841,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── Final save ────────────────────────────────────────────────────
+    let final_step = args.steps + args.start_step;
     let final_path = args
         .output
-        .join(format!("l2p_lora_{}steps.safetensors", args.steps));
+        .join(format!("l2p_lora_step{}.safetensors", final_step));
     save_lora_peft(&named, &final_path)?;
     let avg_loss = if args.steps > 0 {
         total_loss / args.steps as f32
@@ -604,7 +873,33 @@ fn save_lora_peft(
     let mut tensors: HashMap<String, Tensor> = HashMap::new();
     for (name, p) in named {
         let t = p.tensor()?;
-        tensors.insert(name.clone(), t);
+        // The trainer stores down as [in, rank] and up as [rank, out] (native
+        // matmul convention for `x_cast.matmul(&down).matmul(&up)`). PEFT
+        // convention is PyTorch `nn.Linear` weight layout: lora_A.weight =
+        // [rank, in], lora_B.weight = [out, rank]. The inference-side
+        // `LoraStack::load` UNCONDITIONALLY transposes both — assuming
+        // PEFT convention. Without this transpose-on-save the loader
+        // double-transposes and inference produces shape errors at the
+        // LoRA matmul. Fix landed 2026-05-22 after a 1000-step LoRA
+        // produced bit-identical renders with/without --lora.
+        let needs_transpose =
+            name.ends_with(".lora_A.weight") || name.ends_with(".lora_B.weight");
+        let t_out = if needs_transpose && t.shape().dims().len() == 2 {
+            t.transpose()?.contiguous()?
+        } else {
+            t
+        };
+        // Cast to BF16 on save: training keeps LoRA Parameters in F32 (matches
+        // ai-toolkit), but PEFT/diffusers/ai-toolkit-comfy-loader expect BF16
+        // safetensors. F32 saves are 2× larger and not every consumer auto-
+        // casts. F32 training precision is preserved by the optimizer state
+        // (Adam moments stay F32 in memory); only the snapshot is downcast.
+        let t_out = if t_out.dtype() != flame_core::DType::BF16 && t_out.shape().dims().len() == 2 {
+            t_out.to_dtype(flame_core::DType::BF16)?
+        } else {
+            t_out
+        };
+        tensors.insert(name.clone(), t_out);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -616,5 +911,76 @@ fn save_lora_peft(
         &std::path::Path,
         SerializationFormat,
     ) -> flame_core::Result<()>;
+    Ok(())
+}
+
+/// Resume: load LoRA weights from a PEFT-format safetensors written by
+/// `save_lora_peft`, undo the save-time transpose, and copy the tensors
+/// into the freshly-constructed LoRA Parameters in-place. Adam optimizer
+/// state is NOT loaded — it reinitializes (Adam recovers in ~50-100 steps).
+fn load_lora_resume(
+    path: &std::path::Path,
+    named: &[(String, Parameter)],
+    device: &Arc<flame_core::CudaDevice>,
+) -> anyhow::Result<()> {
+    let loaded = flame_core::serialization::load_file(path, device)
+        .map_err(|e| anyhow::anyhow!("load_file({}): {e}", path.display()))?;
+    let mut hit = 0usize;
+    let mut missing: Vec<&str> = Vec::new();
+    for (name, p) in named {
+        let saved = match loaded.get(name) {
+            Some(t) => t,
+            None => {
+                missing.push(name);
+                continue;
+            }
+        };
+        // save_lora_peft writes PEFT layout: lora_A.weight = [rank, in],
+        // lora_B.weight = [out, rank] (transposed from native [in, rank] /
+        // [rank, out]). Undo that here so the in-memory Parameter keeps
+        // the trainer's native shape.
+        let needs_transpose =
+            name.ends_with(".lora_A.weight") || name.ends_with(".lora_B.weight");
+        let target_dtype = p.dtype()?;
+        let t_native = if needs_transpose && saved.shape().dims().len() == 2 {
+            saved.transpose()?.contiguous()?
+        } else {
+            saved.clone()
+        };
+        let t_native = if t_native.dtype() != target_dtype {
+            t_native.to_dtype(target_dtype)?
+        } else {
+            t_native
+        };
+        // Shape sanity check before overwriting.
+        if t_native.shape().dims() != p.shape().dims() {
+            anyhow::bail!(
+                "resume shape mismatch for {name}: file gives {:?} (after un-transpose) vs Parameter expects {:?}",
+                t_native.shape().dims(),
+                p.shape().dims(),
+            );
+        }
+        p.set_data(t_native)
+            .map_err(|e| anyhow::anyhow!("set_data({name}): {e}"))?;
+        hit += 1;
+    }
+    if hit == 0 {
+        anyhow::bail!(
+            "resume from {} matched 0 of {} expected LoRA keys — wrong file?",
+            path.display(),
+            named.len(),
+        );
+    }
+    if !missing.is_empty() {
+        log::warn!(
+            "[resume] {}/{} keys loaded; {} missing (first 3: {:?})",
+            hit,
+            named.len(),
+            missing.len(),
+            &missing[..missing.len().min(3)],
+        );
+    } else {
+        log::info!("[resume] loaded all {} LoRA tensors", hit);
+    }
     Ok(())
 }

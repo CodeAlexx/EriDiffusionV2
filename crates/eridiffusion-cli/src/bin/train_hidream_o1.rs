@@ -93,8 +93,10 @@ use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use flame_core::parameter::Parameter;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use inference_flame::models::hidream_o1::{
-    default_target_suffixes, HiDreamO1Config, HiDreamO1WeightLoader, LoraRegistry, MRopePositions,
+    build_mrope_positions, default_resident_target_keys, default_target_suffixes, HiDreamO1Config,
+    HiDreamO1WeightLoader, LoraRegistry, MRopePositions,
 };
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -125,6 +127,10 @@ struct Args {
     /// runs. Overlong cached samples are skipped before training starts.
     #[arg(long, default_value_t = 0)]
     max_seq_len: usize,
+    /// Disable ai-toolkit-style per-epoch cache shuffling. The default keeps
+    /// shuffled epochs even though samples are cached on disk.
+    #[arg(long, default_value_t = false)]
+    no_cache_shuffle: bool,
     /// HiDream-O1 model dir (containing `model.safetensors.index.json` +
     /// shards + `tokenizer.json`).
     #[arg(long, default_value = DEFAULT_MODEL_PATH)]
@@ -231,6 +237,18 @@ struct Args {
     /// `x0` is retained only as an ablation/debug path.
     #[arg(long, default_value = "velocity")]
     loss_objective: String,
+    /// Probability of dropping the caption to an empty prompt on each sample.
+    /// ai-toolkit's Eri2 O1 config uses 0.05. Because EDv2 caches token ids,
+    /// the trainer rebuilds the empty prompt stream on demand for the current
+    /// image grid instead of requiring a second cache.
+    #[arg(long, default_value_t = 0.05)]
+    caption_dropout_probability: f32,
+    /// Let optimizer steps proceed when some LoRA parameters have no gradient.
+    /// This is only for debugging partial adapter surfaces; production should
+    /// fail fast because missing grads usually mean a detach, wrong key, or
+    /// offload/checkpoint routing bug.
+    #[arg(long, default_value_t = false)]
+    allow_missing_lora_grads: bool,
     /// Log aggregate LoRA A/B magnitudes every N optimizer steps. Set 0 to
     /// disable. This catches A-collapse or B-overgrowth early in long runs.
     #[arg(long, default_value_t = 100)]
@@ -304,6 +322,185 @@ fn sample_t<R: rand::Rng>(rng: &mut R, mode: TstepMode, shift: f32) -> f32 {
             (shift * raw / (1.0 + (shift - 1.0) * raw)).clamp(T_EPS_AT, 1.0 - T_EPS_AT)
         }
     }
+}
+
+fn apply_chat_template_t2i(prompt: &str) -> String {
+    let mut s = String::new();
+    s.push_str("<|im_start|>user\n");
+    s.push_str(prompt);
+    s.push_str("<|im_end|>\n");
+    s.push_str("<|im_start|>assistant\n");
+    s.push_str("<|boi_token|>");
+    s.push_str("<|tms_token|>");
+    s
+}
+
+fn build_prompt_conditioning(
+    tokenizer: &tokenizers::Tokenizer,
+    config: &HiDreamO1Config,
+    prompt: &str,
+    h_patches: usize,
+    w_patches: usize,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> anyhow::Result<(Tensor, Tensor, Tensor, Tensor)> {
+    if h_patches == 0 || w_patches == 0 {
+        anyhow::bail!("invalid image grid {h_patches}x{w_patches}");
+    }
+    let image_len = h_patches * w_patches;
+    let template = apply_chat_template_t2i(prompt);
+    let enc = tokenizer
+        .encode(template.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("Tokenize failed: {e}"))?;
+    let text_ids: Vec<u32> = enc.get_ids().to_vec();
+    let txt_seq_len = text_ids.len();
+
+    let mut full_ids: Vec<u32> = Vec::with_capacity(txt_seq_len + image_len);
+    full_ids.extend_from_slice(&text_ids);
+    full_ids.push(config.vision_start_token_id);
+    for _ in 1..image_len {
+        full_ids.push(config.image_token_id);
+    }
+    let all_seq_len = full_ids.len();
+
+    let (t_pos, h_pos, w_pos) = build_mrope_positions(
+        &full_ids,
+        config.image_token_id,
+        config.video_token_id,
+        config.vision_start_token_id,
+        &[(1, h_patches, w_patches)],
+        &[1],
+        Some(config.fix_point),
+    );
+
+    let input_ids_f: Vec<f32> = text_ids.iter().map(|&id| id as f32).collect();
+    let input_ids = Tensor::from_vec(
+        input_ids_f,
+        Shape::from_dims(&[1, txt_seq_len]),
+        device.clone(),
+    )?
+    .to_dtype(DType::I32)?;
+
+    let mut pos_f: Vec<f32> = Vec::with_capacity(3 * all_seq_len);
+    pos_f.extend(t_pos.iter().map(|&v| v as f32));
+    pos_f.extend(h_pos.iter().map(|&v| v as f32));
+    pos_f.extend(w_pos.iter().map(|&v| v as f32));
+    let position_ids = Tensor::from_vec(
+        pos_f,
+        Shape::from_dims(&[3, all_seq_len]),
+        device.clone(),
+    )?;
+
+    let mut vmask = vec![0.0_f32; all_seq_len];
+    for i in txt_seq_len..(txt_seq_len + image_len) {
+        vmask[i] = 1.0;
+    }
+    let vinput_mask = Tensor::from_vec(vmask, Shape::from_dims(&[1, all_seq_len]), device.clone())?
+        .to_dtype(DType::BF16)?;
+
+    let mut token_types = vec![0.0_f32; all_seq_len];
+    for i in txt_seq_len..(txt_seq_len + image_len) {
+        token_types[i] = 1.0;
+    }
+    if txt_seq_len > 0 {
+        token_types[txt_seq_len - 1] = 1.0;
+    }
+    let token_types_bin =
+        Tensor::from_vec(token_types, Shape::from_dims(&[1, all_seq_len]), device.clone())?
+            .to_dtype(DType::BF16)?;
+
+    Ok((input_ids, position_ids, vinput_mask, token_types_bin))
+}
+
+fn decode_image_grid(grid: &Tensor) -> anyhow::Result<(usize, usize)> {
+    let dims = grid.shape().dims().to_vec();
+    if dims.as_slice() != [3] {
+        anyhow::bail!("image_grid: expected [3], got {:?}", dims);
+    }
+    let v = grid.to_dtype(DType::F32)?.to_vec_f32()?;
+    let h = v[1].round() as usize;
+    let w = v[2].round() as usize;
+    if !v[1].is_finite() || !v[2].is_finite() || h == 0 || w == 0 {
+        anyhow::bail!("image_grid: invalid values {:?}", v);
+    }
+    Ok((h, w))
+}
+
+fn expected_lora_adapter_keys(cfg: &HiDreamO1Config, include_resident: bool) -> Vec<String> {
+    let mut keys = Vec::new();
+    for layer_idx in 0..cfg.num_layers {
+        for suffix in default_target_suffixes() {
+            keys.push(format!("layers.{layer_idx}.{suffix}"));
+        }
+    }
+    if include_resident {
+        keys.extend(default_resident_target_keys().iter().map(|k| (*k).to_string()));
+    }
+    keys.sort();
+    keys
+}
+
+fn preview_keys(keys: &[String]) -> String {
+    let mut out = keys.iter().take(12).cloned().collect::<Vec<_>>().join(", ");
+    if keys.len() > 12 {
+        out.push_str(&format!(", ... ({} total)", keys.len()));
+    }
+    out
+}
+
+fn validate_lora_surface(
+    lora: &LoraRegistry,
+    cfg: &HiDreamO1Config,
+    include_resident: bool,
+) -> anyhow::Result<()> {
+    let expected: BTreeSet<String> =
+        expected_lora_adapter_keys(cfg, include_resident).into_iter().collect();
+    let actual: BTreeSet<String> = lora.adapter_keys().into_iter().collect();
+    let missing: Vec<String> = expected.difference(&actual).cloned().collect();
+    let extra: Vec<String> = actual.difference(&expected).cloned().collect();
+    if !missing.is_empty() || !extra.is_empty() {
+        anyhow::bail!(
+            "LoRA adapter surface mismatch: expected {} adapters, got {}. missing=[{}] extra=[{}]",
+            expected.len(),
+            actual.len(),
+            preview_keys(&missing),
+            preview_keys(&extra)
+        );
+    }
+    Ok(())
+}
+
+fn require_lora_grad_coverage(
+    grads: &flame_core::GradientMap,
+    named: &[(String, Parameter)],
+    step_num: usize,
+    allow_missing_zero_a: bool,
+) -> anyhow::Result<()> {
+    let mut missing = Vec::new();
+    let mut allowed_a = 0usize;
+    for (name, p) in named {
+        if grads.contains(p.id()) {
+            continue;
+        }
+        if allow_missing_zero_a && name.ends_with(".lora_A") {
+            allowed_a += 1;
+        } else {
+            missing.push(name.clone());
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "missing LoRA gradients at step {step_num}: {} of {} parameters absent. [{}]",
+            missing.len(),
+            named.len(),
+            preview_keys(&missing)
+        );
+    }
+    if allowed_a > 0 {
+        log::warn!(
+            "[grad-coverage] step {step_num}: allowed {allowed_a} missing LoRA A grads on fresh zero-B init"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -520,6 +717,8 @@ fn gather_image_rows(x_pred: &Tensor, vinput_mask: &Tensor) -> anyhow::Result<Te
 }
 
 fn main() -> anyhow::Result<()> {
+    use rand::Rng;
+    use rand::seq::SliceRandom;
     use rand::SeedableRng;
     env_logger::init();
     let args = Args::parse();
@@ -527,6 +726,15 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!(
             "--export-scale must be finite and > 0 for weights-only LoRA exports, got {}",
             args.export_scale
+        );
+    }
+    if !args.caption_dropout_probability.is_finite()
+        || args.caption_dropout_probability < 0.0
+        || args.caption_dropout_probability > 1.0
+    {
+        anyhow::bail!(
+            "--caption-dropout-probability must be finite and in [0,1], got {}",
+            args.caption_dropout_probability
         );
     }
     std::fs::create_dir_all(&args.output_dir)?;
@@ -607,8 +815,8 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ── Load model + tokenizer (the tokenizer is unused at training time but
-    //    the weight loader needs the model dir laid out beside it).
+    // ── Load model + tokenizer. The tokenizer is needed for on-the-fly empty
+    //    prompt streams when caption dropout is enabled.
     let hd_cfg = HiDreamO1Config::dev_8b();
     log::info!(
         "[hidream_o1] loading model from {} (num_layers={}, hidden={})",
@@ -616,6 +824,11 @@ fn main() -> anyhow::Result<()> {
         hd_cfg.num_layers,
         hd_cfg.hidden_size,
     );
+    let tokenizer_path = args.model_path.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Tokenizer::from_file({}): {e}", tokenizer_path.display()))?;
+    let mut empty_conditioning_cache: HashMap<(usize, usize), (Tensor, Tensor, Tensor, Tensor)> =
+        HashMap::new();
     let loader = HiDreamO1WeightLoader::from_dir(&args.model_path)
         .map_err(|e| anyhow::anyhow!("HiDreamO1WeightLoader: {e}"))?;
     // The base model's parameters are all `requires_grad=false` (loader runs
@@ -653,6 +866,7 @@ fn main() -> anyhow::Result<()> {
         lora.alpha,
         include_resident_lora,
     );
+    validate_lora_surface(&lora, &hd_cfg, include_resident_lora)?;
     if args.lora_stats_every > 0 {
         log_lora_magnitude_stats("init", &lora)?;
     }
@@ -803,6 +1017,14 @@ fn main() -> anyhow::Result<()> {
 
     // (flame_core::rng::set_seed moved above model-load — BUG-8.)
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+    let mut epoch_order: Vec<usize> = (0..cache_files.len()).collect();
+    let mut epoch_order_epoch: Option<usize> = None;
+    let shuffle_cache = !args.no_cache_shuffle;
+    log::info!(
+        "[hidream_o1] cache_order={} caption_dropout_probability={}",
+        if shuffle_cache { "shuffle_each_epoch" } else { "sorted_cyclic" },
+        args.caption_dropout_probability
+    );
 
     let board = BoardWriter::open(&args.output_dir, BoardWriter::new_session_id(), None)
         .map_err(|e| log::warn!("board.db open failed: {e}"))
@@ -821,7 +1043,27 @@ fn main() -> anyhow::Result<()> {
         let step = start_step + local_step;
         flame_core::debug_finite::reset();
 
-        let cache_idx = step % cache_files.len();
+        let epoch = step / cache_files.len();
+        let epoch_pos = step % cache_files.len();
+        if epoch_order_epoch != Some(epoch) {
+            epoch_order.clear();
+            epoch_order.extend(0..cache_files.len());
+            if shuffle_cache {
+                let mut epoch_rng = rand::rngs::StdRng::seed_from_u64(
+                    SEED.wrapping_add((epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                );
+                epoch_order.shuffle(&mut epoch_rng);
+            }
+            epoch_order_epoch = Some(epoch);
+            if step == start_step || epoch_pos == 0 {
+                log::info!(
+                    "[hidream_o1] epoch {} cache order {}",
+                    epoch + 1,
+                    if shuffle_cache { "shuffled" } else { "sorted" }
+                );
+            }
+        }
+        let cache_idx = epoch_order[epoch_pos];
         let sample = flame_core::serialization::load_file(&cache_files[cache_idx], &device)?;
         let path_disp = cache_files[cache_idx].display().to_string();
 
@@ -829,21 +1071,21 @@ fn main() -> anyhow::Result<()> {
             .get("patches")
             .ok_or_else(|| anyhow::anyhow!("missing `patches` in {path_disp}"))?
             .to_dtype(DType::BF16)?;
-        let input_ids = sample
+        let mut input_ids = sample
             .get("input_ids")
             .ok_or_else(|| anyhow::anyhow!("missing `input_ids` in {path_disp}"))?
             .to_dtype(DType::I32)?;
-        let position_ids = sample
+        let mut position_ids = sample
             .get("position_ids")
             .ok_or_else(|| anyhow::anyhow!("missing `position_ids` in {path_disp}"))?;
-        let vinput_mask = sample
+        let mut vinput_mask = sample
             .get("vinput_mask")
             .ok_or_else(|| anyhow::anyhow!("missing `vinput_mask` in {path_disp}"))?
             .to_dtype(DType::BF16)?;
         // Cache v2 (2026-05-17): `token_types_bin = (raw > 0)`. Drives the
         // structured prefix-causal/full attention split so the TMS/image rows
         // get full-attention, matching `qwen3_vl_transformers.py:1501`.
-        let token_types_bin = sample
+        let mut token_types_bin = sample
             .get("token_types")
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -852,6 +1094,40 @@ fn main() -> anyhow::Result<()> {
                 )
             })?
             .to_dtype(DType::BF16)?;
+        if args.caption_dropout_probability > 0.0
+            && rng.r#gen::<f32>() < args.caption_dropout_probability
+        {
+            let grid = sample
+                .get("image_grid")
+                .ok_or_else(|| anyhow::anyhow!("missing `image_grid` in {path_disp}"))?;
+            let (h_patches, w_patches) = decode_image_grid(grid)?;
+            let cond = match empty_conditioning_cache.get(&(h_patches, w_patches)) {
+                Some(cond) => cond.clone(),
+                None => {
+                    let cond = build_prompt_conditioning(
+                        &tokenizer,
+                        &hd_cfg,
+                        "",
+                        h_patches,
+                        w_patches,
+                        &device,
+                    )?;
+                    empty_conditioning_cache.insert((h_patches, w_patches), cond.clone());
+                    cond
+                }
+            };
+            input_ids = cond.0;
+            position_ids = cond.1;
+            vinput_mask = cond.2;
+            token_types_bin = cond.3;
+            if step == 0 {
+                log::info!(
+                    "step 0 | caption dropped to empty prompt for image_grid={}x{}",
+                    h_patches,
+                    w_patches
+                );
+            }
+        }
         flame_core::debug_finite::check("g2.patches", &patches)?;
         flame_core::debug_finite::check("g2.vinput_mask", &vinput_mask)?;
         flame_core::debug_finite::check("g2.token_types", &token_types_bin)?;
@@ -1022,23 +1298,35 @@ fn main() -> anyhow::Result<()> {
 
         // ── Backward.
         let grads = loss.backward()?;
+        let named_lora_params = lora.named_parameters();
+        if args.allow_missing_lora_grads {
+            log::warn!(
+                "[grad-coverage] --allow-missing-lora-grads is enabled; optimizer may skip detached adapters"
+            );
+        } else {
+            require_lora_grad_coverage(&grads, &named_lora_params, step + 1, step == 0)?;
+        }
 
         // Grad-flow diagnostic — runs at step 1 (lora_B starts zero so step 0
-        // is mathematically zero-grad on the A side).
-        if step == 1 && std::env::var("FLAME_ASSERT_GRAD_FLOW").ok().as_deref() == Some("1") {
-            let named = lora.named_parameters();
+        // is mathematically zero-grad on the A side). This is fail-closed for
+        // O1 because a dead adapter can otherwise produce a numerically
+        // nonzero checkpoint that does not actually learn.
+        if step == 1 {
             let named_refs: Vec<(&str, &Parameter)> =
-                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
-            let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
+                named_lora_params.iter().map(|(n, p)| (n.as_str(), p)).collect();
+            let report = flame_core::diagnostics::check_grad_flow(&grads, &named_refs)?;
             if report.is_clean() {
                 log::info!("[grad-flow] step 1 clean ({} params)", report.ok_count);
             } else {
-                log::warn!("{}", report.summary());
+                anyhow::bail!("{}", report.summary());
             }
         }
 
         // ── Global L2 grad clip = 1.0.
         let grad_refs: Vec<&Tensor> = params.iter().filter_map(|p| grads.get(p.id())).collect();
+        if grad_refs.is_empty() {
+            anyhow::bail!("no LoRA gradients at step {}", step + 1);
+        }
         let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
         if !total_norm.is_finite() {
             anyhow::bail!("NaN/Inf grad_norm at step {step}: {total_norm}");
