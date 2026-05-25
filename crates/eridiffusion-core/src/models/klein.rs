@@ -134,6 +134,46 @@ impl KleinConfig {
 
 const NORM_EPS: f32 = 1e-6;
 
+/// Per-block gradient-probe registry (FLAME_KLEIN_PROBE=1). Records
+/// (label, tensor id) of block-boundary activations during forward and asks
+/// autograd to retain their gradients, so a parity harness can compare the
+/// per-block backward against a reference and localize a divergence.
+pub static KLEIN_GRAD_PROBE: std::sync::Mutex<Vec<(String, flame_core::TensorId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Per-block FORWARD-activation registry (FLAME_KLEIN_PROBE=1). Captures the
+/// F32 value of each probed block-boundary activation during forward, so a
+/// parity harness can compare per-block forward cos vs a reference ALONGSIDE
+/// the per-block backward grad cos — disambiguating a backward-composition bug
+/// (forward matches, grad diverges) from forward-precision drift (both drift).
+pub static KLEIN_FWD_VALS: std::sync::Mutex<Vec<(String, Vec<f32>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn klein_probe(label: &str, t: &flame_core::Tensor) {
+    if std::env::var("FLAME_KLEIN_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    if let Ok(mut v) = KLEIN_GRAD_PROBE.lock() {
+        v.push((label.to_string(), t.id()));
+    }
+    // Capture the forward value on EVERY fire. Under gradient checkpointing the
+    // block forward runs twice (initial no-grad pass + backward recompute), so
+    // we get e.g. "dbl0_img#0" (initial) and "dbl0_img#1" (recompute). Comparing
+    // them tests whether the recompute faithfully reproduces the real forward —
+    // if not, the backward operates on wrong activations (checkpoint = the bug).
+    if let Ok(mut fv) = KLEIN_FWD_VALS.lock() {
+        let occ = fv.iter().filter(|(l, _)| l.starts_with(&format!("{label}#"))).count();
+        if let Ok(f32t) = t.to_dtype(flame_core::DType::F32) {
+            if let Ok(vals) = f32t.to_vec() {
+                fv.push((format!("{label}#{occ}"), vals));
+            }
+        }
+    }
+    let mut s = std::collections::HashSet::new();
+    s.insert(t.id());
+    flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+}
+
 // LoRA slot layout per double block (12 adapters).
 // Audit fix KLEIN_VERIFY §H1.3 / SKEPTIC §H3: upstream Python wraps Q/K/V as 3
 // separate `nn.Linear` modules per attention (`to_q`, `to_k`, `to_v` for
@@ -1015,14 +1055,12 @@ fn build_rope_klein(
     }
     let cos_refs: Vec<&Tensor> = cos_parts.iter().collect();
     let sin_refs: Vec<&Tensor> = sin_parts.iter().collect();
-    let pe_cos = Tensor::cat(&cos_refs, 1)?
-        .unsqueeze(0)?
-        .unsqueeze(0)?
-        .to_dtype(DType::BF16)?;
-    let pe_sin = Tensor::cat(&sin_refs, 1)?
-        .unsqueeze(0)?
-        .unsqueeze(0)?
-        .to_dtype(DType::BF16)?;
+    // Keep cos/sin in F32 (NOT BF16) — BF16 lookup tables lose 8 mantissa bits per
+    // cos/sin value and the per-block bias compounds over 32 blocks (the project-wide
+    // RoPE precision floor, bf16_rope_pattern_audit). apply_rope_klein uses
+    // `rope_fused_bf16_f32pe` (BF16 x, F32 pe) so the forward keeps full RoPE precision.
+    let pe_cos = Tensor::cat(&cos_refs, 1)?.unsqueeze(0)?.unsqueeze(0)?;
+    let pe_sin = Tensor::cat(&sin_refs, 1)?.unsqueeze(0)?.unsqueeze(0)?;
     Ok((pe_cos, pe_sin))
 }
 
@@ -1035,9 +1073,10 @@ fn apply_rope_klein(
     pe_cos: &Tensor,
     pe_sin: &Tensor,
 ) -> flame_core::Result<(Tensor, Tensor)> {
-    // Use the verified flame-core fused kernel.
-    let q_out = flame_core::bf16_ops::rope_fused_bf16(q, pe_cos, pe_sin)?;
-    let k_out = flame_core::bf16_ops::rope_fused_bf16(k, pe_cos, pe_sin)?;
+    // F32 positional-embedding variant: BF16 q/k, F32 cos/sin (no 8-bit mantissa
+    // loss on the RoPE tables). Records Op::RoPePrecomputed; backward is dtype-aware.
+    let q_out = flame_core::bf16_ops::rope_fused_bf16_f32pe(q, pe_cos, pe_sin)?;
+    let k_out = flame_core::bf16_ops::rope_fused_bf16_f32pe(k, pe_cos, pe_sin)?;
     Ok((q_out, k_out))
 }
 
@@ -1230,8 +1269,21 @@ fn single_block_forward_standalone(
         }
     };
 
+    // Intra-block localization (FLAME_KLEIN_SB_IDX=<n>): probe the internal
+    // boundaries of ONE single block to find which sub-op rotates the gradient.
+    let probe_this = std::env::var("FLAME_KLEIN_SB_IDX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        == Some(block_idx);
+    if probe_this {
+        klein_probe("sb_in", &x);
+    }
+
     let (shift, scale, gate) = (&mods[0], &mods[1], &mods[2]);
     let x_normed = modulate_pre_local(&x, shift, scale)?;
+    if probe_this {
+        klein_probe("sb_normed", &x_normed);
+    }
 
     // Fused QKV + gate+up
     let qkv_mlp = lin(&x_normed, "linear1", 0)?;
@@ -1255,6 +1307,11 @@ fn single_block_forward_standalone(
 
     let fused = Tensor::cat(&[&attn_out, &mlp_act], 2)?;
     let out = lin(&fused, "linear2", 1)?;
+    if probe_this {
+        klein_probe("sb_attn_out", &attn_out);
+        klein_probe("sb_mlp_act", &mlp_act);
+        klein_probe("sb_out", &out);
+    }
 
     flame_core::bf16_ops::gate_residual_fused_bf16(&x, gate, &out)
 }
@@ -1692,10 +1749,12 @@ impl KleinModel {
             let total_seq = block_out.shape().dims()[1];
             img = block_out.narrow(1, 0, img_seq_len)?;
             txt = block_out.narrow(1, img_seq_len, total_seq - img_seq_len)?;
+            klein_probe(&format!("dbl{i}_img"), &img);
         }
 
         // ---- Single blocks (txt-then-img) ----
         let mut x = Tensor::cat(&[&txt, &img], 1)?;
+        klein_probe("x_cat_pre_single", &x);
         let txt_len = txt.shape().dims()[1];
 
         // TREAD residual stash (Phase 4.5). When `tread` is `Some` AND the
@@ -1997,6 +2056,9 @@ impl KleinModel {
         // ---- Extract image tokens ----
         let total_len = x.shape().dims()[1];
         let img_only = x.narrow(1, txt_len, total_len - txt_len)?;
+        // Probe: img hidden after the 24 single blocks, before the final layer.
+        // ≡ diffusers norm_out input. Splits final-layer vs single-block backward.
+        klein_probe("img_only", &img_only);
 
         // ---- Final layer: shift/scale + linear ----
         let final_mod = self.linear(&vec_silu, "final_layer.adaLN_modulation.1.weight")?;
