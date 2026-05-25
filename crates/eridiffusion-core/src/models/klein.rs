@@ -1519,21 +1519,19 @@ impl KleinModel {
             let prefix_for_closure = prefix.clone();
 
             let block_out = if use_checkpoint {
-                // 2026-05-14 Phase 6: narrow-scope boundary checkpoint per
-                // OFFLOAD_NEXT_GEN_DESIGN §B. Saves only block I/O (img_in,
-                // txt_in) to the `GrowOnDemandActivationCache`; backward
-                // pulls them and recomputes the block. Cache is installed
-                // by `setup_grow_activation_cache` in train_klein when
-                // `--activation-offload` is set; falls back to plain
-                // `checkpoint` when no cache is installed. Replaces the
-                // 2026-05-13 Gap 2 `checkpoint_offload` call which saved
-                // the full sub-tape (~80 tensors/block) to the legacy
-                // ActivationOffloadPool — too coarse for Klein 9B.
-                flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
+                // 2026-05-15 discriminating-test revert of `1994cac`: use
+                // legacy `checkpoint_offload` API. Without an
+                // ActivationOffloadPool installed (no `--activation-offload`
+                // flag), `checkpoint_offload` falls back to plain
+                // `checkpoint` per `flame_core::autograd::checkpoint_offload`
+                // at autograd.rs:2280. This matches the pre-Phase-6 hot
+                // path at EDv2 commit `661f9e9` (the 3.4-3.8 s/step
+                // baseline). If this restores baseline speed + no crash,
+                // the migration to `checkpoint_offload_boundary` is the
+                // regression trigger.
+                flame_core::autograd::AutogradContext::checkpoint_offload(
                     &[img_in.clone(), txt_in.clone()],
-                    move |inputs: &[Tensor]| {
-                        let img_in = inputs[0].clone();
-                        let txt_in = inputs[1].clone();
+                    move || {
                         // 2026-05-11 perf: `await_block_handle` gates the
                         // default stream on the slot's h2d_done event (no
                         // host stall) when block bi was prefetched by the
@@ -1839,13 +1837,11 @@ impl KleinModel {
             let prefix_for_closure = prefix.clone();
 
             x = if use_checkpoint {
-                // 2026-05-14 Phase 6: narrow-scope boundary checkpoint per
-                // OFFLOAD_NEXT_GEN_DESIGN §B. See double-block site above
-                // for full rationale.
-                flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
+                // 2026-05-15 discriminating-test revert of `1994cac` (single
+                // block site). See double-block site above for rationale.
+                flame_core::autograd::AutogradContext::checkpoint_offload(
                     &[x_in.clone()],
-                    move |inputs: &[Tensor]| {
-                        let x_in = inputs[0].clone();
+                    move || {
                         // 2026-05-11 perf: same async-prefetch protocol as
                         // the double-block loop. `await_block_handle` gates
                         // the default stream on h2d_done (no host stall) for

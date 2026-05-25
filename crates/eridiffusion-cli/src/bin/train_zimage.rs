@@ -25,7 +25,7 @@ use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use rand::distributions::Distribution as _;
 use std::path::PathBuf;
 
-use eridiffusion_core::config::LrScheduler;
+use eridiffusion_core::config::{LrScheduler, TrainConfig};
 use eridiffusion_core::encoders::qwen3::Qwen3Encoder;
 use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::zimage::{ZImageLoraBundle, ZImageModel};
@@ -60,7 +60,7 @@ const ZIMAGE_TXT_PAD_LEN: usize = 512;
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
 const LOGIT_NORMAL_BIAS: f32 = 0.0; // OT TrainConfig default
 const LOGIT_NORMAL_SCALE: f32 = 1.0; // noising_weight + 1.0 = 0.0 + 1.0
-const TIMESTEP_SHIFT: f32 = 1.0;
+const TIMESTEP_SHIFT_DEFAULT: f32 = 1.0;
 const SEED: u64 = 42;
 // Z-Image VAE scale/shift — must be applied at train time (and inverted at
 // sample time before VAE decode). Pretrained Z-Image DiT was trained on
@@ -227,6 +227,12 @@ struct Args {
     /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
     #[arg(long, default_value = "logit_normal")]
     timestep_distribution: String,
+    /// SD3-style flow-matching timestep shift applied AFTER the
+    /// distribution sample: `t' = shift*t / ((shift-1)*t + 1)`.
+    /// `1.0` (default) is the identity (no shift). OneTrainer's Z-Image
+    /// preset uses `1.8` for 512² resolution.
+    #[arg(long, default_value_t = 1.0)]
+    timestep_shift: f32,
     /// Distribution-specific weight knob (default 0.0 — Z-Image preset).
     #[arg(long, default_value_t = 0.0)]
     noising_weight: f32,
@@ -367,6 +373,26 @@ struct Args {
     /// Deliverable C Route (ii).
     #[arg(long, default_value_t = false)]
     use_autograd_v2: bool,
+
+    /// Same-batch parity probe (HANDOFF_2026-05-24 next-action). When set,
+    /// override step 0's (latent, latent_noise, scaled_noisy_latent_image,
+    /// timestep, sigma, flow_target, text_encoder_output) with values
+    /// loaded from this safetensors file (produced by OT's
+    /// OT_DUMP_STEP1_INPUTS=1 in BaseZImageSetup.predict). Forces a
+    /// per-LoRA grad dump at step 0 and EXITS after the dump (before any
+    /// optimizer step). The dumped grads can be compared directly to
+    /// OT's QKV-DUMP for the same input batch — any divergence is in
+    /// our real-model forward path, not in RNG / data sampling.
+    #[arg(long)]
+    replay_from: Option<PathBuf>,
+    /// Optional OT-compatible JSON TrainConfig. When provided, reads
+    /// `mse_strength`, `mae_strength`, and `loss_weight_fn` from the JSON,
+    /// matching the LossScaler path in OT's _flow_matching_losses
+    /// (ModelSetupDiffusionLossMixin.py:150,155). Defaults match OT values
+    /// (mse=1.0, mae=0.0, loss_weight_fn=CONSTANT) so existing CLI
+    /// invocations without --config are byte-identical.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 /// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
@@ -378,11 +404,11 @@ fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng) -> f32 {
     let z = normal.sample(rng);
     let logit_normal = 1.0 / (1.0 + (-z).exp());
     let t = logit_normal * NUM_TRAIN_TIMESTEPS as f32;
-    if (TIMESTEP_SHIFT - 1.0).abs() < 1e-6 {
+    if (TIMESTEP_SHIFT_DEFAULT - 1.0).abs() < 1e-6 {
         t
     } else {
-        NUM_TRAIN_TIMESTEPS as f32 * TIMESTEP_SHIFT * t
-            / ((TIMESTEP_SHIFT - 1.0) * t + NUM_TRAIN_TIMESTEPS as f32)
+        NUM_TRAIN_TIMESTEPS as f32 * TIMESTEP_SHIFT_DEFAULT * t
+            / ((TIMESTEP_SHIFT_DEFAULT - 1.0) * t + NUM_TRAIN_TIMESTEPS as f32)
     }
 }
 
@@ -424,6 +450,19 @@ fn main() -> anyhow::Result<()> {
         );
     }
     std::fs::create_dir_all(&args.output_dir)?;
+
+    // Load optional TrainConfig JSON for mse_strength / mae_strength / loss_weight_fn.
+    // OT parity: BaseZImageSetup reads these via ModelSetupDiffusionLossMixin.py:150,155.
+    // Defaults (mse=1.0, mae=0.0, loss_weight_fn=Constant) match OT's TrainConfig defaults
+    // so existing CLI invocations without --config remain byte-identical.
+    let train_config = if let Some(ref cfg_path) = args.config {
+        let c = TrainConfig::from_json_path(&cfg_path.to_string_lossy())?;
+        log::info!("[config] mse_strength={} mae_strength={} loss_weight_fn={:?}",
+            c.mse_strength, c.mae_strength, c.loss_weight_fn);
+        c
+    } else {
+        TrainConfig::default()
+    };
 
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
@@ -1001,14 +1040,25 @@ fn main() -> anyhow::Result<()> {
         };
 
         // Continuous timestep ∈ [0, NUM_TRAIN_TIMESTEPS), then floor → sigma idx.
-        let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+        let raw_t_unshifted = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+        // SD3-style flow-matching shift, identity when shift==1.0.
+        let raw_t = if (args.timestep_shift - 1.0).abs() < 1e-6 {
+            raw_t_unshifted
+        } else {
+            let s = args.timestep_shift;
+            let n = NUM_TRAIN_TIMESTEPS as f32;
+            n * s * raw_t_unshifted / ((s - 1.0) * raw_t_unshifted + n)
+        };
         // Default-off: Strategy::None → returns raw_t unchanged.
         let t_continuous =
             timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
         let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
         let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
-        // Z-Image's training-time `t` to the model is `1 - sigma` (per zimage_sampler).
-        let t_value = 1.0 - sigma;
+        // Z-Image's training-time `t` to the model: OT BaseZImageSetup.py:130 passes
+        // `(1000 - timestep) / 1000` where `timestep` is the integer sigma_idx.
+        // That is `(1000 - sigma_idx) / 1000`. Pre-fix we computed `1.0 - sigma`
+        // = `(999 - sigma_idx) / 1000` — off by exactly 1. Matched to OT source.
+        let t_value = (NUM_TRAIN_TIMESTEPS as f32 - sigma_idx as f32) / NUM_TRAIN_TIMESTEPS as f32;
 
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;
@@ -1047,6 +1097,130 @@ fn main() -> anyhow::Result<()> {
         let timestep = Tensor::from_vec(vec![t_value], Shape::from_dims(&[1]), device.clone())?
             .to_dtype(DType::BF16)?;
 
+        // ── Same-batch parity probe override (HANDOFF_2026-05-24) ──
+        // Only fires at step 0 when --replay-from is set. Overrides the
+        // freshly-sampled (latent, noise, noisy, target, timestep, cap_feats,
+        // cap_mask) with values dumped by OT's BaseZImageSetup.predict so
+        // both trainers see literally the same input. After backward we
+        // dump per-LoRA grads and exit.
+        let (latent, noise, noisy, target, timestep, cap_feats, cap_mask) =
+            if step == 0 && args.replay_from.is_some() {
+                let path = args.replay_from.as_ref().unwrap().clone();
+                log::info!("[replay] loading OT step-1 inputs from {}", path.display());
+                let ot = flame_core::serialization::load_file(&path, &device)?;
+
+                // Required tensors. OT's keys (see BaseZImageSetup.predict
+                // dump): scaled_latent_image, latent_noise,
+                // scaled_noisy_latent_image, timestep (int64, per-sample),
+                // sigma (per-sample scalar), flow_target, plus
+                // text_encoder_output_{i} (variable-length per sample).
+                let scaled_latent = ot.get("scaled_latent_image")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing scaled_latent_image"))?
+                    .to_dtype(DType::BF16)?;
+                let ot_noise = ot.get("latent_noise")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing latent_noise"))?
+                    .to_dtype(DType::BF16)?;
+                let ot_noisy = ot.get("scaled_noisy_latent_image")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing scaled_noisy_latent_image"))?
+                    .to_dtype(DType::BF16)?;
+                // CONVENTION FIX: OT's `flow_target` is `noise - clean` (the
+                // velocity dir in flow-matching). Our trainer's `target` is
+                // `clean - noise` (so that `pred ≈ -velocity` after the
+                // sampler's pred*-1 — see comment at line 1057). Negate.
+                let ot_target = ot.get("flow_target")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing flow_target"))?
+                    .to_dtype(DType::F32)?
+                    .mul_scalar(-1.0)?
+                    .to_dtype(DType::BF16)?;
+                let ot_ts = ot.get("timestep")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing timestep"))?
+                    .to_dtype(DType::F32)?;
+                // OT timestep is per-sample float (original int64, dumped as
+                // F32 for flame-core's safetensors loader). Ours uses scalar
+                // t_value = 1 - sigma where sigma = (idx+1)/NUM_TRAIN_TIMESTEPS.
+                // To replay faithfully, build a per-sample BF16 t vector with
+                // OT's exact (1000 - timestep)/1000 mapping (per
+                // BaseZImageSetup.predict line 130).
+                let ts_f32: Vec<f32> = ot_ts.to_vec()?;
+                let ts_i64: Vec<i64> = ts_f32.iter().map(|&f| f as i64).collect();
+                let t_vals: Vec<f32> = ts_f32.iter()
+                    .map(|&t| (NUM_TRAIN_TIMESTEPS as f32 - t) / NUM_TRAIN_TIMESTEPS as f32)
+                    .collect();
+                let ot_timestep = Tensor::from_vec(
+                    t_vals.clone(),
+                    Shape::from_dims(&[t_vals.len()]),
+                    device.clone(),
+                )?.to_dtype(DType::BF16)?;
+                log::info!(
+                    "[replay] latent={:?} noise={:?} noisy={:?} target={:?} ts={:?} t_vals={:?}",
+                    scaled_latent.shape().dims(),
+                    ot_noise.shape().dims(),
+                    ot_noisy.shape().dims(),
+                    ot_target.shape().dims(),
+                    ts_i64,
+                    t_vals,
+                );
+
+                // Text encoder: variable-length per sample. Pad to max
+                // length and build mask. OT keys: text_encoder_output_{i}
+                // for i in 0..batch_size.
+                // batch size: count consecutive text_encoder_output_{i}
+                // entries from i=0 (int64 scalar in dump isn't loadable by
+                // flame-core's safetensors path).
+                let mut per_sample: Vec<Tensor> = Vec::new();
+                let mut seq_lens: Vec<usize> = Vec::new();
+                for i in 0usize.. {
+                    let k = format!("text_encoder_output_{}", i);
+                    match ot.get(&k) {
+                        Some(t) => {
+                            let tb = t.to_dtype(DType::BF16)?;
+                            seq_lens.push(tb.shape().dims()[0]);
+                            per_sample.push(tb);
+                        }
+                        None => break,
+                    }
+                }
+                if per_sample.is_empty() {
+                    return Err(anyhow::anyhow!("replay: no text_encoder_output_<i> tensors found"));
+                }
+                let bs_t = per_sample.len();
+                let l_max = *seq_lens.iter().max().unwrap_or(&0);
+                let d_model = per_sample[0].shape().dims()[1];
+                log::info!(
+                    "[replay] text_encoder bs={} L_max={} D={} per_sample_lens={:?}",
+                    bs_t, l_max, d_model, seq_lens
+                );
+
+                // Build padded cap_feats [bs, L_max, D] BF16 + cap_mask [bs, L_max] BF16.
+                let mut padded_flat: Vec<f32> = vec![0.0; bs_t * l_max * d_model];
+                let mut mask_flat: Vec<f32> = vec![0.0; bs_t * l_max];
+                for (i, t) in per_sample.iter().enumerate() {
+                    let v: Vec<f32> = t.to_dtype(DType::F32)?.to_vec()?;
+                    let li = seq_lens[i];
+                    for p in 0..li {
+                        for d in 0..d_model {
+                            padded_flat[i * l_max * d_model + p * d_model + d] =
+                                v[p * d_model + d];
+                        }
+                        mask_flat[i * l_max + p] = 1.0;
+                    }
+                }
+                let cap = Tensor::from_vec(
+                    padded_flat,
+                    Shape::from_dims(&[bs_t, l_max, d_model]),
+                    device.clone(),
+                )?.to_dtype(DType::BF16)?;
+                let cmask = Tensor::from_vec(
+                    mask_flat,
+                    Shape::from_dims(&[bs_t, l_max]),
+                    device.clone(),
+                )?.to_dtype(DType::BF16)?;
+
+                (scaled_latent, ot_noise, ot_noisy, ot_target, ot_timestep, cap, Some(cmask))
+            } else {
+                (latent, clean_noise, noisy, target, timestep, cap_feats, cap_mask)
+            };
+
         if step == 0 {
             log::info!(
                 "step 0 | latent={:?} cap={:?} sigma={:.4} (idx={})",
@@ -1059,6 +1233,41 @@ fn main() -> anyhow::Result<()> {
 
         let pred = model.forward(&noisy, &timestep, &cap_feats, cap_mask.as_ref())?;
 
+        // Same-batch probe: dump our predicted_flow at step 0 (when
+        // replaying) so we can compare element-wise vs OT's predicted_flow
+        // in the input safetensors dump.
+        if step == 0 && args.replay_from.is_some() {
+            let pred_vec: Vec<f32> = pred.to_dtype(DType::F32)?.to_vec()?;
+            let n = pred_vec.len() as f32;
+            let mean = pred_vec.iter().sum::<f32>() / n;
+            let var = pred_vec.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+            let std = var.sqrt();
+            let max_abs = pred_vec.iter().fold(0f32, |a, &b| a.max(b.abs()));
+            let l2 = pred_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+            log::info!(
+                "[replay] OURS predicted_flow stats: mean={:+.3e} std={:.3e} max_abs={:.3e} L2={:.3e} shape={:?}",
+                mean, std, max_abs, l2, pred.shape().dims()
+            );
+            // Also compute target stats + pred-target stats for context.
+            let tgt_vec: Vec<f32> = target.to_dtype(DType::F32)?.to_vec()?;
+            let tmean = tgt_vec.iter().sum::<f32>() / n;
+            let tvar = tgt_vec.iter().map(|x| (x - tmean) * (x - tmean)).sum::<f32>() / n;
+            let tstd = tvar.sqrt();
+            let diff_l2 = pred_vec.iter().zip(tgt_vec.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+            log::info!(
+                "[replay] OURS target stats:         mean={:+.3e} std={:.3e}  ||pred-target||_L2={:.3e}",
+                tmean, tstd, diff_l2
+            );
+            // Save predicted_flow to a safetensors for element-wise compare.
+            let dump_path = std::env::var("REPLAY_DUMP_PRED")
+                .unwrap_or_else(|_| "/tmp/ours_predicted_flow.safetensors".to_string());
+            let mut map = std::collections::HashMap::new();
+            map.insert("predicted_flow".to_string(), pred.to_dtype(DType::BF16)?);
+            map.insert("target".to_string(), target.to_dtype(DType::BF16)?);
+            flame_core::serialization::save_file(&map, &dump_path)?;
+            log::info!("[replay] wrote OURS predicted_flow + target → {}", dump_path);
+        }
+
         if pred.shape().dims() != target.shape().dims() {
             anyhow::bail!(
                 "pred {:?} != target {:?}",
@@ -1067,18 +1276,23 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        // Phase 1: combined loss + per-step weighting. Default-off invariant.
-        // Z-Image trainer does not currently load TrainConfig JSON; mse=1.0,
-        // mae=0.0, loss_weight_fn=Constant defaults are inlined here. Per-step
-        // weighting still picks up `--min-snr-gamma` from args.
+        // Combined loss + per-step weighting matching OT's _flow_matching_losses.
+        // mse_strength / mae_strength / loss_weight_fn are read from --config JSON
+        // when provided (OT ModelSetupDiffusionLossMixin.py:150,155); otherwise the
+        // OT default values (mse=1.0, mae=0.0, loss_weight_fn=Constant) apply.
         let pred_f32 = pred.to_dtype(DType::F32)?;
         let target_f32 = target.to_dtype(DType::F32)?;
-        let raw_loss =
-            loss_weight::combined_loss(&pred_f32, &target_f32, 1.0, 0.0, args.huber_strength)?;
+        let raw_loss = loss_weight::combined_loss(
+            &pred_f32,
+            &target_f32,
+            train_config.mse_strength as f32,
+            train_config.mae_strength as f32,
+            args.huber_strength,
+        )?;
         let loss = loss_weight::apply_loss_weight(
             &raw_loss,
             sigma,
-            eridiffusion_core::config::LossWeight::Constant,
+            train_config.loss_weight_fn,
             args.min_snr_gamma,
             true,
         )?;
@@ -1144,6 +1358,40 @@ fn main() -> anyhow::Result<()> {
                 log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
             } else {
                 log::warn!("{}", report.summary());
+            }
+        }
+
+        // Diagnostic: dump per-block per-role LoRA grad norms at fixed steps.
+        // Set FLAME_DUMP_QKV_GRADS=1 to enable. Surfaces whether Q/K grads
+        // diverge from V grads (RoPE/QKV-split bwd suspicion).
+        if (std::env::var("FLAME_DUMP_QKV_GRADS").as_deref() == Ok("1")
+            && matches!(step, 1 | 5 | 10 | 25 | 50))
+            || (step == 0 && args.replay_from.is_some())
+        {
+            let named = model.bundle.named_parameters();
+            // Group by (block_idx, role) where role ∈ {q_a,q_b,k_a,k_b,v_a,v_b,...}
+            let mut rows: Vec<(String, f32)> = Vec::new();
+            for (name, param) in &named {
+                if let Some(g) = grads.get(param.id()) {
+                    let v = g.to_dtype(DType::F32).and_then(|t| t.to_vec()).unwrap_or_default();
+                    let n = (v.iter().map(|x| x * x).sum::<f32>()).sqrt();
+                    rows.push((name.clone(), n));
+                } else {
+                    rows.push((name.clone(), -1.0));
+                }
+            }
+            log::info!("[QKV-DUMP step={}] -- begin --", step);
+            for (n, val) in &rows {
+                log::info!("[QKV-DUMP step={}] {:60} ||grad||={:.6e}", step, n, val);
+            }
+            log::info!("[QKV-DUMP step={}] -- end --", step);
+
+            // Same-batch parity probe: after dumping at step 0, exit
+            // immediately so we capture pre-opt-step grads on identical
+            // inputs to OT's step-1 dump. Skip optimizer entirely.
+            if step == 0 && args.replay_from.is_some() {
+                log::info!("[replay] step-0 QKV-DUMP complete — exiting before optimizer step.");
+                return Ok(());
             }
         }
         // OT default: clip_grad_norm = 1.0. Mirrors train_ernie.rs.
@@ -1347,7 +1595,14 @@ fn main() -> anyhow::Result<()> {
                     };
                     // Side-RNG so training-side `rng` is not perturbed.
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let raw_t = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    let raw_t_unshifted = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    let raw_t = if (args.timestep_shift - 1.0).abs() < 1e-6 {
+                        raw_t_unshifted
+                    } else {
+                        let s = args.timestep_shift;
+                        let n = NUM_TRAIN_TIMESTEPS as f32;
+                        n * s * raw_t_unshifted / ((s - 1.0) * raw_t_unshifted + n)
+                    };
                     let t_continuous = timestep_bias::apply_bias(
                         raw_t,
                         NUM_TRAIN_TIMESTEPS as f32,

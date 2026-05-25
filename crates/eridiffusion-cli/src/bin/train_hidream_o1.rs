@@ -113,6 +113,24 @@ const T_EPS_AT: f32 = 1.0e-3;
 /// `set_train_timesteps`@sampler.py:161). With `use_dynamic_shifting=False`,
 /// the shift mapping is `sigma_shifted = shift * u / (1 + (shift-1) * u)`.
 const FLOW_SHIFT: f32 = 3.0;
+/// Number of entries in the ai-toolkit flowmatch sigma grid
+/// (`custom_flowmatch_sampler.py:136` `num_timesteps = 1000`).
+const SHIFT_GRID_NUM: usize = 1000;
+/// Pre-shift sigma grid maximum, mirroring ai-toolkit's
+/// `_sigma_to_t(sigma_max) / num_train_timesteps` for
+/// `FlowMatchEulerDiscreteScheduler(shift=3.0)`:
+/// `_sigma_to_t(1.0) = 1000.0`, `/1000 = 1.0` (`custom_flowmatch_sampler.py:137,141`).
+const SHIFT_SIGMA_MAX: f64 = 1.0;
+/// Pre-shift sigma grid minimum, mirroring ai-toolkit's
+/// `_sigma_to_t(sigma_min) / num_train_timesteps`. The diffusers
+/// `FlowMatchEulerDiscreteScheduler(shift=3.0)` computes
+/// `sigma_min = 0.002994012087583542`, and `_sigma_to_t(sigma_min) = 2.994012087583542`,
+/// `/1000 = 0.002994012087583542` (`custom_flowmatch_sampler.py:138,141`).
+/// PREVIOUS BUG: ours used `(1000 - idx) / 1000`, i.e. a linspace floor of
+/// 0.001 instead of 0.002994, letting the reachable shifted sigma drop to
+/// ~0.005976 (idx=998) vs ai-toolkit's ~0.011881 — over-amplifying the
+/// 1/sigma velocity weighting at low sigma. See AUDIT/SKEPTIC_HIDREAM_2026-05-25.
+const SHIFT_SIGMA_MIN: f64 = 0.002994012087583542;
 
 #[derive(Parser)]
 struct Args {
@@ -309,17 +327,34 @@ fn sample_t<R: rand::Rng>(rng: &mut R, mode: TstepMode, shift: f32) -> f32 {
             (1000.0 - idx as f32) / 1000.0
         }
         TstepMode::Uniform => rng.r#gen::<f32>().clamp(T_EPS_AT, 1.0 - T_EPS_AT),
-        // Flow-matching shift mapping over the same discrete 1000-entry grid
-        // edv2-reference builds in `custom_flowmatch_sampler.py:136-178`.
-        // Balanced sampling then draws indices in [0, 999), so the smallest
-        // reachable raw sigma is 0.002, not 0.001.
+        // Flow-matching shift grid — bit-mirror of ai-toolkit
+        // `custom_flowmatch_sampler.py:136-161` for the `shift` timestep type
+        // with `use_dynamic_shifting=False`, `shift_terminal=None`, and no
+        // karras/exponential/beta/invert (all defaults for the HiDream-O1
+        // scheduler, verified against `FlowMatchEulerDiscreteScheduler(shift=3.0)`):
         //
-        // Mapping (`custom_flowmatch_sampler.py:161`):
-        //   sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+        //   timesteps = np.linspace(_sigma_to_t(sigma_max),    # = 1000.0
+        //                           _sigma_to_t(sigma_min),     # = 2.994012087583542
+        //                           num_timesteps)              # = 1000, endpoints inclusive
+        //   sigmas    = timesteps / num_train_timesteps         # → linspace(1.0, 0.002994…)
+        //   sigmas    = shift * sigmas / (1 + (shift - 1) * sigmas)   # :161
+        //
+        // numpy linspace value at index i (both endpoints inclusive):
+        //   sigma_raw[i] = sigma_max + i * (sigma_min - sigma_max) / (num - 1)
+        // The `balanced` sampler then draws idx via `torch.randint(0, 999)` ⇒
+        // idx ∈ [0, 998]; we mirror that with `gen_range(0..SHIFT_GRID_NUM-1)`.
+        // PREVIOUS BUG used `(1000 - idx)/1000` (linspace floor 0.001), giving
+        // a reachable shifted sigma ~0.005976 vs ai-toolkit's ~0.011881.
         TstepMode::Shift => {
-            let idx: usize = rng.gen_range(0..999);
-            let raw = (1000.0 - idx as f32) / 1000.0;
-            (shift * raw / (1.0 + (shift - 1.0) * raw)).clamp(T_EPS_AT, 1.0 - T_EPS_AT)
+            let idx: usize = rng.gen_range(0..(SHIFT_GRID_NUM - 1));
+            // numpy/torch build the grid in float64-equivalent precision; do
+            // the same and cast once at the end so the grid is bit-identical.
+            let n = (SHIFT_GRID_NUM - 1) as f64;
+            let sigma_raw =
+                SHIFT_SIGMA_MAX + (idx as f64) * (SHIFT_SIGMA_MIN - SHIFT_SIGMA_MAX) / n;
+            let s = shift as f64;
+            let sigma_shifted = s * sigma_raw / (1.0 + (s - 1.0) * sigma_raw);
+            (sigma_shifted as f32).clamp(T_EPS_AT, 1.0 - T_EPS_AT)
         }
     }
 }

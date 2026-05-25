@@ -63,10 +63,7 @@ const SEED: u64 = 42;
 // DiT dimensions — pinned from L2pDiTConfig::default() in
 // inference-flame/src/models/l2p/dit.rs.
 const DIM: usize = 3840;
-const QKV_OUT: usize = 3 * DIM; // 11520
 const MLP_HIDDEN: usize = 10240;
-const NUM_NOISE_REFINER: usize = 2;
-const NUM_CONTEXT_REFINER: usize = 2;
 const NUM_LAYERS: usize = 30;
 
 #[derive(Parser)]
@@ -486,7 +483,15 @@ fn main() -> anyhow::Result<()> {
     let opt_kind = OptimizerKind::parse(&args.optimizer)
         .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
     log::info!("[3/5] Optimizer: {} lr={}", opt_kind.as_str(), args.lr);
-    let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
+    // C2 fix 2026-05-25: match ai-toolkit's ACTUAL optimizer construction.
+    // optimizer.py:71 → `AdamW8bit(params, lr, eps=1e-6, **optimizer_params)`.
+    // l2p_boxjana_baseline.yaml sets optimizer=adamw8bit + lr only (NO
+    // optimizer_params), so weight_decay falls through to bitsandbytes'
+    // AdamW8bit default = 0.01.
+    //   eps: 1e-8 → 1e-6 (explicit in optimizer.py:71).
+    //   weight_decay: stays 0.01 (bnb default; the auditor's 1e-4 came from
+    //   jobConfig.ts, a UI default the hand-written baseline never uses — REVERTED).
+    let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-6, 0.01);
 
     // Training-time sigma sampling: Ostris ai-toolkit ZImage-L2P recipe.
     // Sample sigma UNIFORMLY in `(0, 1]` (mirrors `linspace(1000, 1)` with
@@ -658,34 +663,6 @@ fn main() -> anyhow::Result<()> {
                 Err(e) => log::warn!("[grad-flow] check failed: {e}"),
             }
         }
-
-        // ── Per-group grad norms (LoRA-A vs LoRA-B) ─────────────────
-        // The global grad_norm hides the typical pattern in LoRA training
-        // where lora_B (zero-init) grads are tiny early on while lora_A
-        // (random-init) grads dominate. Logging the two separately surfaces
-        // whether convergence is actually happening on the B side — the
-        // load-bearing direction since identity (B=0) means no LoRA effect.
-        let mut grad_refs_a: Vec<&Tensor> = Vec::with_capacity(named.len() / 2);
-        let mut grad_refs_b: Vec<&Tensor> = Vec::with_capacity(named.len() / 2);
-        for (name, p) in &named {
-            if let Some(g) = grads.get(p.id()) {
-                if name.ends_with(".lora_A.weight") {
-                    grad_refs_a.push(g);
-                } else if name.ends_with(".lora_B.weight") {
-                    grad_refs_b.push(g);
-                }
-            }
-        }
-        let norm_a = if grad_refs_a.is_empty() {
-            0.0_f32
-        } else {
-            flame_core::ops::grad_norm::global_l2_norm(&grad_refs_a)?.item()? as f32
-        };
-        let norm_b = if grad_refs_b.is_empty() {
-            0.0_f32
-        } else {
-            flame_core::ops::grad_norm::global_l2_norm(&grad_refs_b)?.item()? as f32
-        };
 
         // ── Per-group grad norms (LoRA-A vs LoRA-B) ─────────────────
         // The global grad_norm hides the typical pattern in LoRA training

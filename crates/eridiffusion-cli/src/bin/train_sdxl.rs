@@ -787,29 +787,29 @@ fn main() -> anyhow::Result<()> {
         // hardcoded in this trainer the per-example mask collapses to a
         // single scalar 0.0 / 1.0 per step.
         //
-        // Divergence note (MEDIUM): OT draws INDEPENDENT Bernoullis for
-        // TE1 and TE2 (`text_encoder.dropout_probability` and
-        // `text_encoder_2.dropout_probability` are separate config fields).
-        // EDv2 caches `text_embedding` as the concat of TE1+TE2 hidden
-        // states, so we use a single shared mask. If independent dropout
-        // is needed, the cache must split TE1/TE2 first.
-        //
-        // The legacy `--null-text-cache` swap path (kept as a fallback) is
-        // available when `--caption-dropout-mode null_cache` is requested
-        // by future CLI work; for now the zero-multiply is unconditional
-        // when `--caption-dropout-probability > 0`.
+        // OT parity (S-C3): StableDiffusionXLModel.py:273-283 draws INDEPENDENT
+        // Bernoullis for TE1 (CLIP-L) and TE2 (CLIP-G) via sequential rand.random() calls.
+        // draw1 → TE1: zeros text_encoder_1_output [1,77,768] (CLIP-L hidden)
+        // draw2 → TE2: zeros text_encoder_2_output [1,77,1280] (CLIP-G hidden)
+        //             AND pooled_text_encoder_2_output [1,1280] (CLIP-G pool)
+        // Our cache stores concat([CLIP-L [1,77,768], CLIP-G [1,77,1280]], dim=2) → [1,77,2048].
+        // We split on dim 2 at index 768, apply independent masks, then recombine.
         let (text_embedding, pooled_clip_g) = if effective_caption_dropout_prob > 0.0 {
             use rand::Rng;
-            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
-                // Zero-multiply both TE hidden and pooled CLIP-G. Matches
-                // OT line 280-281: `text_encoder_*_output * 0`.
-                (
-                    text_embedding.mul_scalar(0.0)?,
-                    pooled_clip_g.mul_scalar(0.0)?,
-                )
-            } else {
-                (text_embedding, pooled_clip_g)
-            }
+            let drop_te1: bool = rng.r#gen::<f32>() < effective_caption_dropout_prob;
+            let drop_te2: bool = rng.r#gen::<f32>() < effective_caption_dropout_prob;
+            // Split text_embedding [1,77,2048] → clip_l [1,77,768] + clip_g [1,77,1280]
+            const CLIP_L_DIM: usize = 768;
+            let te_dims = text_embedding.shape().dims().to_vec();
+            let full_dim = te_dims[2]; // 2048
+            let clip_g_dim = full_dim - CLIP_L_DIM;
+            let clip_l_h = text_embedding.narrow(2, 0, CLIP_L_DIM)?;
+            let clip_g_h = text_embedding.narrow(2, CLIP_L_DIM, clip_g_dim)?;
+            let clip_l_h = if drop_te1 { clip_l_h.mul_scalar(0.0)? } else { clip_l_h };
+            let clip_g_h = if drop_te2 { clip_g_h.mul_scalar(0.0)? } else { clip_g_h };
+            let te = Tensor::cat(&[&clip_l_h, &clip_g_h], 2)?;
+            let pool = if drop_te2 { pooled_clip_g.mul_scalar(0.0)? } else { pooled_clip_g };
+            (te, pool)
         } else {
             (text_embedding, pooled_clip_g)
         };

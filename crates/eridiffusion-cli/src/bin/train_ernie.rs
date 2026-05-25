@@ -584,6 +584,18 @@ fn main() -> anyhow::Result<()> {
         args.noising_bias,
     )?;
 
+    // SD3/flow-matching timestep shift, read from the config (OT applies
+    // `config.timestep_shift` via BaseErnieSetup.py:112, which calls
+    // ModelSetupNoiseMixin._get_timestep_discrete with the shift value;
+    // that function applies `t = N*s*t / ((s-1)*t + N)` at line 172).
+    // Before this fix, train_ernie used a hardcoded TIMESTEP_SHIFT=1.0 constant
+    // and the live sample loop never applied the shift at all.
+    let cfg_timestep_shift = config.timestep_shift as f32;
+    log::info!(
+        "[Ernie] timestep_shift={} (flow-matching; identity at 1.0)",
+        cfg_timestep_shift
+    );
+
     if let Some(resume_path) = args.resume_lora.as_ref() {
         log::info!(
             "Resuming LoRA weights only (no optimizer state) from {}",
@@ -822,7 +834,16 @@ fn main() -> anyhow::Result<()> {
         // Flow-matching noise schedule (OT _add_noise_discrete with discrete sigmas):
         //   sigma_idx ∈ [0, 999], sigma = (sigma_idx + 1) / 1000.
         // Continuous timestep in [0, 1000) is what the transformer's sin/cos sees.
-        let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+        let raw_t_unshifted = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+        // SD3-style flow-matching shift from config.timestep_shift (identity at 1.0).
+        // Mirrors OT ModelSetupNoiseMixin._get_timestep_discrete:172.
+        let raw_t = if (cfg_timestep_shift - 1.0).abs() < 1e-6 {
+            raw_t_unshifted
+        } else {
+            let s = cfg_timestep_shift;
+            let n = NUM_TRAIN_TIMESTEPS as f32;
+            n * s * raw_t_unshifted / ((s - 1.0) * raw_t_unshifted + n)
+        };
         // Default-off: Strategy::None → returns raw_t unchanged.
         let t_continuous =
             timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
@@ -856,8 +877,14 @@ fn main() -> anyhow::Result<()> {
             .mul_scalar(sigma)?
             .add(&latent.mul_scalar(1.0 - sigma)?)?;
         let target = clean_noise.sub(&latent)?;
+        // OT parity: BaseErnieSetup.py:124 passes `timestep=timestep` where
+        // `timestep` is the INTEGER from _get_timestep_discrete (ModelSetupNoiseMixin.py:212
+        // returns `timestep.int()`). The ERNIE transformer.timestep_embedding (ernie.rs:503)
+        // receives the raw integer (e.g. 500), not divided by 1000 — comment says
+        // "NO 1000x scaling". Pre-fix we passed t_continuous (float ~500.73);
+        // now we pass sigma_idx as f32 (integer-valued float, e.g. 500.0).
         let timestep =
-            Tensor::from_vec(vec![t_continuous], Shape::from_dims(&[1]), device.clone())?;
+            Tensor::from_vec(vec![sigma_idx as f32], Shape::from_dims(&[1]), device.clone())?;
 
         if step == 0 {
             let l_dims = latent.shape().dims().to_vec();
@@ -1097,8 +1124,16 @@ fn main() -> anyhow::Result<()> {
                     // uses its OWN run-side RNG so it does not perturb the
                     // training-side seeded sequence (byte invariance).
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let t_continuous =
+                    let v_raw_t_unshifted =
                         timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    // SD3-style flow-matching shift (mirrors training loop above).
+                    let t_continuous = if (cfg_timestep_shift - 1.0).abs() < 1e-6 {
+                        v_raw_t_unshifted
+                    } else {
+                        let s = cfg_timestep_shift;
+                        let n = NUM_TRAIN_TIMESTEPS as f32;
+                        n * s * v_raw_t_unshifted / ((s - 1.0) * v_raw_t_unshifted + n)
+                    };
                     let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
                     let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
                     let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?

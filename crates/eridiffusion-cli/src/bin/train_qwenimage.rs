@@ -1013,8 +1013,19 @@ fn main() -> anyhow::Result<()> {
         // Default-off: Strategy::None → returns raw_t unchanged. qwenimage
         // sigma is already in [0, 1], so we pass total=1.0.
         let t_continuous = timestep_bias::apply_bias(raw_t, 1.0, &timestep_bias_cfg);
-        let sigma = t_continuous;
-        let timestep = Tensor::from_vec(vec![sigma], Shape::from_dims(&[1]), device.clone())?
+        // OT parity (Q-C2/Q-C3): BaseQwenSetup.py:110 calls _get_timestep_discrete which
+        // returns timestep.int() (ModelSetupNoiseMixin.py:212). OT model gets
+        // `timestep / 1000` where timestep is the INTEGER index ∈ [0,999].
+        // Our t_continuous ∈ [0,1] → discretize to integer bin, derive sigma and
+        // model timestep from the same discrete index. Matches _add_noise_discrete:
+        //   sigma = (sigma_idx + 1) / 1000  (FlowMatchingMixin.py:23-24)
+        //   model input = sigma_idx / 1000  (BaseQwenSetup.py:142)
+        const NUM_TRAIN_TIMESTEPS_QWEN: usize = 1000;
+        let sigma_idx = ((t_continuous * NUM_TRAIN_TIMESTEPS_QWEN as f32).floor() as usize)
+            .min(NUM_TRAIN_TIMESTEPS_QWEN - 1);
+        let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS_QWEN as f32;
+        let model_t = sigma_idx as f32 / NUM_TRAIN_TIMESTEPS_QWEN as f32;
+        let timestep = Tensor::from_vec(vec![model_t], Shape::from_dims(&[1]), device.clone())?
             .to_dtype(DType::BF16)?;
 
         // Flow-matching: x_t = (1 - sigma) * latent + sigma * noise; target = noise - latent.

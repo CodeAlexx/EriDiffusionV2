@@ -797,12 +797,15 @@ fn main() -> anyhow::Result<()> {
             timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
         let sigma_continuous = (t_continuous / NUM_TRAIN_TIMESTEPS as f32).clamp(0.0, 1.0);
         // Apply discrete_flow_shift to the sigma used for noising (matches
-        // kohya `flux_train_utils.get_noisy_model_input_and_timesteps` shift path).
+        // kohya `anima_train_utils.get_noisy_model_input_and_timesteps:192-193`).
+        // Clamp AFTER shift mirrors reference line 196: `t.clamp(1e-5, 1.0 - 1e-5)`.
+        // Prevents σ→0 / σ→1 edge cases that cause `sigma_sqrt` weighting blow-up.
         let sigma = if args.timestep_sampling != "shift" {
             apply_shift(sigma_continuous, args.discrete_flow_shift)
         } else {
             sigma_continuous
-        };
+        }
+        .clamp(1e-5, 1.0 - 1e-5);
 
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;

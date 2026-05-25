@@ -7,7 +7,9 @@
 //!   - lora_rank / alpha     = 16 / 1.0       (preset doesn't pin these — common community defaults)
 //!   - timestep_distribution = LOGIT_NORMAL   (preset L27)
 //!   - dynamic_timestep_shifting = false      (preset L28)
-//!   - timestep_shift        = 1.0            (default — overridden by per-resolution mu in sampling, NOT in training)
+//!   - timestep_shift        = 1.0            (default; identity shift — OT preset has dynamic_timestep_shifting=false;
+//!                                            per-resolution shift is an INFERENCE knob, not used in OT training)
+//!                                            BUG-FIX Set-B 2026-05-25: config.timestep_shift now wired via --timestep-shift.
 //!   - noising_weight        = 0.0            (TrainConfig default → LOGIT_NORMAL scale = 1.0)
 //!   - noising_bias          = 0.0            (TrainConfig default → LOGIT_NORMAL bias  = 0.0)
 //!   - clip_grad_norm        = 1.0
@@ -54,7 +56,7 @@ use std::str::FromStr as _;
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
 const LOGIT_NORMAL_BIAS: f32 = 0.0; // TrainConfig.noising_bias default
 const LOGIT_NORMAL_SCALE: f32 = 1.0; // noising_weight + 1.0 = 0.0 + 1.0
-const TIMESTEP_SHIFT: f32 = 1.0; // preset default (dynamic shifting = false)
+const TIMESTEP_SHIFT: f32 = 1.0; // dead — used only in the kept-for-reference fn; CLI uses args.timestep_shift
 const SEED: u64 = 42;
 const CLIP_GRAD_NORM: f32 = 1.0;
 
@@ -180,6 +182,15 @@ struct Args {
     /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
     #[arg(long, default_value = "logit_normal")]
     timestep_distribution: String,
+    /// SD3-style flow-matching timestep shift applied AFTER the distribution
+    /// sample: `t' = N*shift*t / ((shift-1)*t + N)`. `1.0` (default) is the
+    /// identity (no shift). OneTrainer's Flux preset defaults to `1.0`
+    /// (dynamic_timestep_shifting=false; per-resolution shift is an inference
+    /// knob, not a training knob per the OT Flux preset). Mirrors the fix
+    /// applied to train_zimage.rs and train_klein.rs — config.timestep_shift
+    /// was previously silently ignored.
+    #[arg(long, default_value_t = 1.0)]
+    timestep_shift: f32,
     /// Distribution-specific weight knob (default 0.0 — FLUX preset).
     #[arg(long, default_value_t = 0.0)]
     noising_weight: f32,
@@ -675,16 +686,20 @@ fn main() -> anyhow::Result<()> {
             .get("clip_pool")
             .ok_or_else(|| anyhow::anyhow!("missing 'clip_pool'"))?
             .to_dtype(DType::BF16)?;
-        // Caption dropout: single Bernoulli per step swaps both T5 + CLIP
-        // pool together (correlated, matching CFG training convention).
+        // Caption dropout: OT parity (F-C3). FluxModel.py:291-299 draws INDEPENDENT
+        // Bernoullis for TE1 (CLIP pool) and TE2 (T5 hidden) via sequential rand.random()
+        // calls. We match this with two independent draws from our rng:
+        //   draw1 → CLIP pool (text_encoder_1_dropout_probability)
+        //   draw2 → T5 hidden (text_encoder_2_dropout_probability)
+        // Both use the same effective_caption_dropout_prob (OT default: same prob for both).
         // Default-off (prob == 0.0 OR null_text == None) draws no rng.
         let (t5, clip_pool) = if let Some((ref nt5, ref nclip)) = null_text {
             use rand::Rng;
-            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
-                (nt5.clone(), nclip.clone())
-            } else {
-                (t5, clip_pool)
-            }
+            let drop_clip: bool = rng.r#gen::<f32>() < effective_caption_dropout_prob;
+            let drop_t5: bool = rng.r#gen::<f32>() < effective_caption_dropout_prob;
+            let out_clip = if drop_clip { nclip.clone() } else { clip_pool };
+            let out_t5 = if drop_t5 { nt5.clone() } else { t5 };
+            (out_t5, out_clip)
         } else {
             (t5, clip_pool)
         };
@@ -700,7 +715,19 @@ fn main() -> anyhow::Result<()> {
         let txt_ids = build_txt_ids(n_txt, device.clone())?.to_dtype(DType::BF16)?;
 
         // Flow-matching: t in [0, 1000), sigma = (idx+1)/1000.
-        let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+        let raw_t_unshifted = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+        // SD3-style flow-matching shift (identity when shift==1.0). Mirrors
+        // OT `BaseFluxSetup.py:244-251` which passes
+        // `shift = config.timestep_shift` to `_get_timestep_discrete`.
+        // BUG-FIX: config.timestep_shift was previously silently ignored
+        // (hardcoded 1.0). Same pattern fixed in train_zimage.rs + train_klein.rs.
+        let raw_t = if (args.timestep_shift - 1.0).abs() < 1e-6 {
+            raw_t_unshifted
+        } else {
+            let s = args.timestep_shift;
+            let n = NUM_TRAIN_TIMESTEPS as f32;
+            n * s * raw_t_unshifted / ((s - 1.0) * raw_t_unshifted + n)
+        };
         // Default-off: Strategy::None → returns raw_t unchanged.
         let t_continuous =
             timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
@@ -956,7 +983,16 @@ fn main() -> anyhow::Result<()> {
 
                     // SIDE-RNG: do NOT touch training-side `rng`.
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let raw_t = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    let raw_t_unshifted =
+                        timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    // Mirror training-step shift exactly.
+                    let raw_t = if (args.timestep_shift - 1.0).abs() < 1e-6 {
+                        raw_t_unshifted
+                    } else {
+                        let s = args.timestep_shift;
+                        let n = NUM_TRAIN_TIMESTEPS as f32;
+                        n * s * raw_t_unshifted / ((s - 1.0) * raw_t_unshifted + n)
+                    };
                     let t_continuous = timestep_bias::apply_bias(
                         raw_t,
                         NUM_TRAIN_TIMESTEPS as f32,
@@ -971,7 +1007,12 @@ fn main() -> anyhow::Result<()> {
                         .mul_scalar(sigma)?
                         .add(&v_latent.mul_scalar(1.0 - sigma)?)?;
                     let v_target = v_noise.sub(&v_latent)?;
-                    let v_t_model = t_continuous / NUM_TRAIN_TIMESTEPS as f32;
+                    // OT parity (F-C1/F-C2): validation path must use the integer-discretized
+                    // sigma_idx (matching training path at line 738 + 780: `t_int = sigma_idx as f32;
+                    // t_model = t_int / NUM_TRAIN_TIMESTEPS`). Pre-fix used t_continuous / 1000
+                    // (fractional) while the training path used sigma_idx as f32 / 1000 (integer).
+                    // BaseFluxSetup.py always calls _get_timestep_discrete → timestep.int().
+                    let v_t_model = sigma_idx as f32 / NUM_TRAIN_TIMESTEPS as f32;
                     let v_timestep =
                         Tensor::from_vec(vec![v_t_model], Shape::from_dims(&[1]), device.clone())?;
                     let v_context = vec![v_t5, v_img_ids, v_txt_ids];

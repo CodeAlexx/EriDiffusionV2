@@ -719,6 +719,17 @@ fn main() -> anyhow::Result<()> {
         args.noising_weight,
         args.noising_bias,
     )?;
+    // SD3/flow-matching timestep shift, read from the config (OT applies
+    // `config.timestep_shift` via BaseFlux2Setup.py:121). BEFORE 2026-05-25
+    // train_klein IGNORED this field entirely — the live loop never applied a
+    // shift and the `TIMESTEP_SHIFT=1.0` const was dead code, so every Klein
+    // run silently trained at effective shift 1.0 regardless of the config.
+    // Now honored, matching train_zimage.rs:1024 and OT.
+    let cfg_timestep_shift = config.timestep_shift as f32;
+    log::info!(
+        "[Klein] timestep_shift={} (flow-matching; identity at 1.0)",
+        cfg_timestep_shift
+    );
 
     // Caption dropout startup check: if requested but no uncond source is
     // available (sample mode is off), disable the feature with a warning so
@@ -1200,8 +1211,15 @@ fn main() -> anyhow::Result<()> {
         let mut t_model_per_b: Vec<f32> = Vec::with_capacity(bs);
         for _ in 0..bs {
             // Sample u in [0,1] via unified dispatcher → scale to [0, NUM_TRAIN_TIMESTEPS).
-            // With klein's `TIMESTEP_SHIFT=1.0` the legacy post-shift was a no-op.
-            let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+            let raw_t_unshifted = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+            // SD3-style flow-matching shift from config.timestep_shift (identity at 1.0).
+            let raw_t = if (cfg_timestep_shift - 1.0).abs() < 1e-6 {
+                raw_t_unshifted
+            } else {
+                let s = cfg_timestep_shift;
+                let n = NUM_TRAIN_TIMESTEPS as f32;
+                n * s * raw_t_unshifted / ((s - 1.0) * raw_t_unshifted + n)
+            };
             // Default-off: Strategy::None → returns raw_t unchanged.
             let t_continuous = timestep_bias::apply_bias(
                 raw_t,
@@ -1445,6 +1463,28 @@ fn main() -> anyhow::Result<()> {
         if dbg_on {
             eprintln!("[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}", step, total_norm);
         }
+
+        // Diagnostic: dump per-block per-role LoRA grad norms at fixed steps.
+        // Set FLAME_DUMP_QKV_GRADS=1 to enable. Compares Q/K vs V grad magnitudes
+        // across blocks — surfaces autograd-path divergence (RoPE/QKV-split bwd).
+        if std::env::var("FLAME_DUMP_QKV_GRADS").as_deref() == Ok("1")
+            && matches!(step, 1 | 5 | 10 | 25 | 50)
+        {
+            let named = model.named_parameters();
+            log::info!("[QKV-DUMP step={}] -- begin --", step);
+            for (name, param) in &named {
+                let v_norm = if let Some(g) = grads.get(param.id()) {
+                    g.to_dtype(flame_core::DType::F32)
+                        .and_then(|t| t.to_vec())
+                        .map(|v| (v.iter().map(|x| x * x).sum::<f32>()).sqrt())
+                        .unwrap_or(-1.0)
+                } else {
+                    -1.0
+                };
+                log::info!("[QKV-DUMP step={}] {:60} ||grad||={:.6e}", step, name, v_norm);
+            }
+            log::info!("[QKV-DUMP step={}] -- end --", step);
+        }
         let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
 
         // FLAME_MT_SCALE=1 collapses the per-parameter mul_scalar loop into a
@@ -1627,7 +1667,15 @@ fn main() -> anyhow::Result<()> {
                     // uses its OWN run-side RNG so it does not perturb the
                     // training-side seeded sequence (byte invariance).
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(args.seed ^ (step as u64 + 1));
-                    let t_continuous = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    let v_raw_unshifted = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    // Same flow-matching shift as the training loop.
+                    let t_continuous = if (cfg_timestep_shift - 1.0).abs() < 1e-6 {
+                        v_raw_unshifted
+                    } else {
+                        let s = cfg_timestep_shift;
+                        let n = NUM_TRAIN_TIMESTEPS as f32;
+                        n * s * v_raw_unshifted / ((s - 1.0) * v_raw_unshifted + n)
+                    };
                     let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
                     let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
                     let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?

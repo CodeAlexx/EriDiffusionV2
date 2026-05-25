@@ -889,24 +889,29 @@ fn main() -> anyhow::Result<()> {
         let dims = latent.shape().dims();
         // Token count for shift schedule: F * H * W (per sample).
         let n_tokens = dims[2] * dims[3] * dims[4];
-        let mu = ltx2_sampler::shift_for_token_count(n_tokens);
-        let mut t_continuous = Vec::with_capacity(args.batch_size);
+        let shift = ltx2_sampler::shift_for_token_count(n_tokens);
+        // `sigmas` — continuous sigma in [0, 1], used directly for noising.
+        // Musubi passes continuous sigma to both the noising formula and the
+        // model (as sigma*1000). The old code discretized to 1/1000 grid here,
+        // which introduced quantization error not present in musubi.
+        let mut sigmas: Vec<f32> = Vec::with_capacity(args.batch_size);
+        // `t_continuous` — sigma converted to model timestep scale [0, 1000],
+        // after optional bias. Passed as the F32 timestep tensor to the DiT.
+        let mut t_continuous: Vec<f32> = Vec::with_capacity(args.batch_size);
         for _ in 0..args.batch_size {
-            let raw_t = ltx2_sampler::sample_timestep_logit_normal(&mut rng, mu);
+            // Returns continuous sigma in [0, 1] — official Lightricks stretched
+            // logit-normal sampler (serenity::training::noise::sample_shifted_logit_normal).
+            let sigma = ltx2_sampler::sample_timestep_logit_normal(&mut rng, shift);
+            // Scale to timestep space for bias (apply_bias expects [0, NUM_TRAIN_TIMESTEPS]).
+            let raw_t = sigma * NUM_TRAIN_TIMESTEPS as f32;
             // Default-off: Strategy::None returns raw_t unchanged.
             let t =
                 timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
             t_continuous.push(t);
+            // Sigma for noising: convert back from (possibly biased) timestep scale.
+            // Musubi uses continuous sigma directly without discretization.
+            sigmas.push(t / NUM_TRAIN_TIMESTEPS as f32);
         }
-        // Cap-and-floor to integer index for sigma lookup; LTX-2 uses 1000-step
-        // discretization same as ERNIE/Z-Image.
-        let sigmas: Vec<f32> = t_continuous
-            .iter()
-            .map(|&t| {
-                let idx = (t.floor() as usize).min(999);
-                (idx + 1) as f32 / 1000.0
-            })
-            .collect();
 
         // ── Build noisy + target ──
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
@@ -987,13 +992,13 @@ fn main() -> anyhow::Result<()> {
 
         if step == 0 {
             log::info!(
-                "step 0 | latent={:?} text={:?} audio_latent={:?} audio_text={:?} sigma={:.4} mu={:.3} n_tokens={}",
+                "step 0 | latent={:?} text={:?} audio_latent={:?} audio_text={:?} sigma={:.4} shift={:.3} n_tokens={}",
                 dims,
                 txt.shape().dims(),
                 audio_latent.as_ref().map(|t| t.shape().dims().to_vec()),
                 audio_txt.as_ref().map(|t| t.shape().dims().to_vec()),
                 sigmas[0],
-                mu,
+                shift,
                 n_tokens
             );
         }
@@ -1203,15 +1208,14 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     let v_n_tokens = v_dims[2] * v_dims[3] * v_dims[4];
-                    let v_mu = ltx2_sampler::shift_for_token_count(v_n_tokens);
+                    let v_shift = ltx2_sampler::shift_for_token_count(v_n_tokens);
                     // Validation uses its OWN run-side RNG so it does not
                     // perturb the training-side seeded sequence (byte invariance).
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let v_t_continuous =
-                        ltx2_sampler::sample_timestep_logit_normal(&mut vrng, v_mu);
-                    let v_sigma_idx =
-                        (v_t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
-                    let v_sigma = (v_sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+                    // sigma in [0, 1]; timestep for model = sigma * 1000.
+                    let v_sigma =
+                        ltx2_sampler::sample_timestep_logit_normal(&mut vrng, v_shift);
+                    let v_t_continuous = v_sigma * NUM_TRAIN_TIMESTEPS as f32;
                     // Clean noise, no offset / no input perturbation — eval should
                     // measure model fit, not augmented-noise fit.
                     let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?

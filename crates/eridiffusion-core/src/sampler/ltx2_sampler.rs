@@ -1,27 +1,33 @@
 //! LTX-2 rectified-flow Euler sampler with sequence-length-dependent
-//! shift schedule. Mirrors `CustomFlowMatchEulerDiscreteScheduler`
-//! (edv2-reference) and `LTX2Scheduler` (musubi).
+//! shift schedule. Mirrors `LTX2Scheduler` (musubi / official Lightricks trainer).
 //!
 //! ## Math (T2V):
 //! - Forward noising at train time: `noisy = (1 - sigma) * clean + sigma * noise`
-//!   (`sample_timestep_logit_normal` style).
 //! - Velocity target: `noise - clean`.
 //! - At sample time: Euler step `x_next = x + (sigma_next - sigma) * pred`,
 //!   identical to ERNIE/Z-Image schedulers.
 //!
-//! ## Shift schedule
-//! The sigma curve is "shifted" by an LTX-2-specific factor that interpolates
-//! between `base_shift = 0.95` at 1024 tokens and `max_shift = 2.05` at
-//! 4096 tokens. Token count = `F * H * W` (latent units).
-//!
-//! Formula (mu: shift in log-sigma space):
+//! ## Shift schedule (inference)
+//! The sigma curve for inference is "shifted" using the exponential transform:
 //!   `mu = base_shift + (max_shift - base_shift) * (n_tokens - 1024) / (4096 - 1024)`
 //!   `mu = mu.clamp(base_shift, max_shift)`
-//!   then `sigma_shifted = exp(mu) * sigma / (1 + (exp(mu) - 1) * sigma)`
+//!   `sigma_shifted = exp(mu) * sigma / (1 + (exp(mu) - 1) * sigma)`
 //!
-//! The `time_shift_type=exponential` mode in edv2-reference is the same;
-//! `dynamic_shifting=True` means we recompute `mu` per call from the
-//! actual token count.
+//! ## Training timestep sampling: shifted logit-normal (musubi "stretched" mode)
+//! Official Lightricks formula (serenity::training::noise::sample_shifted_logit_normal):
+//!   1. `shift = lininterp(seq_len, base_tokens=1024, max_tokens=4096, base_shift=0.95, max_shift=2.05)`
+//!   2. `z ~ N(shift, std=1.0)`                 // shift used as the normal MEAN
+//!   3. `sigma_raw = sigmoid(z)`
+//!   4. Stretch between percentile bounds:
+//!      `p_hi = sigmoid(shift + 3.0902)`, `p_lo = sigmoid(shift - 2.5758)`
+//!      `stretched = (sigma_raw - p_lo) / (p_hi - p_lo)`
+//!      Reflect: `stretched = 2*eps - stretched` where `stretched < eps`
+//!      Clamp to [0, 1]
+//!   5. Mix 10% uniform from Uniform(eps, 1): `if rand() < 0.1 { uniform } else { stretched }`
+//!
+//! This differs from the old formula which applied an exp(mu) rational transform
+//! AFTER sigmoid(N(0,1)). See serenity/tests/test_ltx2_shifted_logit_normal.py
+//! `TestComparisonWithOldMethod` for a proof that the distributions differ.
 
 use flame_core::{Result, Tensor};
 
@@ -73,14 +79,49 @@ pub fn euler_step(x: &Tensor, pred: &Tensor, sigma: f32, sigma_next: f32) -> Res
     x.add(&pred.mul_scalar(dt)?)
 }
 
-/// Logit-normal timestep sampler used at training (matches musubi's
-/// `shifted_logit_normal` and edv2-reference's flow scheduler training mode).
-/// Returns a continuous timestep in [0, NUM_TRAIN_TIMESTEPS).
-pub fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng, mu: f32) -> f32 {
+/// Logit-normal timestep sampler for training — official Lightricks "stretched" mode.
+///
+/// Matches `serenity::training::noise::sample_shifted_logit_normal` and
+/// musubi's `_sample_shifted_logit_normal_sigmas` in "stretched" mode
+/// (default for LTX-2.3, and confirmed correct for LTX-2.0 as well by
+/// serenity/tests/test_ltx2_shifted_logit_normal.py).
+///
+/// Returns a continuous sigma in [0, 1].
+///
+/// Parameters mirror serenity defaults: std=1.0, eps=1e-3, uniform_prob=0.1.
+pub fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng, shift: f32) -> f32 {
+    use rand::Rng;
     use rand_distr::{Distribution, Normal};
-    let normal = Normal::new(0.0f32, 1.0f32).unwrap();
+
+    const STD: f32 = 1.0;
+    const EPS: f32 = 1e-3;
+    const UNIFORM_PROB: f32 = 0.1;
+
+    // Step 1: sample N(shift, std) → sigmoid → raw logit-normal
+    let normal = Normal::new(shift, STD).unwrap();
     let z = normal.sample(rng);
-    let sigma_raw = 1.0 / (1.0 + (-z).exp());
-    let sigma = apply_shift(sigma_raw, mu);
-    sigma * NUM_TRAIN_TIMESTEPS
+    let sigma_raw = 1.0 / (1.0 + (-z).exp()); // sigmoid(z)
+
+    // Step 2: percentile bounds for stretching
+    let p_hi = 1.0 / (1.0 + (-(shift + 3.0902 * STD)).exp()); // sigmoid(shift + 3.0902*std)
+    let p_lo = 1.0 / (1.0 + (-(shift - 2.5758 * STD)).exp()); // sigmoid(shift - 2.5758*std)
+    let denom = (p_hi - p_lo).max(1e-6);
+
+    // Step 3: stretch to cover [0, 1] more evenly
+    let mut stretched = (sigma_raw - p_lo) / denom;
+    // Reflect values below eps (equivalent to stretched = 2*eps - stretched)
+    if stretched < EPS {
+        stretched = 2.0 * EPS - stretched;
+    }
+    stretched = stretched.clamp(0.0, 1.0);
+
+    // Step 4: 10% uniform mix (prevents collapse at extreme token counts)
+    let selector: f32 = rng.gen();
+    if selector < UNIFORM_PROB {
+        // Uniform(eps, 1.0)
+        let u: f32 = rng.gen();
+        (1.0 - EPS) * u + EPS
+    } else {
+        stretched
+    }
 }

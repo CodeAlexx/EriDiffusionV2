@@ -10,7 +10,9 @@
 //!   - text_mask:      F32  [1, 512]            — 1 at valid token positions, 0 at PADs
 
 use clap::Parser;
-use eridiffusion_core::encoders::{qwen3::Qwen3Encoder, wan21_encoder::Wan21VaeEncoder};
+use eridiffusion_core::encoders::{
+    flux_vae_encoder::LdmVAEEncoder, qwen3::Qwen3Encoder,
+};
 use flame_core::{serialization::save_file, DType, Shape, Tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -77,13 +79,13 @@ fn main() -> anyhow::Result<()> {
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
     let device = flame_core::global_cuda_device();
 
-    log::info!("[1/3] Loading Wan21 VAE encoder (16-ch latents, raw output for Z-Image)...");
-    // Z-Image trainer applies its own scalar shift+scale at predict time
-    // (`(raw - 0.1159) * 0.3611`), so we save **raw** VAE z here. Same
-    // semantics as the previous LdmVAEEncoder path, but on a backend that
-    // can actually load the on-disk Wan-VAE keys (the qwen_image_vae.safetensors
-    // shipped with Z-Image is in wan21 internal-key format, NOT diffusers).
-    let vae = Wan21VaeEncoder::from_safetensors(args.vae_ckpt.to_str().unwrap(), &device)?;
+    log::info!("[1/3] Loading Z-Image diffusers AutoencoderKL encoder (16-ch)...");
+    // Z-Image's actual VAE shipped at `zimage_base/vae/diffusion_pytorch_model.safetensors`
+    // is diffusers-format AutoencoderKL with shift_factor=0.1159, scaling_factor=0.3611.
+    // The trainer applies (raw - 0.1159) * 0.3611 at predict time, so we save **raw**
+    // VAE z here (deterministic mean from `encode()`). This MUST match OT's
+    // `model.scale_latents(batch['latent_image'])` pipeline.
+    let vae = LdmVAEEncoder::from_safetensors(args.vae_ckpt.to_str().unwrap(), 16, &device)?;
 
     log::info!("[2/3] Loading Qwen3 encoder (single-layer extract @26)...");
     let qwen_weights = load_qwen3_weights(&args.qwen3, &device)?;
@@ -191,7 +193,7 @@ fn main() -> anyhow::Result<()> {
         }
         let img_t = Tensor::from_vec(pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone())?
             .to_dtype(DType::BF16)?;
-        let latent = vae.encode_image_raw(&img_t)?;
+        let latent = vae.encode(&img_t)?;
 
         let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
         let prompt = format!(
