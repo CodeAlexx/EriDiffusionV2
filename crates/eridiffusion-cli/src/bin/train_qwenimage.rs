@@ -1029,8 +1029,8 @@ fn main() -> anyhow::Result<()> {
             .to_dtype(DType::BF16)?;
 
         // Flow-matching: x_t = (1 - sigma) * latent + sigma * noise; target = noise - latent.
-        let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        let latent_f32 = latent.to_dtype(DType::F32)?;
+        let noise = noise_modifiers::randn_f32(latent_f32.shape().clone(), device.clone())?;
         // Multi-resolution noise (default-off). When iterations==0 returns
         // noise.clone() with no rng draw — byte-identical to baseline.
         let noise = noise_modifiers::maybe_apply_multires_noise(
@@ -1054,10 +1054,11 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let xt = latent
+        let xt_f32 = latent_f32
             .mul_scalar(1.0 - sigma)?
             .add(&perturbed_noise.mul_scalar(sigma)?)?;
-        let target = clean_noise.sub(&latent)?;
+        let xt = xt_f32.to_dtype(DType::BF16)?;
+        let target = clean_noise.sub(&latent_f32)?;
 
         // Pack [B, 16, H, W] → [B, H/2 * W/2, 64] for forward.
         let xt_packed = qwen_model::pack_latents(&xt)?;

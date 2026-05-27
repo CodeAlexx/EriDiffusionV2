@@ -709,7 +709,8 @@ fn main() -> anyhow::Result<()> {
         // ~7.7× the variance the BFL DiT was trained on).
         let latent_scaled = latent_raw.add_scalar(-SHIFT)?.mul_scalar(SCALE)?;
         let (latent, h_tok, w_tok) = pack_latents(&latent_scaled)?;
-        let latent = latent.to_dtype(DType::BF16)?;
+        let latent_f32 = latent.to_dtype(DType::F32)?;
+        let latent = latent_f32.to_dtype(DType::BF16)?;
         let n_txt = t5.shape().dims()[1];
         let img_ids = build_img_ids(h_tok, w_tok, device.clone())?.to_dtype(DType::BF16)?;
         let txt_ids = build_txt_ids(n_txt, device.clone())?.to_dtype(DType::BF16)?;
@@ -741,8 +742,9 @@ fn main() -> anyhow::Result<()> {
         let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
         let t_int = sigma_idx as f32;
 
-        let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        // Match OneTrainer: keep noising and target construction in F32,
+        // then cast only the transformer input to BF16.
+        let noise = noise_modifiers::randn_f32(latent_f32.shape().clone(), device.clone())?;
         // Pyramid / multi-resolution noise (additive). Default-off when
         // iterations == 0 → byte-identical.
         let noise = noise_modifiers::maybe_apply_multires_noise(
@@ -766,11 +768,12 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let noisy = perturbed_noise
+        let noisy_f32 = perturbed_noise
             .mul_scalar(sigma)?
-            .add(&latent.mul_scalar(1.0 - sigma)?)?;
+            .add(&latent_f32.mul_scalar(1.0 - sigma)?)?;
+        let noisy = noisy_f32.to_dtype(DType::BF16)?;
         // Rectified-flow target: target = noise - clean.
-        let target = clean_noise.sub(&latent)?;
+        let target = clean_noise.sub(&latent_f32)?;
 
         // Audit fix FLUX_VERIFY §H1 / SKEPTIC §H1: pass `t / 1000 ∈ [0, 1)` to
         // the model — `flux.rs::timestep_embedding` then multiplies by 1000

@@ -2109,12 +2109,12 @@ impl TrainableModel for KleinModel {
         if let Some(ref lyc) = self.lyc_adapters {
             // ── LyCORIS save ────────────────────────────────────────────
             // Same (block, slot) order as `named_parameters()`. Per-adapter
-            // suffixes come from `AdapterModule::named_tensors()` (algo-specific).
+            // suffixes come from `AdapterModule::export_tensors()` (algo-specific).
             let mut k = 0;
             for i in 0..self.kconfig.num_double {
                 for slot in 0..DOUBLE_LORA_SLOTS {
                     let prefix = format!("double_blocks.{i}.{}", DOUBLE_LORA_KEYS[slot]);
-                    for (suffix, t) in lyc[k].named_tensors() {
+                    for (suffix, t) in lyc[k].export_tensors() {
                         out.insert(format!("{prefix}.{suffix}"), t);
                     }
                     k += 1;
@@ -2123,14 +2123,14 @@ impl TrainableModel for KleinModel {
             for i in 0..self.kconfig.num_single {
                 for slot in 0..SINGLE_LORA_SLOTS {
                     let prefix = format!("single_blocks.{i}.{}", SINGLE_LORA_KEYS[slot]);
-                    for (suffix, t) in lyc[k].named_tensors() {
+                    for (suffix, t) in lyc[k].export_tensors() {
                         out.insert(format!("{prefix}.{suffix}"), t);
                     }
                     k += 1;
                 }
             }
         } else {
-            // ── Legacy LoRA save (BYTE-IDENTICAL to pre-LyCORIS) ────────
+            // ── Legacy LoRA save with PEFT-style alpha sidecars ─────────
             let mut k = 0;
             for i in 0..self.kconfig.num_double {
                 for slot in 0..DOUBLE_LORA_SLOTS {

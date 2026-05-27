@@ -41,7 +41,7 @@
 //!   math; this trait just exposes the magnitude tensor and the
 //!   `apply_weight_decompose` wrapper.
 
-use flame_core::{parameter::Parameter, Error as FlameError, Result as FlameResult, Tensor};
+use flame_core::{parameter::Parameter, Error as FlameError, Result as FlameResult, Shape, Tensor};
 
 use lycoris_rs::{LycorisAdapter, LycorisModule, StorageDtype};
 
@@ -137,8 +137,10 @@ pub trait AdapterModule: Send + Sync {
     /// "lokr" | "full" | "oft"`.
     fn kind(&self) -> &'static str;
 
-    /// Per-adapter (suffix, tensor) pairs used for save/load. Combined as
-    /// `<prefix>.<adapter_name>.<suffix>`.
+    /// Per-adapter trainable (suffix, tensor) leaf pairs. These names are
+    /// paired with [`to_parameters`](Self::to_parameters) by optimizer-state
+    /// and grad-flow code, so this must stay one-to-one with trainable
+    /// parameters.
     ///
     /// Suffix convention (matches `lycoris-upstream` exactly):
     ///
@@ -152,6 +154,14 @@ pub trait AdapterModule: Send + Sync {
     /// | OFT   | `oft_blocks`                                               |
     /// | DoRA  | `dora_scale` appended to any of the above                  |
     fn named_tensors(&self) -> Vec<(&'static str, Tensor)>;
+
+    /// Per-adapter (suffix, tensor) pairs to serialize. Defaults to the
+    /// trainable leaves from [`named_tensors`](Self::named_tensors), but
+    /// implementations may append non-trainable checkpoint metadata such as
+    /// the plain-LoRA `.alpha` scalar.
+    fn export_tensors(&self) -> Vec<(&'static str, Tensor)> {
+        self.named_tensors()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +213,15 @@ impl AdapterModule for LoRALinear {
             .tensor()
             .expect("LoRALinear: lora_b parameter mutex poisoned");
         vec![("lora_A.weight", a), ("lora_B.weight", b)]
+    }
+
+    fn export_tensors(&self) -> Vec<(&'static str, Tensor)> {
+        let mut out = self.named_tensors();
+        let device = out[0].1.device().clone();
+        let alpha = Tensor::from_vec(vec![self.alpha], Shape::from_dims(&[]), device)
+            .expect("LoRALinear::export_tensors: alpha tensor allocation failed");
+        out.push(("alpha", alpha));
+        out
     }
 }
 

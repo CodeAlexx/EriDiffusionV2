@@ -850,8 +850,10 @@ fn main() -> anyhow::Result<()> {
         let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
         let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
 
-        let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        // OneTrainer keeps noising math and the supervision target in F32;
+        // only the transformer input is cast to the train dtype.
+        let latent_f32 = latent.to_dtype(DType::F32)?;
+        let noise = noise_modifiers::randn_f32(latent_f32.shape().clone(), device.clone())?;
         // Pyramid / multi-resolution noise (additive). Default-off when
         // iterations == 0 → byte-identical.
         let noise = noise_modifiers::maybe_apply_multires_noise(
@@ -873,10 +875,11 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let noisy = perturbed_noise
+        let noisy_f32 = perturbed_noise
             .mul_scalar(sigma)?
-            .add(&latent.mul_scalar(1.0 - sigma)?)?;
-        let target = clean_noise.sub(&latent)?;
+            .add(&latent_f32.mul_scalar(1.0 - sigma)?)?;
+        let noisy = noisy_f32.to_dtype(DType::BF16)?;
+        let target = clean_noise.sub(&latent_f32)?;
         // OT parity: BaseErnieSetup.py:124 passes `timestep=timestep` where
         // `timestep` is the INTEGER from _get_timestep_discrete (ModelSetupNoiseMixin.py:212
         // returns `timestep.int()`). The ERNIE transformer.timestep_embedding (ernie.rs:503)

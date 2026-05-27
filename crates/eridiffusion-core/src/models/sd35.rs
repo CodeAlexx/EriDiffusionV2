@@ -1166,7 +1166,7 @@ impl TrainableModel for SD35Model {
         }
         let mut out: HashMap<String, Tensor> = HashMap::new();
         if let Some(blocks) = self.block_adapters.as_ref() {
-            // Legacy plain-LoRA path — preserved byte-for-byte.
+            // Legacy plain-LoRA path, with PEFT-style alpha sidecars.
             for (i, block) in blocks.iter().enumerate() {
                 for (suffix, lora) in block.iter_with_keys() {
                     let prefix = format!("joint_blocks.{i}.{suffix}");
@@ -1186,12 +1186,12 @@ impl TrainableModel for SD35Model {
                 }
             }
         } else if !self.lycoris_adapters.is_empty() {
-            // LyCORIS path — emit each adapter's `named_tensors()` under the
+            // LyCORIS path — emit each adapter's `export_tensors()` under the
             // same `joint_blocks.{i}.{suffix}.` prefix scheme. No `.alpha`
             // scalar (LyCORIS adapters carry alpha internally).
             for (&(block_idx, target), adapter) in &self.lycoris_adapters {
                 let prefix = format!("joint_blocks.{block_idx}.{}", target.suffix());
-                for (leaf, t) in adapter.named_tensors() {
+                for (leaf, t) in adapter.export_tensors() {
                     out.insert(format!("{prefix}.{leaf}"), t);
                 }
             }

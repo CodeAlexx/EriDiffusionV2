@@ -986,6 +986,7 @@ fn main() -> anyhow::Result<()> {
             Tensor::cat(&latents_raw.iter().collect::<Vec<_>>(), 0)?
         };
         let latent = raw_latent
+            .to_dtype(DType::F32)?
             .add_scalar(-ZIMAGE_VAE_SHIFT)?
             .mul_scalar(ZIMAGE_VAE_SCALE)?;
         let cap_feats = if bs == 1 {
@@ -1060,8 +1061,9 @@ fn main() -> anyhow::Result<()> {
         // = `(999 - sigma_idx) / 1000` — off by exactly 1. Matched to OT source.
         let t_value = (NUM_TRAIN_TIMESTEPS as f32 - sigma_idx as f32) / NUM_TRAIN_TIMESTEPS as f32;
 
-        let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        // Match OneTrainer: keep the sampled noise, noisy latent, and target
+        // in F32; cast only the model input to BF16.
+        let noise = noise_modifiers::randn_f32(latent.shape().clone(), device.clone())?;
         // Pyramid / multi-resolution noise (additive). Default-off when
         // iterations == 0 → byte-identical.
         let noise = noise_modifiers::maybe_apply_multires_noise(
@@ -1087,9 +1089,10 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let noisy = perturbed_noise
+        let noisy_f32 = perturbed_noise
             .mul_scalar(sigma)?
             .add(&latent.mul_scalar(1.0 - sigma)?)?;
+        let noisy = noisy_f32.to_dtype(DType::BF16)?;
         // Rectified-flow target: pred ≈ -velocity where velocity = noise - clean.
         // Caller of model.forward in the sampler does `pred * -1`, so the trained
         // pred is `clean - noise`. Train against that.
@@ -1103,7 +1106,7 @@ fn main() -> anyhow::Result<()> {
         // cap_mask) with values dumped by OT's BaseZImageSetup.predict so
         // both trainers see literally the same input. After backward we
         // dump per-LoRA grads and exit.
-        let (latent, noise, noisy, target, timestep, cap_feats, cap_mask) =
+        let (latent, _noise, noisy, target, timestep, cap_feats, cap_mask) =
             if step == 0 && args.replay_from.is_some() {
                 let path = args.replay_from.as_ref().unwrap().clone();
                 log::info!("[replay] loading OT step-1 inputs from {}", path.display());
@@ -1116,10 +1119,10 @@ fn main() -> anyhow::Result<()> {
                 // text_encoder_output_{i} (variable-length per sample).
                 let scaled_latent = ot.get("scaled_latent_image")
                     .ok_or_else(|| anyhow::anyhow!("replay: missing scaled_latent_image"))?
-                    .to_dtype(DType::BF16)?;
+                    .to_dtype(DType::F32)?;
                 let ot_noise = ot.get("latent_noise")
                     .ok_or_else(|| anyhow::anyhow!("replay: missing latent_noise"))?
-                    .to_dtype(DType::BF16)?;
+                    .to_dtype(DType::F32)?;
                 let ot_noisy = ot.get("scaled_noisy_latent_image")
                     .ok_or_else(|| anyhow::anyhow!("replay: missing scaled_noisy_latent_image"))?
                     .to_dtype(DType::BF16)?;
@@ -1130,8 +1133,7 @@ fn main() -> anyhow::Result<()> {
                 let ot_target = ot.get("flow_target")
                     .ok_or_else(|| anyhow::anyhow!("replay: missing flow_target"))?
                     .to_dtype(DType::F32)?
-                    .mul_scalar(-1.0)?
-                    .to_dtype(DType::BF16)?;
+                    .mul_scalar(-1.0)?;
                 let ot_ts = ot.get("timestep")
                     .ok_or_else(|| anyhow::anyhow!("replay: missing timestep"))?
                     .to_dtype(DType::F32)?;

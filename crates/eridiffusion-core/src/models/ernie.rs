@@ -1069,7 +1069,7 @@ impl TrainableModel for ErnieModel {
                     let layer_idx = i / 7;
                     let slot = i % 7;
                     let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
-                    for (leaf, t) in adapter.named_tensors() {
+                    for (leaf, t) in adapter.export_tensors() {
                         out.insert(format!("{prefix}.{leaf}"), t);
                     }
                 }

@@ -1666,7 +1666,7 @@ impl TrainableModel for FluxModel {
             // `AdapterModule::named_tensors`.
             for (i, adapter) in lb.store.adapters.iter().enumerate() {
                 let prefix = &lb.store.names[i];
-                for (suffix, t) in adapter.named_tensors() {
+                for (suffix, t) in adapter.export_tensors() {
                     tensors.insert(format!("{prefix}.{suffix}"), t);
                 }
                 emit_alpha(prefix, lb.config.alpha, &mut tensors)?;

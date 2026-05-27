@@ -358,7 +358,7 @@ impl AnimaLoraBundle {
                 "diffusion_model.blocks.{block_idx}.{}",
                 LORA_SLOT_KEYS[slot]
             );
-            for (leaf, t) in adapter.named_tensors() {
+            for (leaf, t) in adapter.export_tensors() {
                 tensors.insert(format!("{prefix}.{leaf}"), t);
             }
         }

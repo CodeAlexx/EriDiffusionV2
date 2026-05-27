@@ -502,14 +502,14 @@ impl ChromaLoraBundle {
         for (&(block_idx, target), adapter) in &self.double_adapters {
             let suffix = double_lora_suffix(target);
             let prefix = format!("transformer_blocks.{block_idx}.{suffix}");
-            for (leaf, t) in adapter.named_tensors() {
+            for (leaf, t) in adapter.export_tensors() {
                 tensors.insert(format!("{prefix}.{leaf}"), t);
             }
         }
         for (&(block_idx, target), adapter) in &self.single_adapters {
             let suffix = single_lora_suffix(target);
             let prefix = format!("single_transformer_blocks.{block_idx}.{suffix}");
-            for (leaf, t) in adapter.named_tensors() {
+            for (leaf, t) in adapter.export_tensors() {
                 tensors.insert(format!("{prefix}.{leaf}"), t);
             }
         }

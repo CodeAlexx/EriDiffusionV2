@@ -913,7 +913,7 @@ impl TrainableModel for SDXLModel {
         // practice exactly one is non-empty per run).
         for (i, prefix) in self.lora_target_prefixes.iter().enumerate() {
             if let Some(lyc) = self.lycoris_adapters.get(prefix) {
-                for (leaf, t) in lyc.named_tensors() {
+                for (leaf, t) in lyc.export_tensors() {
                     out.insert(format!("{prefix}.{leaf}"), t);
                 }
                 // SDXL audit H6: companion `.alpha` scalar applies to

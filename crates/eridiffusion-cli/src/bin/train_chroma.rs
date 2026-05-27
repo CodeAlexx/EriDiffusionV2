@@ -948,8 +948,8 @@ fn main() -> anyhow::Result<()> {
 
         // Clean noise + multires + offset + perturbation. All default-off
         // are byte-invariant.
-        let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        let latent_f32 = latent.to_dtype(DType::F32)?;
+        let noise = noise_modifiers::randn_f32(latent_f32.shape().clone(), device.clone())?;
         let noise = noise_modifiers::maybe_apply_multires_noise(
             &noise,
             args.multires_noise_iterations,
@@ -969,11 +969,12 @@ fn main() -> anyhow::Result<()> {
         )?;
 
         // x_t = (1 - sigma) * latent + sigma * noise (FLUX flow-matching).
-        let noisy = latent
+        let noisy_f32 = latent_f32
             .mul_scalar(1.0 - sigma)?
             .add(&perturbed_noise.mul_scalar(sigma)?)?;
+        let noisy = noisy_f32.to_dtype(DType::BF16)?;
         // Rectified-flow target: noise - clean (matches archive `pipeline.rs`).
-        let target = clean_noise.sub(&latent)?;
+        let target = clean_noise.sub(&latent_f32)?;
 
         // Chroma's forward expects sigma directly as the timestep input
         // (not `sigma * 1000`). Matches `pipeline.rs::prepare_inputs` and

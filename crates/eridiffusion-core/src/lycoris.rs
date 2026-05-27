@@ -1753,7 +1753,7 @@ impl AdapterStore {
     }
 
     /// Save adapter tensors as PEFT-style safetensors. Iterates each
-    /// adapter's [`AdapterModule::named_tensors`] with `<prefix>.<name>.<suffix>`
+    /// adapter's [`AdapterModule::export_tensors`] with `<prefix>.<name>.<suffix>`
     /// keys.
     pub fn save_safetensors(&self, prefix: &str, path: &Path) -> anyhow::Result<()> {
         let mut out: HashMap<String, Tensor> = HashMap::new();
@@ -1761,7 +1761,7 @@ impl AdapterStore {
         for (i, adapter) in self.adapters.iter().enumerate() {
             let name = &self.names[i];
             let full = qualify(prefix, name);
-            for (suffix, tensor) in adapter.named_tensors() {
+            for (suffix, tensor) in adapter.export_tensors() {
                 out.insert(format!("{full}.{suffix}"), tensor);
             }
         }

@@ -732,8 +732,8 @@ fn main() -> anyhow::Result<()> {
         let encoder_hs = apply_cfg_dropout(&encoder_hs, &null_emb, args.cfg_ratio, &mut rng)?;
 
         // Flow-matching: x1 = noise, x0 = clean target, t = sigmoid(z * sigma + mu).
-        let x1 = Tensor::randn(target_latents.shape().clone(), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        let x0 = target_latents.to_dtype(DType::F32)?;
+        let x1 = noise_modifiers::randn_f32(x0.shape().clone(), device.clone())?;
         // Pyramid / multi-resolution noise (additive). NOTE: ACE-Step trains
         // on non-4D audio latents `[B, C, T]`; the helper short-circuits to
         // a no-op for non-4D inputs, so this is a documented no-op here. We
@@ -759,7 +759,6 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let x0 = target_latents;
         let t_val = {
             let raw_t = if let Some(ref tcfg) = unified_timestep_cfg {
                 tcfg.sample_one(&mut rng)
@@ -780,9 +779,10 @@ fn main() -> anyhow::Result<()> {
             .to_dtype(DType::BF16)?;
 
         // x_t = t * x1 + (1 - t) * x0  (use perturbed for model input)
-        let xt = x1_perturbed
+        let xt_f32 = x1_perturbed
             .mul_scalar(t_val)?
             .add(&x0.mul_scalar(1.0 - t_val)?)?;
+        let xt = xt_f32.to_dtype(DType::BF16)?;
 
         // Forward + flow-matching loss.
         AutogradContext::clear();

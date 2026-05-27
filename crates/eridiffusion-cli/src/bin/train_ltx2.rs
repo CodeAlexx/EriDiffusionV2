@@ -914,8 +914,8 @@ fn main() -> anyhow::Result<()> {
         }
 
         // ── Build noisy + target ──
-        let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        let latent_f32 = latent.to_dtype(DType::F32)?;
+        let noise = noise_modifiers::randn_f32(latent_f32.shape().clone(), device.clone())?;
         // Phase 1: noise modifiers (default-off). Offset noise is part of the
         // clean noise distribution; input perturbation feeds model input only.
         let clean_noise = noise_modifiers::maybe_apply_offset_noise(
@@ -934,10 +934,11 @@ fn main() -> anyhow::Result<()> {
         // a scalar; for >1 we expand a [B,1,1,1,1] tensor.
         let (noisy, target) = if args.batch_size == 1 {
             let s = sigmas[0];
-            let noisy = perturbed_noise
+            let noisy_f32 = perturbed_noise
                 .mul_scalar(s)?
-                .add(&latent.mul_scalar(1.0 - s)?)?;
-            let target = clean_noise.sub(&latent)?;
+                .add(&latent_f32.mul_scalar(1.0 - s)?)?;
+            let noisy = noisy_f32.to_dtype(DType::BF16)?;
+            let target = clean_noise.sub(&latent_f32)?;
             (noisy, target)
         } else {
             // Build [B, 1, 1, 1, 1] sigma tensor.
@@ -945,38 +946,39 @@ fn main() -> anyhow::Result<()> {
                 sigmas.clone(),
                 Shape::from_dims(&[args.batch_size, 1, 1, 1, 1]),
                 device.clone(),
-            )?
-            .to_dtype(DType::BF16)?;
+            )?;
             let one_minus_s = s_tensor.mul_scalar(-1.0)?.add_scalar(1.0)?;
-            let noisy = perturbed_noise
+            let noisy_f32 = perturbed_noise
                 .mul(&s_tensor)?
-                .add(&latent.mul(&one_minus_s)?)?;
-            let target = clean_noise.sub(&latent)?;
+                .add(&latent_f32.mul(&one_minus_s)?)?;
+            let noisy = noisy_f32.to_dtype(DType::BF16)?;
+            let target = clean_noise.sub(&latent_f32)?;
             (noisy, target)
         };
         let audio_noisy_target: Option<(Tensor, Tensor)> = if let Some(audio_latent_ref) = audio_latent.as_ref() {
+            let audio_latent_f32 = audio_latent_ref.to_dtype(DType::F32)?;
             let audio_noise =
-                Tensor::randn(audio_latent_ref.shape().clone(), 0.0, 1.0, device.clone())?
-                    .to_dtype(DType::BF16)?;
+                noise_modifiers::randn_f32(audio_latent_f32.shape().clone(), device.clone())?;
             if args.batch_size == 1 {
                 let s = sigmas[0];
-                let noisy_audio = audio_noise
+                let noisy_audio_f32 = audio_noise
                     .mul_scalar(s)?
-                    .add(&audio_latent_ref.mul_scalar(1.0 - s)?)?;
-                let audio_target = audio_noise.sub(audio_latent_ref)?;
+                    .add(&audio_latent_f32.mul_scalar(1.0 - s)?)?;
+                let noisy_audio = noisy_audio_f32.to_dtype(DType::BF16)?;
+                let audio_target = audio_noise.sub(&audio_latent_f32)?;
                 Some((noisy_audio, audio_target))
             } else {
                 let s_tensor = Tensor::from_vec(
                     sigmas.clone(),
                     Shape::from_dims(&[args.batch_size, 1, 1, 1]),
                     device.clone(),
-                )?
-                .to_dtype(DType::BF16)?;
+                )?;
                 let one_minus_s = s_tensor.mul_scalar(-1.0)?.add_scalar(1.0)?;
-                let noisy_audio = audio_noise
+                let noisy_audio_f32 = audio_noise
                     .mul(&s_tensor)?
-                    .add(&audio_latent_ref.mul(&one_minus_s)?)?;
-                let audio_target = audio_noise.sub(audio_latent_ref)?;
+                    .add(&audio_latent_f32.mul(&one_minus_s)?)?;
+                let noisy_audio = noisy_audio_f32.to_dtype(DType::BF16)?;
+                let audio_target = audio_noise.sub(&audio_latent_f32)?;
                 Some((noisy_audio, audio_target))
             }
         } else {

@@ -304,7 +304,7 @@ impl QwenImageLoraBundle {
                 "transformer_blocks.{block_idx}.{}",
                 Self::target_suffix(target),
             );
-            for (leaf, t) in adapter.named_tensors() {
+            for (leaf, t) in adapter.export_tensors() {
                 tensors.insert(format!("{prefix}.{leaf}"), t);
             }
         }

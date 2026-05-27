@@ -24,9 +24,24 @@
 //!     input perturbation paths.
 
 use flame_core::upsampling::{Upsample2d, Upsample2dConfig, UpsampleMode};
-use flame_core::{Result, Shape, Tensor};
+use flame_core::{CudaDevice, Result, Shape, Tensor};
 use rand::rngs::StdRng;
 use rand::Rng;
+use std::sync::Arc;
+
+/// Sample standard normal noise as F32 regardless of flame-core's global
+/// default dtype. Training sets the global default to BF16 for model tensors,
+/// but the flow target must be constructed from F32 noise to match OT.
+pub fn randn_f32(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
+    let data = flame_core::rng::sample_normal(shape.elem_count(), 0.0, 1.0)?;
+    Tensor::from_vec(data, shape, device)
+}
+
+/// Seeded variant of [`randn_f32`].
+pub fn randn_f32_seeded(shape: Shape, seed: u64, device: Arc<CudaDevice>) -> Result<Tensor> {
+    let data = flame_core::rng::sample_normal_seeded(shape.elem_count(), 0.0, 1.0, seed);
+    Tensor::from_vec(data, shape, device)
+}
 
 /// Apply offset noise: `noise + weight * per_channel_offset` with probability
 /// `prob`.
@@ -56,8 +71,7 @@ pub fn maybe_apply_offset_noise(
         2 => Shape::from_dims(&[dims[0], dims[1]]),
         _ => return Ok(noise.clone()),
     };
-    let offset =
-        Tensor::randn(per_channel_shape, 0.0, 1.0, noise.device().clone())?.mul_scalar(weight)?;
+    let offset = randn_f32(per_channel_shape, noise.device().clone())?.mul_scalar(weight)?;
     let offset = offset.to_dtype(noise.dtype())?;
     let broadcast = offset.broadcast_to(noise.shape())?;
     noise.add(&broadcast)
@@ -74,7 +88,7 @@ pub fn maybe_apply_input_perturbation(
     if gamma <= 0.0 {
         return Ok(noise.clone());
     }
-    let perturbation = Tensor::randn(noise.shape().clone(), 0.0, 1.0, noise.device().clone())?
+    let perturbation = randn_f32(noise.shape().clone(), noise.device().clone())?
         .mul_scalar(gamma)?
         .to_dtype(noise.dtype())?;
     noise.add(&perturbation)
@@ -124,12 +138,7 @@ pub fn maybe_apply_multires_noise(
         let scale = 1usize << k;
         let h_k = (h / scale).max(1);
         let w_k = (w / scale).max(1);
-        let scaled = Tensor::randn(
-            Shape::from_dims(&[b, c, h_k, w_k]),
-            0.0,
-            1.0,
-            noise.device().clone(),
-        )?;
+        let scaled = randn_f32(Shape::from_dims(&[b, c, h_k, w_k]), noise.device().clone())?;
         let scaled = scaled.to_dtype(noise.dtype())?;
         let upsampled = upsampler.forward(&scaled)?;
         let weighted = upsampled.mul_scalar(discount.powi(k as i32))?;

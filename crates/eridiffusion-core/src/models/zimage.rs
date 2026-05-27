@@ -413,10 +413,11 @@ impl ZImageLoraBundle {
 
     /// Save in edv2-reference's PEFT-style format:
     ///   `diffusion_model.layers.{i}.{module}.lora_{A,B}.weight`
+    /// plus `diffusion_model.layers.{i}.{module}.alpha`.
     /// Verified against `edv2-reference/output/zimage/zimage.safetensors` — same
-    /// prefix, same dotted path, same suffix, no `.alpha`. Per-module alpha
-    /// is implicitly `alpha=rank` → `scale=1.0` (matches `LoraStack::load`'s
-    /// fallback in `inference-flame/src/lora.rs:255`).
+    /// prefix, same dotted path, same suffix. The `.alpha` sidecar is required
+    /// when training uses `alpha != rank`; otherwise loaders that fall back to
+    /// `scale=1.0` over-apply the adapter.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut tensors = HashMap::new();
         // Legacy plain-LoRA path (used when --algo lora). Empty when a
@@ -427,18 +428,25 @@ impl ZImageLoraBundle {
             // edv2-reference uses `.lora_A.weight` / `.lora_B.weight`.
             let lora_a = lora.lora_a().tensor()?;
             let lora_b = lora.lora_b().tensor()?;
+            let alpha = Tensor::from_vec(
+                vec![lora.alpha],
+                Shape::from_dims(&[]),
+                lora_a.device().clone(),
+            )?
+            .to_dtype(DType::BF16)?;
             tensors.insert(format!("{prefix}.lora_A.weight"), lora_a);
             tensors.insert(format!("{prefix}.lora_B.weight"), lora_b);
+            tensors.insert(format!("{prefix}.alpha"), alpha);
         }
         // LyCORIS path — must save when --algo lokr/loha/locon/... is active,
         // otherwise the ckpt is just an empty `{}` safetensors file (10 bytes).
-        // Each adapter contributes its own per-leaf tensors via
-        // `named_tensors()`: LoKr → (lokr_w1, lokr_w2 or lokr_w2_a/b),
+        // Each adapter contributes its own serialized tensors via
+        // `export_tensors()`: LoKr → (lokr_w1, lokr_w2 or lokr_w2_a/b),
         // LoCon → (lora_down/up), LoHa → (hada_*), etc.
         for (&(block_idx, target), adapter) in &self.lycoris_adapters {
             let suffix = Self::peft_suffix(target);
             let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
-            for (leaf, t) in adapter.named_tensors() {
+            for (leaf, t) in adapter.export_tensors() {
                 tensors.insert(format!("{prefix}.{leaf}"), t);
             }
         }

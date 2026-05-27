@@ -552,14 +552,11 @@ impl Wan22LoraBundle {
         let mut out: HashMap<String, Tensor> = HashMap::new();
         for ((idx, target), lora) in &self.adapters {
             let prefix = self.key_prefix(*idx, *target);
-            let a = lora.lora_a().tensor()?;
-            let b = lora.lora_b().tensor()?;
-            out.insert(format!("{prefix}.lora_A.weight"), a);
-            out.insert(format!("{prefix}.lora_B.weight"), b);
+            lora.save_tensors(&prefix, &mut out)?;
         }
         for ((idx, target), adapter) in &self.lycoris_adapters {
             let prefix = self.key_prefix(*idx, *target);
-            for (leaf, t) in adapter.named_tensors() {
+            for (leaf, t) in adapter.export_tensors() {
                 out.insert(format!("{prefix}.{leaf}"), t);
             }
         }

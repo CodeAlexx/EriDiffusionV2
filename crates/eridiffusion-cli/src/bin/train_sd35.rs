@@ -1329,8 +1329,8 @@ fn main() -> anyhow::Result<()> {
             t_model_per_b.push(sigma_idx as f32);
         }
 
-        let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?;
+        let latent_f32 = latent.to_dtype(DType::F32)?;
+        let noise = noise_modifiers::randn_f32(latent_f32.shape().clone(), device.clone())?;
         // Pyramid / multi-resolution noise (additive). Default-off when
         // iterations == 0 → byte-identical.
         let noise = noise_modifiers::maybe_apply_multires_noise(
@@ -1352,21 +1352,22 @@ fn main() -> anyhow::Result<()> {
             args.gamma_input_perturbation,
             &mut rng,
         )?;
-        let noisy = if bs == 1 {
+        let noisy_f32 = if bs == 1 {
             perturbed_noise
                 .mul_scalar(sigma_per_b[0])?
-                .add(&latent.mul_scalar(1.0 - sigma_per_b[0])?)?
+                .add(&latent_f32.mul_scalar(1.0 - sigma_per_b[0])?)?
         } else {
             let mut pieces = Vec::with_capacity(bs);
             for b in 0..bs {
                 let n_b = perturbed_noise.narrow(0, b, 1)?;
-                let l_b = latent.narrow(0, b, 1)?;
+                let l_b = latent_f32.narrow(0, b, 1)?;
                 let s = sigma_per_b[b];
                 pieces.push(n_b.mul_scalar(s)?.add(&l_b.mul_scalar(1.0 - s)?)?);
             }
             Tensor::cat(&pieces.iter().collect::<Vec<_>>(), 0)?
         };
-        let target = clean_noise.sub(&latent)?;
+        let noisy = noisy_f32.to_dtype(DType::BF16)?;
+        let target = clean_noise.sub(&latent_f32)?;
         // Keep timestep in F32. BF16 has 8-bit mantissa → loses 1-LSB precision
         // for integer values >256, which is most of the [0, 999] range. Train
         // ↔ inference timestep embedding parity breaks otherwise. The model's

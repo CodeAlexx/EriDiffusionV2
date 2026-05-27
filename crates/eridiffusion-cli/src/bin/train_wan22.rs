@@ -56,7 +56,8 @@ use eridiffusion_core::sampler::wan22_sampler::{
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::{
-    ema_advanced::EmaConfig, loss_weight, lr_schedule, timestep_bias, validation::ValidationLoop,
+    ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+    validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::timestep_dist::{
     TimestepConfig, TimestepDistribution,
@@ -1011,17 +1012,20 @@ fn main() -> anyhow::Result<()> {
         // (Tensor::randn uses a global RNG that is never seeded; switching
         // to randn_seeded with a derived per-step seed makes the run
         // bit-identical across re-launches.)
+        let latent_f32 = latent.to_dtype(DType::F32)?;
         let noise_seed = SEED.wrapping_add((step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let noise =
-            Tensor::randn_seeded(latent.shape().clone(), 0.0, 1.0, noise_seed, device.clone())?
-                .to_dtype(DType::BF16)?;
+        let noise = noise_modifiers::randn_f32_seeded(
+            latent_f32.shape().clone(),
+            noise_seed,
+            device.clone(),
+        )?;
         let (noisy, target) = if args.batch_size == 1 {
             let t = t_continuous[0];
-            let noisy_5d = noise.mul_scalar(t)?.add(&latent.mul_scalar(1.0 - t)?)?;
-            let target_5d = noise.sub(&latent)?;
+            let noisy_5d = noise.mul_scalar(t)?.add(&latent_f32.mul_scalar(1.0 - t)?)?;
+            let target_5d = noise.sub(&latent_f32)?;
             // Squeeze leading B dim → [C, F, H, W] for the forward and the
             // 4D pred output.
-            let noisy = noisy_5d.squeeze(Some(0))?;
+            let noisy = noisy_5d.squeeze(Some(0))?.to_dtype(DType::BF16)?;
             let target = target_5d.squeeze(Some(0))?;
             (noisy, target)
         } else {
@@ -1029,11 +1033,11 @@ fn main() -> anyhow::Result<()> {
                 t_continuous.clone(),
                 Shape::from_dims(&[args.batch_size, 1, 1, 1, 1]),
                 device.clone(),
-            )?
-            .to_dtype(DType::BF16)?;
+            )?;
             let one_minus_t = t_tensor.mul_scalar(-1.0)?.add_scalar(1.0)?;
-            let noisy = noise.mul(&t_tensor)?.add(&latent.mul(&one_minus_t)?)?;
-            let target = noise.sub(&latent)?;
+            let noisy_f32 = noise.mul(&t_tensor)?.add(&latent_f32.mul(&one_minus_t)?)?;
+            let noisy = noisy_f32.to_dtype(DType::BF16)?;
+            let target = noise.sub(&latent_f32)?;
             (noisy, target)
         };
 

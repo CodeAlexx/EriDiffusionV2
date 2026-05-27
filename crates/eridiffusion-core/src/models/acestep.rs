@@ -547,7 +547,7 @@ impl AceStepLoRAModel {
     }
 
     /// Save LoRA weights as safetensors.
-    /// When a LyCORIS bundle is installed, the per-adapter `named_tensors`
+    /// When a LyCORIS bundle is installed, the per-adapter `export_tensors`
     /// entries are serialized under `decoder.layers.{i}.{suffix}.<leaf>`
     /// (matching the canonical lycoris-rs leaf names).  Otherwise the
     /// legacy plain-LoRA `lora_A.weight`/`lora_B.weight` keys are used.
@@ -556,7 +556,7 @@ impl AceStepLoRAModel {
         if !self.lycoris_adapters.is_empty() {
             for ((layer_idx, target), adapter) in &self.lycoris_adapters {
                 let prefix = format!("decoder.layers.{}.{}", layer_idx, target.suffix());
-                for (leaf, t) in adapter.named_tensors() {
+                for (leaf, t) in adapter.export_tensors() {
                     tensors.insert(format!("{prefix}.{leaf}"), t);
                 }
             }

@@ -5,6 +5,7 @@
 //! - Forward path casts to BF16 for compute, uses autograd-aware path.
 //! - Kaiming uniform init on A, zero init on B.
 //! - Supports save/load with standard lora_A / lora_B key naming.
+//! - Saves a per-module `.alpha` scalar so external loaders preserve scale.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -120,13 +121,21 @@ impl LoRALinear {
     }
 
     /// Save in diffusers / PEFT / edv2-reference convention:
-    ///   `<prefix>.lora_A.weight` and `<prefix>.lora_B.weight`
-    /// — the `.weight` suffix is what the broader ecosystem expects (HF PEFT,
-    /// diffusers `load_lora_weights`, edv2-reference, etc.). Without it, every
-    /// inference-side loader has to special-case "bare suffix" trainers.
+    ///   `<prefix>.lora_A.weight`, `<prefix>.lora_B.weight`, and
+    ///   `<prefix>.alpha`.
+    ///
+    /// The `.weight` suffix is what the broader ecosystem expects (HF PEFT,
+    /// diffusers `load_lora_weights`, edv2-reference, etc.). The `.alpha`
+    /// scalar prevents loaders from falling back to `scale = 1.0`, which would
+    /// over-apply adapters trained with `alpha < rank`.
     pub fn save_tensors(&self, prefix: &str, out: &mut HashMap<String, Tensor>) -> Result<()> {
-        out.insert(format!("{prefix}.lora_A.weight"), self.lora_a.tensor()?);
-        out.insert(format!("{prefix}.lora_B.weight"), self.lora_b.tensor()?);
+        let a = self.lora_a.tensor()?;
+        let b = self.lora_b.tensor()?;
+        let device = a.device().clone();
+        let alpha = Tensor::from_vec(vec![self.alpha], Shape::from_dims(&[]), device)?;
+        out.insert(format!("{prefix}.lora_A.weight"), a);
+        out.insert(format!("{prefix}.lora_B.weight"), b);
+        out.insert(format!("{prefix}.alpha"), alpha);
         Ok(())
     }
 
