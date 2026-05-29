@@ -178,6 +178,55 @@ fn main() -> anyhow::Result<()> {
     adj_single("  narrow.permute.reshape", false)?;
     adj_single("  narrow.CONTIGUOUS.permute.reshape", true)?;
 
+    // ---- PIN THE EXACT OP: isolate each op applied to the offset (mid-narrowed) view ----
+    // adj_op(name, f): adjoint of f on a fresh mid-narrowed (offset) view.
+    let adj_op = |label: &str, f: &dyn Fn(&Tensor) -> anyhow::Result<Tensor>| -> anyhow::Result<()> {
+        AutogradContext::clear();
+        AutogradContext::set_enabled(true);
+        let x = randn(&[b, h, n, d], &dev)?.requires_grad_(true);
+        let narrowed = x.narrow(2, n_txt, n_img)?; // OFFSET along mid dim
+        let y = f(&narrowed)?;
+        let g = randn(y.shape().dims(), &dev)?;
+        let loss = y.to_dtype(DType::F32)?.mul(&g.to_dtype(DType::F32)?)?.sum()?;
+        let lhs = loss.to_vec()?[0] as f64;
+        let grads = loss.backward()?;
+        let gx = grads.get(x.id()).ok_or_else(|| anyhow::anyhow!("no grad"))?.clone();
+        report(label, lhs, dot_f32(&x, &gx)?);
+        Ok(())
+    };
+    println!("isolation (single op on the OFFSET mid-narrowed view):");
+    adj_op("  narrow -> contiguous", &|t| Ok(t.contiguous()?))?;
+    adj_op("  narrow -> permute (views only)", &|t| Ok(t.permute(&[0, 2, 1, 3])?))?;
+    adj_op("  narrow -> permute -> contiguous", &|t| Ok(t.permute(&[0, 2, 1, 3])?.contiguous()?))?;
+
+    // ---- COMPOSED joint-attention linear skeleton (the REAL double-block backward chain):
+    //      qkv_split_permute -> cat([txt,img], dim=2) -> [sdpa as IDENTITY] -> attn_split.
+    //      Each piece passes adjoint alone; this tests whether the CHAIN does. The backward
+    //      here is: attn_split^T -> cat^T (mid-dim narrow into txt/img) -> qkv_split_permute^T. ----
+    {
+        AutogradContext::clear();
+        AutogradContext::set_enabled(true);
+        let img_qkv = randn(&[b, n_img, 3 * inner], &dev)?.requires_grad_(true);
+        let txt_qkv = randn(&[b, n_txt, 3 * inner], &dev)?.requires_grad_(true);
+        let (img_q, _ik, _iv) = flame_core::bf16_ops::qkv_split_permute_bf16(&img_qkv, h, d)?;
+        let (txt_q, _tk, _tv) = flame_core::bf16_ops::qkv_split_permute_bf16(&txt_qkv, h, d)?;
+        let q = Tensor::cat(&[&txt_q, &img_q], 2)?; // [b,h,n,d], cat of permuted views (txt first)
+        let attn_out = q; // sdpa replaced by identity to keep it linear
+        let (txt_out, img_out) =
+            flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_txt, n_img)?;
+        let gt = randn(txt_out.shape().dims(), &dev)?;
+        let gi = randn(img_out.shape().dims(), &dev)?;
+        let loss = txt_out.to_dtype(DType::F32)?.mul(&gt.to_dtype(DType::F32)?)?.sum()?
+            .add(&img_out.to_dtype(DType::F32)?.mul(&gi.to_dtype(DType::F32)?)?.sum()?)?;
+        let lhs = loss.to_vec()?[0] as f64;
+        let grads = loss.backward()?;
+        let gimg = grads.get(img_qkv.id()).ok_or_else(|| anyhow::anyhow!("no g img_qkv"))?.clone();
+        let gtxt = grads.get(txt_qkv.id()).ok_or_else(|| anyhow::anyhow!("no g txt_qkv"))?.clone();
+        let rhs = dot_f32(&img_qkv, &gimg)? + dot_f32(&txt_qkv, &gtxt)?;
+        println!("COMPOSED joint-attn skeleton (qkv_split->cat(dim2)->identity->attn_split):");
+        report("  qkv->cat->attn_split", lhs, rhs);
+    }
+
     // permute([0,2,1,3]) alone on a fresh contiguous tensor
     {
         AutogradContext::clear();

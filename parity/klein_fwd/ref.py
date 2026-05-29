@@ -62,9 +62,13 @@ hidden = pack(x_t)
 # --- img_ids: cartesian (t,h,w,l) 4-dim ---
 t_ax = torch.arange(1); h_ax = torch.arange(H); w_ax = torch.arange(W); l_ax = torch.arange(1)
 img_ids = torch.cartesian_prod(t_ax, h_ax, w_ax, l_ax).to(dev).unsqueeze(0).expand(B, -1, -1).float()
-# txt_ids: zeros [B, n_txt, 4]
+# txt_ids: per diffusers Flux2Pipeline._prepare_text_ids → row k = [0,0,0,k]
+# (cartesian_prod(arange(1),arange(1),arange(1),arange(L))). The L-axis (col 3)
+# receives axes_dims[3]=32 rotary freqs so each text token gets a distinct RoPE
+# phase. (Previously zeros — a TEST BUG that desynced text RoPE vs our trainer.)
 n_txt = txt.shape[1]
 txt_ids = torch.zeros(B, n_txt, 4, device=dev).float()
+txt_ids[:, :, 3] = torch.arange(n_txt, device=dev).float()
 
 timestep = torch.tensor([sigma], device=dev, dtype=dt).expand(B)
 guidance = torch.full([B], 4.0, device=dev, dtype=torch.float32)
@@ -151,6 +155,48 @@ if SB_IDX < len(tf.single_transformer_blocks):
     hooks.append(sb.norm.register_full_backward_hook(sb_norm_b))
     hooks.append(sb.norm.register_forward_hook(sb_norm_f))
 
+# --- BLOCK-0 PER-OP localization: monkeypatch block[0].forward to capture the
+# img-stream activation after each sub-op (matches our klein.rs b0_* probes). ---
+import types
+from diffusers.models.transformers.transformer_flux2 import Flux2Modulation
+b0 = {}
+_blk0 = tf.transformer_blocks[0]
+def _instr_forward(self, hidden_states, encoder_hidden_states, temb_mod_img, temb_mod_txt,
+                   image_rotary_emb=None, joint_attention_kwargs=None):
+    joint_attention_kwargs = joint_attention_kwargs or {}
+    (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = Flux2Modulation.split(temb_mod_img, 2)
+    (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = Flux2Modulation.split(temb_mod_txt, 2)
+    b0["b0_in_img"] = hidden_states.detach().float().contiguous().cpu()
+    norm_hidden_states = self.norm1(hidden_states)
+    norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+    b0["b0_normed_img"] = norm_hidden_states.detach().float().contiguous().cpu()
+    norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
+    norm_encoder_hidden_states = (1 + c_scale_msa) * norm_encoder_hidden_states + c_shift_msa
+    attention_outputs = self.attn(hidden_states=norm_hidden_states,
+                                  encoder_hidden_states=norm_encoder_hidden_states,
+                                  image_rotary_emb=image_rotary_emb, **joint_attention_kwargs)
+    attn_output, context_attn_output = attention_outputs
+    b0["b0_proj_img"] = attn_output.detach().float().contiguous().cpu()
+    attn_output = gate_msa * attn_output
+    hidden_states = hidden_states + attn_output
+    b0["b0_postattn_img"] = hidden_states.detach().float().contiguous().cpu()
+    norm_hidden_states = self.norm2(hidden_states)
+    norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+    b0["b0_mlpin_img"] = norm_hidden_states.detach().float().contiguous().cpu()
+    ff_output = self.ff(norm_hidden_states)
+    b0["b0_mlpout_img"] = ff_output.detach().float().contiguous().cpu()
+    hidden_states = hidden_states + gate_mlp * ff_output
+    context_attn_output = c_gate_msa * context_attn_output
+    encoder_hidden_states = encoder_hidden_states + context_attn_output
+    norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+    norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+    context_ff_output = self.ff_context(norm_encoder_hidden_states)
+    encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
+    if encoder_hidden_states.dtype == torch.float16:
+        encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+    return encoder_hidden_states, hidden_states
+_blk0.forward = types.MethodType(_instr_forward, _blk0)
+
 out = tf(hidden_states=hidden_g, encoder_hidden_states=txt, timestep=timestep,
          img_ids=img_ids, txt_ids=txt_ids, guidance=guidance, return_dict=False)[0]
 vel = out[:, :H * W, :].permute(0, 2, 1).reshape(B, C, H, W)
@@ -158,6 +204,30 @@ loss = ((vel.float() - target.float()) ** 2).mean()
 loss.backward()
 for h in hooks: h.remove()
 dLdx = x_t_leaf.grad.detach().float()
+
+# === DIFFUSERS SELF-CONSISTENCY BASELINE (matches our Rust parity_klein_fwd test) ===
+# Perturb x_t along the unit dLdx direction, BF16-cast, re-run diffusers forward,
+# measure (l+ - l-)/(2 eps) vs |dLdx|. ratio->1 iff diffusers' own backward is the
+# true gradient of its own (BF16) forward. SAME input/eps/loss as ours, so if
+# diffusers ALSO plateaus ~0.77 the number is a test confound (forward-amplification/
+# BF16), not our backward bug; if diffusers ~1.0 while ours is 0.77, ours has a real bug.
+@torch.no_grad()
+def _loss_at(xt):
+    h = pack(xt.to(dt))
+    o = tf(hidden_states=h, encoder_hidden_states=txt, timestep=timestep,
+           img_ids=img_ids, txt_ids=txt_ids, guidance=guidance, return_dict=False)[0]
+    v = o[:, :H * W, :].permute(0, 2, 1).reshape(B, C, H, W)
+    return float(((v.float() - target.float()) ** 2).mean().item())
+_gn = float(dLdx.norm().item())
+_vunit = dLdx / (_gn + 1e-30)
+_x0 = x_t.detach().float()
+print("--- DIFFUSERS SELF-CONSISTENCY (baseline; ratio ~1.0 = diffusers bwd is true grad of diffusers fwd) ---", flush=True)
+for _eps in [0.15, 0.25, 0.4, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0]:
+    _lp = _loss_at(_x0 + _eps * _vunit)
+    _lm = _loss_at(_x0 - _eps * _vunit)
+    _num = (_lp - _lm) / (2.0 * _eps)
+    print(f"  eps={_eps:.2f} numeric={_num:.4e} analytic(|grad|)={_gn:.4e} ratio={_num/(_gn+1e-30):.3f}", flush=True)
+
 blk_ref = {f"dbl{i}_img": g for i, g in blk_grads.items()}
 if "grad" in img_only_ref: blk_ref["img_only"] = img_only_ref["grad"]
 print(f"captured {len(blk_ref)} per-block ref grads (incl img_only={'grad' in img_only_ref})", flush=True)
@@ -170,6 +240,9 @@ if "sb_out_act" in sb_ref: blk_act_ref["sb_out"] = sb_ref["sb_out_act"]
 if "sb_normed_act" in sb_ref: blk_act_ref["sb_normed"] = sb_ref["sb_normed_act"]
 print(f"captured sb_ref keys: {sorted(sb_ref.keys())}", flush=True)
 save_file(blk_ref, "block_grads_ref.safetensors")
+for _k, _v in b0.items():
+    blk_act_ref[_k] = _v
+print(f"captured block-0 per-op keys: {sorted(b0.keys())}", flush=True)
 print(f"captured {len(blk_act_ref)} per-block ref forward acts (incl img_only={'act' in img_only_ref})", flush=True)
 save_file(blk_act_ref, "block_acts_ref.safetensors")
 print(f"velocity pred {tuple(vel.shape)} |vel|={vel.float().norm():.4e}  "

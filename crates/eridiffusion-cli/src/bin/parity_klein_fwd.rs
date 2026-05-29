@@ -82,6 +82,39 @@ fn main() -> anyhow::Result<()> {
         // Per-block FORWARD activations (our side) → compare vs diffusers
         // forward hooks. forward cos high + backward cos low = backward bug.
         let fwd = eridiffusion_core::models::klein::KLEIN_FWD_VALS.lock().unwrap().clone();
+
+        // === RECOMPUTE FIDELITY: initial forward (#0) vs checkpoint recompute (#1) ===
+        // If recompute diverges from the initial forward, the backward operates on
+        // activations that differ from those that produced the loss → corrupted grad.
+        {
+            use std::collections::HashMap;
+            let mut by_base: HashMap<String, HashMap<usize, Vec<f32>>> = HashMap::new();
+            for (label, vals) in &fwd {
+                if let Some((base, nstr)) = label.rsplit_once('#') {
+                    if let Ok(n) = nstr.parse::<usize>() {
+                        by_base.entry(base.to_string()).or_default().insert(n, vals.clone());
+                    }
+                }
+            }
+            let mut keys: Vec<_> = by_base.keys().cloned().collect();
+            keys.sort();
+            println!("--- RECOMPUTE FIDELITY: initial(#0) vs recompute(#1) ---");
+            let mut worst = 1.0f64;
+            let mut pairs = 0;
+            for base in &keys {
+                let m = &by_base[base];
+                if let (Some(a), Some(b)) = (m.get(&0), m.get(&1)) {
+                    if a.len() == b.len() {
+                        let (cos, rel) = cos_rel(a, b);
+                        if cos < worst { worst = cos; }
+                        pairs += 1;
+                        println!("  {base:<26} #0 vs #1: cos={cos:.8} relL2={rel:.4e}");
+                    }
+                }
+            }
+            println!("  >>> {pairs} blocks compared; WORST recompute cos = {worst:.8}  (1.0=faithful; <1=recompute DIVERGES from forward)");
+        }
+
         let mut facts = std::collections::HashMap::new();
         for (label, vals) in &fwd {
             let n = vals.len();
@@ -124,7 +157,14 @@ fn main() -> anyhow::Result<()> {
     let gn: f64 = dv.iter().map(|x|(*x as f64).powi(2)).sum::<f64>().sqrt();
     let vunit: Vec<f32> = dv.iter().map(|x| (*x as f64 / (gn+1e-30)) as f32).collect();
     let ana: f64 = dv.iter().zip(&vunit).map(|(g,v)| *g as f64 * *v as f64).sum(); // = |grad|
-    for eps in [0.15f32, 0.25, 0.4, 0.7] {
+    // NOTE: xp/xm are cast to BF16 below, so perturbations below BF16 input
+    // resolution (~0.004 near |x|~1) get rounded away — this UNDER-counts
+    // `numeric` at small eps. The unit grad dir spreads ~0.0026/component over
+    // ~143k dims, so eps must be ≳2 for the per-element step to clear BF16
+    // resolution. Sweep into the large-eps regime to separate genuine backward
+    // over-magnitude (ratio plateaus <1) from BF16-input-quantization artifact
+    // (ratio → 1.0 as eps grows).
+    for eps in [0.15f32, 0.25, 0.4, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0] {
         let plus: Vec<f32> = x0.iter().zip(&vunit).map(|(a,b)| a + eps*b).collect();
         let minus: Vec<f32> = x0.iter().zip(&vunit).map(|(a,b)| a - eps*b).collect();
         let xp = Tensor::from_vec(plus, shp.clone(), device.clone())?.to_dtype(DType::BF16)?;

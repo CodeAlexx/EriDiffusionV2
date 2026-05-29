@@ -93,6 +93,9 @@ struct Args {
     #[arg(long, default_value = "500")] sample_every: usize,
     /// Prompt for the periodic sample. Required if `--sample-every > 0`.
     #[arg(long, default_value = "")] sample_prompt: String,
+    /// Optional SECOND periodic-sample prompt. Encoded once at startup
+    /// alongside `--sample-prompt` and rendered to `sample_step{N}_p2.png`.
+    #[arg(long, default_value = "")] sample_prompt2: String,
     /// Negative / unconditional prompt for CFG.
     #[arg(long, default_value = "")] sample_neg_prompt: String,
     /// Klein VAE safetensors. Required if `--sample-every > 0`.
@@ -1344,6 +1347,27 @@ fn main() -> anyhow::Result<()> {
         // exactly the previous (pred-target).square().mean() formula.
         let pred_f32 = pred.to_dtype(DType::F32)?;
         let target_f32 = target.to_dtype(DType::F32)?;
+        // TRAP 2 (FLAME_TRAP=1, DIAGNOSTIC): forward-output probe. At the ~670 bifurcation,
+        // is the prediction EXPLODING (pred_rms ≫ target_rms ⇒ numerical/BF16 blowup in a
+        // specific op) or COLLAPSING (pred_rms small / loss→target_rms² ⇒ forward divergence
+        // makes the prediction useless at high-σ)? target_rms ~1.4 (noise−latent). Also logs σ
+        // so we see WHICH timesteps degrade.
+        if std::env::var("FLAME_TRAP").as_deref() == Ok("1") {
+            let rms = |t: &flame_core::Tensor| -> f64 {
+                t.square()
+                    .and_then(|s| s.mean())
+                    .and_then(|m| m.to_vec())
+                    .map(|v| (v[0] as f64).sqrt())
+                    .unwrap_or(f64::NAN)
+            };
+            eprintln!(
+                "[TRAP_FWD step={:5}] pred_rms={:.4} target_rms={:.4} sigma={:.4}",
+                step,
+                rms(&pred_f32),
+                rms(&target_f32),
+                sigma
+            );
+        }
         // Phase 3: when masked-loss is active, take the manual diff path so we
         // can multiply the per-element diff by a per-pixel mask BEFORE squaring
         // and reducing. When masked_loss_weight == 0.0 (default) we route
@@ -1466,6 +1490,101 @@ fn main() -> anyhow::Result<()> {
             .item()? as f32;
         if dbg_on {
             eprintln!("[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}", step, total_norm);
+        }
+
+        // TRAP (FLAME_TRAP=1, DIAGNOSTIC, revert after use): per-step LoRA weight-norm
+        // accumulation probe to catch the ~step-600 bifurcation. The runaway is a delayed-onset
+        // divergence (stable=OT for ~600 steps, then mean-loss + grad blow up). Q1: does |B|
+        // grow & ACCELERATE at ~600 (weight-magnitude-driven) and which group? Q2: compared to
+        // OT's |B| trajectory — same growth (⇒ forward/activation instability) or faster
+        // (⇒ optimizer/update accumulation)? Logs |B|/|A| every step + per-group |B| every 25.
+        if std::env::var("FLAME_TRAP").as_deref() == Ok("1") {
+            let named = model.named_parameters();
+            let norm_of = |needle: &str| -> f32 {
+                let ts: Vec<flame_core::Tensor> = named
+                    .iter()
+                    .filter(|(n, _)| n.contains(needle))
+                    .filter_map(|(_, p)| p.tensor().ok())
+                    .collect();
+                let refs: Vec<&flame_core::Tensor> = ts.iter().collect();
+                flame_core::ops::grad_norm::global_l2_norm(&refs)
+                    .and_then(|t| t.item())
+                    .map(|v| v as f32)
+                    .unwrap_or(f32::NAN)
+            };
+            eprintln!(
+                "[TRAP step={:5}] grad_pre={:.4e} |B|={:.5e} |A|={:.5e}",
+                step, total_norm, norm_of("lora_B"), norm_of("lora_A")
+            );
+            if step % 25 == 0 {
+                use std::collections::BTreeMap;
+                let mut grp: BTreeMap<String, f64> = BTreeMap::new();
+                for (name, p) in &named {
+                    if !name.contains("lora_B") {
+                        continue;
+                    }
+                    if let Ok(v) = p
+                        .tensor()
+                        .and_then(|t| t.to_dtype(flame_core::DType::F32))
+                        .and_then(|t| t.to_vec())
+                    {
+                        let key = name
+                            .split('.')
+                            .filter(|s| s.parse::<u64>().is_err())
+                            .collect::<Vec<_>>()
+                            .join(".")
+                            .replace(".weight", "");
+                        *grp.entry(key).or_default() +=
+                            v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>();
+                    }
+                }
+                let mut top: Vec<(f64, String)> =
+                    grp.into_iter().map(|(k, v)| (v.sqrt(), k)).collect();
+                top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                let line = top
+                    .iter()
+                    .take(6)
+                    .map(|(n, k)| format!("{}={:.4}", k, n))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                eprintln!("[TRAP_BNORM step={:5}] {}", step, line);
+            }
+        }
+
+        // DIAGNOSTIC (FLAME_GROUP_GRAD=1, revert after use): per-adapter-group
+        // pre-clip grad L2, logged every 25 steps, to localize WHICH group leads
+        // the runaway envelope. Group key strips block index + ".weight".
+        if std::env::var("FLAME_GROUP_GRAD").as_deref() == Ok("1") && step % 25 == 0 {
+            use std::collections::BTreeMap;
+            fn grp_key(name: &str) -> String {
+                name.split('.')
+                    .filter(|s| s.parse::<u64>().is_err())
+                    .collect::<Vec<_>>()
+                    .join(".")
+                    .replace(".weight", "")
+            }
+            let named = model.named_parameters();
+            let mut grp: BTreeMap<String, f64> = BTreeMap::new();
+            for (name, param) in &named {
+                if let Some(g) = grads.get(param.id()) {
+                    let n2 = g
+                        .to_dtype(flame_core::DType::F32)
+                        .and_then(|t| t.to_vec())
+                        .map(|v| v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>())
+                        .unwrap_or(0.0);
+                    *grp.entry(grp_key(name)).or_default() += n2;
+                }
+            }
+            let mut top: Vec<(f64, String)> =
+                grp.into_iter().map(|(k, v)| (v.sqrt(), k)).collect();
+            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let line = top
+                .iter()
+                .take(6)
+                .map(|(n, k)| format!("{}={:.3}", k, n))
+                .collect::<Vec<_>>()
+                .join("  ");
+            eprintln!("[GROUP_GRAD step={:5}] total={:.3} | {}", step, total_norm, line);
         }
 
         // Diagnostic: dump per-block per-role LoRA grad norms at fixed steps.
@@ -1603,6 +1722,34 @@ fn main() -> anyhow::Result<()> {
                 phase_start = std::time::Instant::now();
             }
         AutogradContext::clear();
+
+        // FLAME_DESCENT_PROBE=1 (DIAGNOSTIC): the model-agnostic "does training
+        // actually descend?" test. After opt.step, re-run the forward on the
+        // SAME (noisy, txt, timestep) in no_grad and recompute the SAME loss.
+        // A correct forward+backward+optimizer MUST make loss_after < loss_before
+        // on the batch the gradient was computed from (lr is small). If loss_after
+        // is reliably >= loss_before, the gradient is not a descent direction —
+        // the bug, caught live during training, no reference / no parity confound.
+        if std::env::var("FLAME_DESCENT_PROBE").as_deref() == Ok("1") {
+            let _g = AutogradContext::no_grad();
+            let pred2 = model.forward_train(&noisy, &txt, &timestep, None)?;
+            let pred2_f32 = pred2.to_dtype(DType::F32)?;
+            let raw2 = loss_weight::combined_loss(
+                &pred2_f32, &target_f32,
+                config.mse_strength as f32, config.mae_strength as f32, args.huber_strength,
+            )?;
+            let loss2 = loss_weight::apply_loss_weight(
+                &raw2, sigma, config.loss_weight_fn, args.min_snr_gamma, true,
+            )?;
+            let loss_after = loss2.to_vec()?[0];
+            let delta = loss_val - loss_after; // >0 means loss went DOWN (good)
+            eprintln!(
+                "[DESCENT step={:5}] before={:.6} after={:.6} delta={:+.6} {}",
+                step, loss_val, loss_after, delta,
+                if loss_after < loss_val { "DOWN" } else { "UP" },
+            );
+            AutogradContext::clear();
+        }
             if profile_step {
                 let _ = device.synchronize();
                 let clear_ms = phase_start.elapsed().as_secs_f64() * 1000.0;

@@ -149,6 +149,41 @@ pub static KLEIN_GRAD_PROBE: std::sync::Mutex<Vec<(String, flame_core::TensorId)
 pub static KLEIN_FWD_VALS: std::sync::Mutex<Vec<(String, Vec<f32>)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// PROTOTYPE (env `FLAME_KLEIN_F32_RESIDUAL=1`, default OFF): keep the
+/// inter-block residual stream in F32 across all 32 blocks, rounding to BF16
+/// only at each block's internal op inputs (mirrors OneTrainer's autocast,
+/// which keeps F32 between ops). Tests the hypothesis that the ~0.17%/block
+/// inter-op BF16 residency compounding in klein's UNBOUNDED pre-norm residual
+/// is the root of the LoRA-training grad runaway. When OFF the code path is
+/// byte-identical to the committed BF16-fused path.
+///
+/// Cached in a `OnceLock` so the env read happens once per process (the flag
+/// is fixed for the lifetime of a run); the block forwards call this ~32×/step.
+fn klein_f32_residual_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("FLAME_KLEIN_F32_RESIDUAL").as_deref() == Ok("1"))
+}
+
+/// Compute the gate-residual `residual + gate.unsqueeze(1) * x` entirely in
+/// F32 via autograd-REGISTERED primitive ops (`to_dtype` / `mul` / `add`),
+/// keeping the result F32. This mirrors `gate_residual_fused_bf16`'s math
+/// (kernel: `out[b,n,d] = residual[b,n,d] + gate[b,d] * x[b,n,d]`) but never
+/// materializes the residual stream in BF16 between blocks. Backward flows
+/// automatically through `Op::Mul`/`Op::Add`/`Op::Cast` — no new kernel.
+///
+/// `residual` is F32 `[B,N,dim]` (the carried stream); `gate` is `[B,dim]`
+/// (BF16 or F32); `x` is the BF16 block output `[B,N,dim]`. All are upcast to
+/// F32 before the multiply/add.
+fn gate_residual_f32(residual: &Tensor, gate: &Tensor, x: &Tensor) -> flame_core::Result<Tensor> {
+    let dims = residual.shape().dims();
+    let (b, _n, dim) = (dims[0], dims[1], dims[2]);
+    let residual_f32 = residual.to_dtype(DType::F32)?;
+    let gate_f32 = gate.to_dtype(DType::F32)?.reshape(&[b, 1, dim])?;
+    let x_f32 = x.to_dtype(DType::F32)?;
+    let gated = x_f32.mul(&gate_f32)?; // broadcast [B,1,dim] * [B,N,dim]
+    residual_f32.add(&gated)
+}
+
 fn klein_probe(label: &str, t: &flame_core::Tensor) {
     if std::env::var("FLAME_KLEIN_PROBE").as_deref() != Ok("1") {
         return;
@@ -1162,9 +1197,26 @@ fn double_block_forward_standalone(
     let (txt_shift1, txt_scale1, txt_gate1) = (&txt_mods[0], &txt_mods[1], &txt_mods[2]);
     let (txt_shift2, txt_scale2, txt_gate2) = (&txt_mods[3], &txt_mods[4], &txt_mods[5]);
 
+    // F32-residual prototype: when on, `img`/`txt` arrive F32 (carried
+    // streams). Cast to BF16 for the modulation/linear ops (same input the
+    // baseline feeds); the F32 streams are kept for the gate-residual adds.
+    let f32_resid = klein_f32_residual_enabled();
+    let img_bf16 = if f32_resid { img.to_dtype(DType::BF16)? } else { img.clone() };
+    let txt_bf16 = if f32_resid { txt.to_dtype(DType::BF16)? } else { txt.clone() };
+
+    // Per-op forward localization (block 0 only). Captures img-stream after each
+    // op so a parity harness can compare against diffusers block-0 sub-op outputs
+    // and pin which op injects the ~0.008 relL2 of block 0.
+    if block_idx == 0 {
+        klein_probe("b0_in_img", &img);
+    }
+
     // Attention
-    let img_normed = modulate_pre_local(&img, img_shift1, img_scale1)?;
-    let txt_normed = modulate_pre_local(&txt, txt_shift1, txt_scale1)?;
+    let img_normed = modulate_pre_local(&img_bf16, img_shift1, img_scale1)?;
+    let txt_normed = modulate_pre_local(&txt_bf16, txt_shift1, txt_scale1)?;
+    if block_idx == 0 {
+        klein_probe("b0_normed_img", &img_normed);
+    }
 
     // Slot map per DOUBLE_LORA_KEYS (12 adapters/block):
     //  0/1/2 = img_attn.to_q/to_k/to_v ; 3 = img_attn.proj
@@ -1201,35 +1253,83 @@ fn double_block_forward_standalone(
     let q = Tensor::cat(&[&txt_q, &img_q], 2)?;
     let k = Tensor::cat(&[&txt_k, &img_k], 2)?;
     let v = Tensor::cat(&[&txt_v, &img_v], 2)?;
+    if block_idx == 0 {
+        klein_probe("b0_q_prerope", &q);
+        klein_probe("b0_k_prerope", &k);
+    }
 
     let (q, k) = apply_rope_klein(&q, &k, &pe_cos, &pe_sin)?;
+    // Block-0 attention-internal probes: dump the exact SDPA inputs/output so a
+    // parity harness can recompute an F32 reference SDPA on OUR q/k/v and isolate
+    // SDPA precision from the qkv-linear / rope / qk-norm contributions.
+    if block_idx == 0 {
+        klein_probe("b0_sdpa_q", &q);
+        klein_probe("b0_sdpa_k", &k);
+        klein_probe("b0_sdpa_v", &v);
+    }
 
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    if block_idx == 0 {
+        klein_probe("b0_sdpa_out", &attn_out);
+    }
     let (txt_out, img_out) =
         flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_txt, n_img)?;
 
     let img_proj = lin(&img_out, "img_attn.proj", 3)?;
     let txt_proj = lin(&txt_out, "txt_attn.proj", 7)?;
+    if block_idx == 0 {
+        klein_probe("b0_proj_img", &img_proj);
+    }
 
-    let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, img_gate1, &img_proj)?;
-    let txt = flame_core::bf16_ops::gate_residual_fused_bf16(&txt, txt_gate1, &txt_proj)?;
+    let (img, txt) = if f32_resid {
+        (
+            gate_residual_f32(&img, img_gate1, &img_proj)?,
+            gate_residual_f32(&txt, txt_gate1, &txt_proj)?,
+        )
+    } else {
+        (
+            flame_core::bf16_ops::gate_residual_fused_bf16(&img, img_gate1, &img_proj)?,
+            flame_core::bf16_ops::gate_residual_fused_bf16(&txt, txt_gate1, &txt_proj)?,
+        )
+    };
     let _ = inner_dim;
+    if block_idx == 0 {
+        klein_probe("b0_postattn_img", &img);
+    }
 
-    // MLP (SwiGLU)
-    let img_mlp_in = modulate_pre_local(&img, img_shift2, img_scale2)?;
-    let txt_mlp_in = modulate_pre_local(&txt, txt_shift2, txt_scale2)?;
+    // MLP (SwiGLU). When F32-residual is on, `img`/`txt` are now F32; cast to
+    // BF16 for the modulation input (same as baseline).
+    let img_mlp_bf16 = if f32_resid { img.to_dtype(DType::BF16)? } else { img.clone() };
+    let txt_mlp_bf16 = if f32_resid { txt.to_dtype(DType::BF16)? } else { txt.clone() };
+    let img_mlp_in = modulate_pre_local(&img_mlp_bf16, img_shift2, img_scale2)?;
+    let txt_mlp_in = modulate_pre_local(&txt_mlp_bf16, txt_shift2, txt_scale2)?;
+    if block_idx == 0 {
+        klein_probe("b0_mlpin_img", &img_mlp_in);
+    }
 
     // img_mlp: gate+up fused, then silu(gate)*up, then down
     let img_gu = lin(&img_mlp_in, "img_mlp.0", 8)?;
     let img_act = flame_core::bf16_ops::swiglu_split_lastdim_bf16(&img_gu)?;
     let img_mlp_out = lin(&img_act, "img_mlp.2", 9)?;
+    if block_idx == 0 {
+        klein_probe("b0_mlpout_img", &img_mlp_out);
+    }
 
     let txt_gu = lin(&txt_mlp_in, "txt_mlp.0", 10)?;
     let txt_act = flame_core::bf16_ops::swiglu_split_lastdim_bf16(&txt_gu)?;
     let txt_mlp_out = lin(&txt_act, "txt_mlp.2", 11)?;
 
-    let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, img_gate2, &img_mlp_out)?;
-    let txt = flame_core::bf16_ops::gate_residual_fused_bf16(&txt, txt_gate2, &txt_mlp_out)?;
+    let (img, txt) = if f32_resid {
+        (
+            gate_residual_f32(&img, img_gate2, &img_mlp_out)?,
+            gate_residual_f32(&txt, txt_gate2, &txt_mlp_out)?,
+        )
+    } else {
+        (
+            flame_core::bf16_ops::gate_residual_fused_bf16(&img, img_gate2, &img_mlp_out)?,
+            flame_core::bf16_ops::gate_residual_fused_bf16(&txt, txt_gate2, &txt_mlp_out)?,
+        )
+    };
     Ok((img, txt))
 }
 
@@ -1280,7 +1380,17 @@ fn single_block_forward_standalone(
     }
 
     let (shift, scale, gate) = (&mods[0], &mods[1], &mods[2]);
-    let x_normed = modulate_pre_local(&x, shift, scale)?;
+    // F32-residual prototype: when on, `x` arrives F32 (carried stream). The
+    // modulation/linear ops expect BF16 input (same byte-for-byte input the
+    // baseline feeds), so cast x→BF16 here. The F32 `x` is kept for the
+    // gate-residual add below.
+    let f32_resid = klein_f32_residual_enabled();
+    let x_for_block = if f32_resid {
+        x.to_dtype(DType::BF16)?
+    } else {
+        x.clone()
+    };
+    let x_normed = modulate_pre_local(&x_for_block, shift, scale)?;
     if probe_this {
         klein_probe("sb_normed", &x_normed);
     }
@@ -1313,7 +1423,92 @@ fn single_block_forward_standalone(
         klein_probe("sb_out", &out);
     }
 
-    flame_core::bf16_ops::gate_residual_fused_bf16(&x, gate, &out)
+    if f32_resid {
+        // Keep the residual stream F32: out = x_f32 + gate * out_bf16.
+        gate_residual_f32(&x, gate, &out)
+    } else {
+        flame_core::bf16_ops::gate_residual_fused_bf16(&x, gate, &out)
+    }
+}
+
+/// DIAGNOSTIC parity entry point (uncommitted): run ONE single block forward
+/// in isolation on controlled inputs. `adapters=None`. Exposes
+/// `single_block_forward_standalone` to the standalone parity bin. Sub-op
+/// disable knobs (env `FLAME_SB_DISABLE_MLP`/`FLAME_SB_DISABLE_ATTN`) live in
+/// `single_block_forward_standalone` only if set; here we just forward through.
+#[allow(clippy::too_many_arguments)]
+pub fn parity_single_block_forward(
+    x: Tensor,
+    mods: [Tensor; 3],
+    pe_cos: Tensor,
+    pe_sin: Tensor,
+    layer_weights: HashMap<String, Tensor>,
+    block_idx: usize,
+    num_heads: usize,
+    head_dim: usize,
+    inner_dim: usize,
+    mlp_hidden: usize,
+) -> Result<Tensor> {
+    Ok(single_block_forward_standalone(
+        x,
+        mods,
+        pe_cos,
+        pe_sin,
+        layer_weights,
+        None,
+        block_idx,
+        num_heads,
+        head_dim,
+        inner_dim,
+        mlp_hidden,
+    )?)
+}
+
+/// DIAGNOSTIC parity entry point (uncommitted, TASK A): run ONE single block
+/// forward in isolation WITH injected LoRA adapters (legacy plain-LoRA path).
+/// `adapters[0]` -> linear1 (lora_idx 0), `adapters[1]` -> linear2 (lora_idx 1).
+/// Exposes the LoRA-augmented `single_block_forward_standalone` so the
+/// standalone LoRA-grad parity bin can measure dL/d(lora_B) at large ‖B‖.
+#[allow(clippy::too_many_arguments)]
+pub fn parity_single_block_forward_lora(
+    x: Tensor,
+    mods: [Tensor; 3],
+    pe_cos: Tensor,
+    pe_sin: Tensor,
+    layer_weights: HashMap<String, Tensor>,
+    adapters: Vec<LoRALinear>,
+    block_idx: usize,
+    num_heads: usize,
+    head_dim: usize,
+    inner_dim: usize,
+    mlp_hidden: usize,
+) -> Result<Tensor> {
+    Ok(single_block_forward_standalone(
+        x,
+        mods,
+        pe_cos,
+        pe_sin,
+        layer_weights,
+        Some(BlockAdapterSlice::Legacy(adapters)),
+        block_idx,
+        num_heads,
+        head_dim,
+        inner_dim,
+        mlp_hidden,
+    )?)
+}
+
+/// DIAGNOSTIC: build the Klein 4-axis RoPE tables `[1,1,N,head_dim/2]` (F32)
+/// from positional ids, the same way the full model does. Exposed so the
+/// standalone single-block parity bin builds rope identically to the model.
+pub fn parity_build_rope(
+    img_ids: &Tensor,
+    txt_ids: &Tensor,
+    axes_dims: &[usize; 4],
+    theta: f32,
+    device: &Arc<CudaDevice>,
+) -> Result<(Tensor, Tensor)> {
+    Ok(build_rope_klein(img_ids, txt_ids, axes_dims, theta, device)?)
 }
 
 impl KleinModel {
@@ -1493,8 +1688,13 @@ impl KleinModel {
         // Backward re-runs the closure to recompute activations rather
         // than storing them, trading ~33% extra forward compute for the
         // ability to fit klein 9B + LoKr in 24 GB.
-        let mut img = img_proj;
-        let mut txt = txt_proj;
+        // F32-residual prototype: lift the inter-block residual streams to F32
+        // at the model entry so they stay F32 across all 32 blocks (the blocks
+        // cast to BF16 internally at op inputs). The cat/narrow plumbing
+        // between blocks preserves dtype; the final norm casts back to BF16.
+        let f32_resid = klein_f32_residual_enabled();
+        let mut img = if f32_resid { img_proj.to_dtype(DType::F32)? } else { img_proj };
+        let mut txt = if f32_resid { txt_proj.to_dtype(DType::F32)? } else { txt_proj };
         let img_mods_arc = std::sync::Arc::new(img_mods.clone());
         let txt_mods_arc = std::sync::Arc::new(txt_mods.clone());
 
@@ -2068,7 +2268,11 @@ impl KleinModel {
         let shift = final_mod.narrow(ndim - 1, 0, half_mod)?;
         let scale = final_mod.narrow(ndim - 1, half_mod, half_mod)?;
 
-        let img_norm = modulate_pre_local(&img_only, &shift, &scale)?;
+        // F32-residual prototype: `img_only` is F32 when the flag is on; cast
+        // back to BF16 for the final modulation/linear head (same byte-for-byte
+        // input the baseline feeds at this point).
+        let img_only_for_norm = if f32_resid { img_only.to_dtype(DType::BF16)? } else { img_only };
+        let img_norm = modulate_pre_local(&img_only_for_norm, &shift, &scale)?;
         let img_out = self.linear(&img_norm, "final_layer.linear.weight")?;
         // `img_out`: [B, N_img, in_channels] — unpack back to [B, C, H, W]
         let unpacked = img_out

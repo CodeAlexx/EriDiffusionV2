@@ -36,6 +36,14 @@ fn main() -> anyhow::Result<()> {
     let config = TrainConfig::from_json_path("configs/klein9b_alina.json")?;
     let mut model = KleinModel::load(&[PathBuf::from(TRANSFORMER)], &config, device.clone())?;
 
+    // TRAP 3: optional trained-LoRA checkpoint (arg 2). Loads LoRA weights over the init
+    // zeros so the finite-diff gradient check runs at a TRAINED state (e.g. near the
+    // ~step-600 bifurcation). No ckpt ⇒ init (zero LoRA), the original self-consistency test.
+    if let Some(lora) = std::env::args().nth(2) {
+        eprintln!("[paramgrad] loading trained LoRA from {lora}");
+        model.load_weights(&lora)?;
+    }
+
     let fix = flame_core::serialization::load_file(&dir.join("fwd_fixture.safetensors"), &device)?;
     let x_t = fix.get("x_t").unwrap().to_dtype(DType::BF16)?;
     let txt = fix.get("text_embedding").unwrap().to_dtype(DType::BF16)?;
