@@ -388,6 +388,12 @@ struct Args {
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
     #[arg(long, default_value_t = false)]
     use_autograd_v2: bool,
+
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the default
+    /// as of 2026-05-30 (gate-on Stage 6a); v3 kept as the reference engine.
+    /// `--use-autograd-v2` remains accepted as a back-compat no-op.
+    #[arg(long, default_value_t = false, conflicts_with = "use_autograd_v2")]
+    use_autograd_v3: bool,
 }
 
 fn parse_weight_dtype(s: &str) -> anyhow::Result<DType> {
@@ -710,15 +716,28 @@ fn main() -> anyhow::Result<()> {
     let mut opt_low = make_opt();
     let mut opt_high: Option<Optimizer> = if dual { Some(make_opt()) } else { None };
 
-    let params_low = low_model.parameters();
+    let mut params_low = low_model.parameters();
     log::info!("[wan22:low] {} trainable LoRA tensors", params_low.len());
-    let params_high: Vec<flame_core::parameter::Parameter> = if let Some(ref hm) = high_model {
+    let mut params_high: Vec<flame_core::parameter::Parameter> = if let Some(ref hm) = high_model {
         let p = hm.parameters();
         log::info!("[wan22:high] {} trainable LoRA tensors", p.len());
         p
     } else {
         Vec::new()
     };
+    // Gate-on 6a: under v2 (default), flip BOTH expert param sets to
+    // MatchParamDtype so BF16 grads from the bridge stay BF16 (Class A).
+    // LoRA params are not quantized (the FP8/AdamW8bit exception is on the base
+    // experts), so this is safe. --use-autograd-v3 skips.
+    if !args.use_autograd_v3 {
+        for p in params_low.iter_mut().chain(params_high.iter_mut()) {
+            p.set_grad_dtype_policy(flame_core::parameter::GradDtypePolicy::MatchParamDtype);
+        }
+        log::info!(
+            "[autograd_v2] flipped {} params (low+high) to MatchParamDtype grad policy",
+            params_low.len() + params_high.len()
+        );
+    }
 
     // ── Caption dropout (null text cache) ───────────────────────────────
     let mut effective_caption_dropout_prob = args.caption_dropout_probability;
@@ -1117,9 +1136,9 @@ fn main() -> anyhow::Result<()> {
         total_loss += loss_val;
 
         // --- 7. Backward + clip-grad-norm + step (only the active expert)
-        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
-        // backward entry to construct a `MatchInsertedDtype` GradientMap.
-        let grads = if args.use_autograd_v2 {
+        // Phase 5b / gate-on 6a: Route (ii) bridge. v2 is the default; backward
+        // goes through `backward_v2` unless `--use-autograd-v3` opts into v3.
+        let grads = if !args.use_autograd_v3 {
             #[cfg(feature = "autograd_v2")]
             {
                 flame_core::AutogradContext::backward_v2(&loss)?

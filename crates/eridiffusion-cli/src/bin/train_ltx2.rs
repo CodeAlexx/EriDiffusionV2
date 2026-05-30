@@ -553,6 +553,12 @@ struct Args {
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
     #[arg(long, default_value_t = false)]
     use_autograd_v2: bool,
+
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the default
+    /// as of 2026-05-30 (gate-on Stage 6a); v3 kept as the reference engine.
+    /// `--use-autograd-v2` remains accepted as a back-compat no-op.
+    #[arg(long, default_value_t = false, conflicts_with = "use_autograd_v2")]
+    use_autograd_v3: bool,
 }
 
 fn debug_enabled() -> bool {
@@ -649,7 +655,18 @@ fn main() -> anyhow::Result<()> {
         model.load_weights(resume.to_str().unwrap())?;
         log::info!("Resumed LoRA from {}", resume.display());
     }
-    let params = model.parameters();
+    let mut params = model.parameters();
+    // Gate-on 6a: under v2 (default), flip LoRA params to MatchParamDtype so
+    // BF16 grads from the bridge stay BF16 (Class A). --use-autograd-v3 skips.
+    if !args.use_autograd_v3 {
+        for p in &mut params {
+            p.set_grad_dtype_policy(flame_core::parameter::GradDtypePolicy::MatchParamDtype);
+        }
+        log::info!(
+            "[autograd_v2] flipped {} params to MatchParamDtype grad policy",
+            params.len()
+        );
+    }
     log::info!("Loaded {} trainable LoRA tensors", params.len());
     if params.is_empty() {
         anyhow::bail!("No trainable parameters — TrainingMethod::Lora produced empty param list");
@@ -1116,9 +1133,9 @@ fn main() -> anyhow::Result<()> {
         total_loss += loss_val;
 
         // ── Backward + clip-grad-norm + step ──
-        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
-        // backward entry to construct a `MatchInsertedDtype` GradientMap.
-        let grads = if args.use_autograd_v2 {
+        // Phase 5b / gate-on 6a: Route (ii) bridge. v2 is the default; backward
+        // goes through `backward_v2` unless `--use-autograd-v3` opts into v3.
+        let grads = if !args.use_autograd_v3 {
             #[cfg(feature = "autograd_v2")]
             {
                 flame_core::AutogradContext::backward_v2(&loss)?
