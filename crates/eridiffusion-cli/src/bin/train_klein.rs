@@ -319,6 +319,13 @@ struct Args {
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
     #[arg(long, default_value_t = false)] use_autograd_v2: bool,
 
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the Klein
+    /// default as of 2026-05-30 (gate-on Stage 6a — proven within BF16
+    /// tolerance vs v3); v3 is kept available indefinitely as the reference
+    /// engine. `--use-autograd-v2` remains accepted as a back-compat no-op.
+    #[arg(long, default_value_t = false, conflicts_with = "use_autograd_v2")]
+    use_autograd_v3: bool,
+
     // ── Gap 2 (2026-05-13): activation offload opt-in ──────────────────────
     /// Install the global activation-offload pool. When set, klein.rs's
     /// `checkpoint_offload` saves block sub-tape activations into pinned RAM
@@ -653,10 +660,25 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    let params = model.parameters();
+    let mut params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors", params.len());
     if params.is_empty() {
         anyhow::bail!("No trainable parameters — TrainingMethod::Lora produced empty param list");
+    }
+
+    // Phase 5d item #2: when `--use-autograd-v2` is on, flip every trainable
+    // LoRA Parameter to `MatchParamDtype` so BF16 grads from the bridge stay
+    // BF16 in `param.set_grad` instead of being upcast to F32 by the default
+    // `CastToF32` policy. Without this the 50% Class A memory savings never
+    // materializes in real runs. Mirrors train_zimage.rs:637-648.
+    if !args.use_autograd_v3 {
+        for p in &mut params {
+            p.set_grad_dtype_policy(flame_core::parameter::GradDtypePolicy::MatchParamDtype);
+        }
+        log::info!(
+            "[autograd_v2] flipped {} params to MatchParamDtype grad policy",
+            params.len()
+        );
     }
 
     // Phase 2b: bundle population now happens INSIDE
@@ -1492,9 +1514,10 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
-        // backward entry to construct a `MatchInsertedDtype` GradientMap.
-        let mut grads = if args.use_autograd_v2 {
+        // Phase 5b / gate-on 6a: Route (ii) bridge. v2 is the default; backward
+        // goes through `backward_v2` (MatchInsertedDtype GradientMap) unless
+        // `--use-autograd-v3` opts into the legacy v3 backward.
+        let mut grads = if !args.use_autograd_v3 {
             #[cfg(feature = "autograd_v2")]
             {
                 flame_core::AutogradContext::backward_v2(&loss)?
@@ -1664,7 +1687,7 @@ fn main() -> anyhow::Result<()> {
             .as_deref()
             .map(|v| matches!(v, "1" | "true" | "TRUE"))
             .unwrap_or(false)
-            && !args.use_autograd_v2;
+            && args.use_autograd_v3;
 
         if mt_scale_enabled && scale < 1.0 {
             let mut ptrs: Vec<u64> = Vec::with_capacity(params.len());

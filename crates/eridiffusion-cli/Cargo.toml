@@ -37,8 +37,11 @@ safetensors = { workspace = true }
 cudarc = { workspace = true }
 
 [features]
-# Phase 5b: enable the autograd v2 `backward_v2()` bridge in train_zimage
-# (and any other trainer that opts in via `--use-autograd-v2`). Without
-# this feature the flag returns an explicit error at runtime — the
-# default `cargo build` continues to ship the v3 path only.
+# Gate-on Stage 6a (2026-05-30): autograd_v2 is now a DEFAULT feature so the
+# v2 `backward_v2()` bridge compiles into the normal build. Klein routes
+# through v2 by default (proven within BF16 tolerance vs v3); other trainers
+# still default to v3 unless they pass --use-autograd-v2. v3 stays compiled
+# and reachable (Klein: --use-autograd-v3). Use --no-default-features to
+# exclude the v2 bridge entirely.
+default = ["autograd_v2"]
 autograd_v2 = ["flame-core/autograd_v2"]
