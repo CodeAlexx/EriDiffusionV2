@@ -38,8 +38,8 @@ use eridiffusion_core::sampler::ltx2_sampler;
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::{
-    ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
-    validation::ValidationLoop,
+    ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers,
+    sample_library::SampleLibrary, timestep_bias, validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::OptimizerKind;
 use flame_core::adam::AdamW;
@@ -581,9 +581,8 @@ fn main() -> anyhow::Result<()> {
     if !args.multi_backend_cache_dirs.is_empty() || !args.multi_backend_weights.is_empty() {
         log::warn!("--multi-backend-* flags are Klein-only in Phase 2; ignored here");
     }
-    if args.validation_prompts_file.is_some() {
-        log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
-    }
+    // `--validation-prompts-file` is now consumed below for config-driven
+    // sampling (see `sample_set`); no longer a no-op warn for this trainer.
     std::fs::create_dir_all(&args.output_dir)?;
 
     flame_core::config::set_default_dtype(DType::BF16);
@@ -801,11 +800,51 @@ fn main() -> anyhow::Result<()> {
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
+    // Config-driven sample set. When a prompts file (CLI override OR
+    // config.validation_prompts_file) is present, EVERY prompt is rendered at
+    // each checkpoint AND final; otherwise we fall back to the single
+    // --sample-prompt. Each entry: (label "p{i+1}", prompt text).
+    //
+    // NOTE: LTX-2 has no inline text encoder — `inline_sample` uses a zero text
+    // embedding regardless of the prompt string (see its body). So the rendered
+    // frame is identical across prompts; the per-prompt labels exist so the
+    // board organises previews/prompts per entry, matching the other trainers.
+    let prompts_file = args
+        .validation_prompts_file
+        .clone()
+        .or_else(|| config.validation_prompts_file.clone());
+    let mut sample_set: Vec<(String, String)> = Vec::new();
+    if let Some(ref pf) = prompts_file {
+        let lib = SampleLibrary::from_file(pf)?;
+        log::info!(
+            "[sample-setup] {} config-driven prompt(s) from {}",
+            lib.len(),
+            pf.display()
+        );
+        for (i, p) in lib.prompts.iter().enumerate() {
+            sample_set.push((format!("p{}", i + 1), p.prompt.clone()));
+        }
+    }
+    if sample_set.is_empty() {
+        sample_set.push(("p1".into(), args.sample_prompt.clone()));
+    }
+
     let board = BoardWriter::open(&args.output_dir, BoardWriter::new_session_id(), None)
         .map_err(|e| log::warn!("board.db open failed: {e}"))
         .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"ltx2\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"warmup_steps\":{},\"batch_size\":{},\"optimizer\":\"{}\",\
+             \"sample_size\":{},\"sample_steps\":{},\"sample_cfg\":{},\"seed\":{}}}",
+            args.steps, args.rank, args.lora_alpha, args.lr, args.warmup_steps,
+            args.batch_size, args.optimizer,
+            args.sample_size, args.sample_steps, args.sample_cfg, SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
@@ -1312,20 +1351,31 @@ fn main() -> anyhow::Result<()> {
         }
 
         if sample_fires {
-            let out = args.output_dir.join(format!("sample_step{step_num}.png"));
-            if let Err(e) = inline_sample(
-                &mut model,
-                &args.sample_prompt,
-                args.sample_vae.as_deref(),
-                &out,
-                args.sample_size,
-                args.sample_steps,
-                args.sample_cfg,
-                args.sample_seed,
-                args.fps,
-                &device,
-            ) {
-                log::warn!("[sample step={step_num}] failed: {e}");
+            // Render EVERY config-driven prompt in `sample_set` (loaded from the
+            // prompts file, or the --sample-prompt fallback). Each →
+            // sample_step{N}_{label}.png + board image/text.
+            for (label, ptext) in &sample_set {
+                let out = args
+                    .output_dir
+                    .join(format!("sample_step{step_num}_{label}.png"));
+                log::info!("[sample step={step_num} {label}] → {}", out.display());
+                if let Err(e) = inline_sample(
+                    &mut model,
+                    ptext,
+                    args.sample_vae.as_deref(),
+                    &out,
+                    args.sample_size,
+                    args.sample_steps,
+                    args.sample_cfg,
+                    args.sample_seed,
+                    args.fps,
+                    &device,
+                ) {
+                    log::warn!("[sample step={step_num} {label}] failed: {e}");
+                } else if let Some(b) = &board {
+                    b.log_image_png(&format!("samples/{label}"), step_num as u64, 0, &out);
+                    b.log_text(&format!("prompts/{label}"), step_num as u64, ptext);
+                }
             }
         }
 
@@ -1372,22 +1422,29 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.sample_every > 0 || !args.sample_prompt.is_empty() {
-        let out = args
-            .output_dir
-            .join(format!("sample_step{}_FINAL.png", args.steps));
-        if let Err(e) = inline_sample(
-            &mut model,
-            &args.sample_prompt,
-            args.sample_vae.as_deref(),
-            &out,
-            args.sample_size,
-            args.sample_steps,
-            args.sample_cfg,
-            args.sample_seed,
-            args.fps,
-            &device,
-        ) {
-            log::warn!("[sample final] failed: {e}");
+        // Final sample: render EVERY config-driven prompt.
+        for (label, ptext) in &sample_set {
+            let out = args
+                .output_dir
+                .join(format!("sample_step{}_FINAL_{label}.png", args.steps));
+            log::info!("[sample FINAL step={} {label}] → {}", args.steps, out.display());
+            if let Err(e) = inline_sample(
+                &mut model,
+                ptext,
+                args.sample_vae.as_deref(),
+                &out,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_seed,
+                args.fps,
+                &device,
+            ) {
+                log::warn!("[sample final {label}] failed: {e}");
+            } else if let Some(b) = &board {
+                b.log_image_png(&format!("samples/{label}"), args.steps as u64, 0, &out);
+                b.log_text(&format!("prompts/{label}"), args.steps as u64, ptext);
+            }
         }
     }
 

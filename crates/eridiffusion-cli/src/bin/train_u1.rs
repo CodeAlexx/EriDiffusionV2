@@ -31,6 +31,7 @@ use tokenizers::{AddedToken, Tokenizer};
 
 use eridiffusion_core::models::sensenova_u1::{self, SenseNovaU1};
 use eridiffusion_core::models::sensenova_u1_lora as u1lora;
+use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 
 const SEED_DEFAULT: u64 = 42;
@@ -582,6 +583,62 @@ fn main() -> anyhow::Result<()> {
         args.grad_accum,
     );
 
+    // ---- SerenityBoard writer --------------------------------------------
+    // Resolve the board output directory: prefer the explicit `--board-dir`,
+    // else fall back to the parent of `--lora-save-to` / `--save-to` so the
+    // board.db lands next to the checkpoints, else skip (no board). board.db
+    // is written under the resolved directory by `BoardWriter::open`.
+    let board_dir: Option<PathBuf> = args.board_dir.clone().or_else(|| {
+        args.lora_save_to
+            .as_ref()
+            .or(args.save_to.as_ref())
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .filter(|d| !d.as_os_str().is_empty())
+    });
+    let board = if let Some(dir) = board_dir.as_ref() {
+        BoardWriter::open(
+            dir,
+            BoardWriter::new_session_id(),
+            if resume_step > 0 { Some(resume_step as u64) } else { None },
+        )
+        .map_err(|e| log::warn!("board.db open failed: {e}"))
+        .ok()
+    } else {
+        log::info!(
+            "[train_u1] no --board-dir and no save path with a parent dir — \
+             SerenityBoard logging disabled"
+        );
+        None
+    };
+    if let Some(b) = &board {
+        log::info!("[train_u1] SerenityBoard writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde dep here). LoRA
+        // rank/alpha are per-spec on U1 (no single scalar), so we report the
+        // spec count + the preset/spec string instead of one rank value.
+        let lora_desc = args
+            .lora_preset
+            .clone()
+            .or_else(|| args.lora_spec.clone())
+            .unwrap_or_else(|| if use_lora { "spec".into() } else { "none".into() });
+        let mode = if use_lora {
+            "lora"
+        } else if use_unfreeze {
+            "unfreeze"
+        } else {
+            "mvp"
+        };
+        let hparams_json = format!(
+            "{{\"model\":\"sensenova-u1\",\"steps\":{},\"lr\":{},\"optimizer\":\"{}\",\
+             \"seed\":{},\"batch_size\":{},\"grad_accum\":{},\"image_hw\":{},\
+             \"mode\":\"{}\",\"lora\":\"{}\",\"resume_step\":{},\"trainable_params\":{}}}",
+            args.steps, args.lr, opt_kind.as_str(), args.seed,
+            1, args.grad_accum, args.image_hw, mode, lora_desc, resume_step,
+            params.len(),
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
+    }
+
     // ---- Geometry --------------------------------------------------------
     let (p, merge, fm_dim, t_eps, bos_id, add_ns_embed, ns_max, ns_base_seq, ns_value) = {
         let cfg = model.config();
@@ -942,7 +999,7 @@ fn main() -> anyhow::Result<()> {
             grad_norm,
             args.lr,
             t_run,
-            None, // BoardWriter — wired in follow-up
+            board.as_ref(),
         );
         // t value for diagnostic (loss varies massively with t at single-
         // step granularity; the rolling mean is the real signal).
@@ -1043,6 +1100,10 @@ fn main() -> anyhow::Result<()> {
             tensors.len(),
             path.display()
         );
+    }
+
+    if let Some(b) = &board {
+        b.set_status("completed");
     }
 
     Ok(())

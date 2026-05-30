@@ -24,7 +24,7 @@ use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::{
     caption_dropout, ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers,
-    timestep_bias, validation::ValidationLoop,
+    sample_library::SampleLibrary, timestep_bias, validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::timestep_dist::{
     TimestepConfig, TimestepDistribution,
@@ -434,9 +434,8 @@ fn main() -> anyhow::Result<()> {
     if !args.multi_backend_cache_dirs.is_empty() || !args.multi_backend_weights.is_empty() {
         log::warn!("--multi-backend-* flags are Klein-only in Phase 2; ignored here");
     }
-    if args.validation_prompts_file.is_some() {
-        log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
-    }
+    // `--validation-prompts-file` is now consumed below for config-driven
+    // sampling (see `sample_set`); no longer a no-op warn for this trainer.
     if args.masked_loss_weight > 0.0 {
         log::warn!(
             "[masked-loss] --masked-loss-weight={:.3} requested but Qwen-Image's prepare_qwenimage cache schema has no `latent_mask` field; flag is a no-op for this trainer.",
@@ -463,6 +462,15 @@ fn main() -> anyhow::Result<()> {
     // So pre-encode prompts NOW (TE only resident on GPU), drop the TE, then
     // load DiT into the freed memory. Mirrors train_ernie with order swapped.
     let periodic_sample = args.sample_every > 0;
+    // Config-driven sample set. When `--validation-prompts-file` is present,
+    // EVERY prompt (prompt + per-prompt negative) is encoded here and rendered
+    // at each checkpoint AND final. Otherwise we fall back to the single/dual
+    // --sample-prompt-N path below. (train_qwenimage is fully CLI-driven — it
+    // does not load a TrainConfig — so there is no config fallback source.)
+    // Each entry: (label "p{i+1}", encoded cap, encoded uncond opt).
+    let prompts_file = args.validation_prompts_file.clone();
+    // (label "p{i+1}", prompt text, encoded cap, encoded uncond opt).
+    let mut sample_set: Vec<(String, String, Tensor, Option<Tensor>)> = Vec::new();
     let (sample_cond_1, sample_cond_2, sample_uncond, sample_vae_path) = if periodic_sample {
         let te_path = args
             .sample_text_encoder
@@ -530,6 +538,35 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         };
+        // Config-driven set: encode every (prompt, negative) pair from the
+        // prompts file while the text encoder is still resident. Per-prompt
+        // negative encoded only when CFG > 1.0 (mirrors uncond gating above).
+        if let Some(ref pf) = prompts_file {
+            let lib = SampleLibrary::from_file(pf)?;
+            log::info!(
+                "[sample-setup] {} config-driven prompt(s) from {}",
+                lib.len(),
+                pf.display()
+            );
+            for (i, p) in lib.prompts.iter().enumerate() {
+                let label = format!("p{}", i + 1);
+                let cap = encode_one(&p.prompt)?;
+                let unc = if args.sample_cfg > 1.0 {
+                    Some(encode_one(&p.negative)?)
+                } else {
+                    None
+                };
+                log::info!("[sample-setup] {label} encoded cap={:?}", cap.shape().dims());
+                sample_set.push((label, p.prompt.clone(), cap, unc));
+            }
+        }
+        // Fallback when no prompts file: render the two --sample-prompt-N
+        // entries (preserves prior behaviour). The step-0 baseline path still
+        // uses cond_1/cond_2 directly from the returned tuple.
+        if sample_set.is_empty() {
+            sample_set.push(("p1".into(), p1.clone(), cond_1.clone(), uncond.clone()));
+            sample_set.push(("p2".into(), p2.clone(), cond_2.clone(), uncond.clone()));
+        }
         log::info!(
             "[sample-setup] dropping text encoder; cond_1={:?} cond_2={:?}{}",
             cond_1.shape().dims(),
@@ -925,6 +962,17 @@ fn main() -> anyhow::Result<()> {
     .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"qwenimage\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"warmup_steps\":{},\"batch_size\":{},\"optimizer\":\"{}\",\"timestep_shift\":{},\
+             \"sample_size\":{},\"sample_steps\":{},\"sample_cfg\":{},\"seed\":{}}}",
+            args.steps, args.rank, args.lora_alpha, args.lr, args.warmup_steps,
+            1, opt_kind.as_str(), shift,
+            args.sample_size, args.sample_steps, args.sample_cfg, args.seed
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     let t_start = std::time::Instant::now();
 
@@ -1228,9 +1276,10 @@ fn main() -> anyhow::Result<()> {
 
         let step_num = step + 1;
         let _ = total_loss;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "QwenImage-lora",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             cache_files.len(),
             1,
@@ -1384,19 +1433,19 @@ fn main() -> anyhow::Result<()> {
         // Periodic in-loop sample: both prompts at 512² (1024² would need
         // activation pool teardown, which is unsafe mid-training).
         if periodic_sample && step_num % args.sample_every == 0 && step_num < args.steps {
-            let cond_1 = sample_cond_1.as_ref().unwrap();
-            let cond_2 = sample_cond_2.as_ref().unwrap();
-            let uncond = sample_uncond.as_ref();
             let vae_path = sample_vae_path.as_ref().unwrap();
-            for (idx, cond) in [cond_1, cond_2].iter().enumerate() {
+            // Render EVERY config-driven prompt in `sample_set` (loaded from the
+            // prompts file, or the --sample-prompt-N fallback). Each →
+            // sample_step{N}_{label}.png + board image/text.
+            for (label, ptext, cond, unc) in &sample_set {
                 let out_path = args
                     .output_dir
-                    .join(format!("sample_step{}_p{}.png", step_num, idx + 1));
-                log::info!("[sample step={} p{}] → {}", step_num, idx + 1, out_path.display());
+                    .join(format!("sample_step{}_{label}.png", step_num));
+                log::info!("[sample step={} {label}] → {}", step_num, out_path.display());
                 if let Err(e) = qwenimage_inline_sample(
                     &mut model,
                     cond,
-                    uncond,
+                    unc.as_ref(),
                     vae_path,
                     &out_path,
                     512,
@@ -1405,7 +1454,10 @@ fn main() -> anyhow::Result<()> {
                     args.sample_seed,
                     &device,
                 ) {
-                    log::warn!("[sample step={} p{}] failed: {e}", step_num, idx + 1);
+                    log::warn!("[sample step={} {label}] failed: {e}", step_num);
+                } else if let Some(b) = &board {
+                    b.log_image_png(&format!("samples/{label}"), step_num as u64, 0, &out_path);
+                    b.log_text(&format!("prompts/{label}"), step_num as u64, ptext);
                 }
                 flame_core::cuda_alloc_pool::clear_pool_cache();
                 flame_core::trim_cuda_mempool(0);
@@ -1455,24 +1507,21 @@ fn main() -> anyhow::Result<()> {
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
 
-        let cond_1 = sample_cond_1.as_ref().unwrap();
-        let cond_2 = sample_cond_2.as_ref().unwrap();
-        let uncond = sample_uncond.as_ref();
         let vae_path = sample_vae_path.as_ref().unwrap();
-        for (idx, cond) in [cond_1, cond_2].iter().enumerate() {
+        // Final sample: render EVERY config-driven prompt at full --sample-size.
+        for (label, ptext, cond, unc) in &sample_set {
             let out_path =
                 args.output_dir
-                    .join(format!("sample_step{}_final_p{}.png", args.steps, idx + 1));
+                    .join(format!("sample_step{}_final_{label}.png", args.steps));
             log::info!(
-                "[sample FINAL step={} p{}] → {}",
+                "[sample FINAL step={} {label}] → {}",
                 args.steps,
-                idx + 1,
                 out_path.display()
             );
             if let Err(e) = qwenimage_inline_sample(
                 &mut model,
                 cond,
-                uncond,
+                unc.as_ref(),
                 vae_path,
                 &out_path,
                 args.sample_size,
@@ -1481,7 +1530,10 @@ fn main() -> anyhow::Result<()> {
                 args.sample_seed,
                 &device,
             ) {
-                log::warn!("[sample FINAL p{}] failed: {e}", idx + 1);
+                log::warn!("[sample FINAL {label}] failed: {e}");
+            } else if let Some(b) = &board {
+                b.log_image_png(&format!("samples/{label}"), args.steps as u64, 0, &out_path);
+                b.log_text(&format!("prompts/{label}"), args.steps as u64, ptext);
             }
             flame_core::cuda_alloc_pool::clear_pool_cache();
             flame_core::trim_cuda_mempool(0);

@@ -636,6 +636,15 @@ fn main() -> anyhow::Result<()> {
     .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"flux\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"batch_size\":{},\"optimizer\":\"{}\",\"timestep_shift\":{},\"seed\":{}}}",
+            args.steps, args.rank, args.lora_alpha, args.lr,
+            1, opt_kind.as_str(), args.timestep_shift, SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
@@ -918,9 +927,10 @@ fn main() -> anyhow::Result<()> {
         model.post_optimizer_step();
 
         let _ = total_loss;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "FLUX.1-lora",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             cache_files.len(),
             1,

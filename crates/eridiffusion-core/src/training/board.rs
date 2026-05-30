@@ -271,6 +271,115 @@ impl BoardWriter {
         }
     }
 
+    /// Content-addressed blobs directory: `<run_dir>/blobs/` (sibling of
+    /// board.db), matching serenityboard `SummaryWriter` convention
+    /// (summary_writer.py:147 `BlobStorage(run_dir/blobs)`).
+    fn blobs_dir(&self) -> PathBuf {
+        self.db_path
+            .parent()
+            .map(|p| p.join("blobs"))
+            .unwrap_or_else(|| PathBuf::from("blobs"))
+    }
+
+    /// Store `bytes` content-addressed and return the blob_key. Key format
+    /// mirrors `BlobStorage.store`: 16 lowercase-hex chars + "." + extension.
+    /// We hash with the std hasher (not sha256 — no crypto needed; the board
+    /// UI just maps blob_key → `blobs/<blob_key>`), widened to 16 hex chars.
+    fn store_blob(&self, bytes: &[u8], extension: &str) -> std::io::Result<String> {
+        use std::hash::{Hash, Hasher};
+        let mut h1 = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h1);
+        let mut h2 = std::collections::hash_map::DefaultHasher::new();
+        0x9e3779b97f4a7c15u64.hash(&mut h2);
+        bytes.hash(&mut h2);
+        let key = format!("{:08x}{:08x}.{}", (h1.finish() as u32), (h2.finish() as u32), extension);
+        let dir = self.blobs_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(&key);
+        if !path.exists() {
+            let tmp = dir.join(format!("{key}.tmp"));
+            std::fs::write(&tmp, bytes)?;
+            std::fs::rename(&tmp, &path)?;
+        }
+        Ok(key)
+    }
+
+    /// Log an image artifact from a PNG file on disk. Stores the PNG bytes in
+    /// the content-addressed blob store and inserts an `artifacts` row
+    /// (kind='image', mime='image/png') the dashboard renders in its gallery.
+    /// `seq_index` lets multiple images share a (tag, step) — e.g. one per
+    /// sample prompt. Width/height parsed from the PNG IHDR header.
+    pub fn log_image_png(&self, tag: &str, step: u64, seq_index: i64, png_path: &Path) {
+        let bytes = match std::fs::read(png_path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        // PNG IHDR: width = bytes[16..20] BE, height = bytes[20..24] BE.
+        let (w, h) = if bytes.len() >= 24 && &bytes[1..4] == b"PNG" {
+            let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as i64;
+            let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) as i64;
+            (Some(w), Some(h))
+        } else {
+            (None, None)
+        };
+        let key = match self.store_blob(&bytes, "png") {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let wall = unix_now();
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO artifacts (tag, step, seq_index, wall_time, kind, mime_type, blob_key, width, height, meta) \
+                 VALUES (?, ?, ?, ?, 'image', 'image/png', ?, ?, ?, '{}')",
+                params![tag, step as i64, seq_index, wall, key, w, h],
+            );
+        }
+    }
+
+    /// Log a text event (e.g. a sample prompt, a milestone note). Mirrors
+    /// `SummaryWriter.add_text` → `text_events`.
+    pub fn log_text(&self, tag: &str, step: u64, text: &str) {
+        let wall = unix_now();
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO text_events (tag, step, wall_time, value) VALUES (?, ?, ?, ?)",
+                params![tag, step as i64, wall, text],
+            );
+        }
+    }
+
+    /// Log run hyper-parameters (as a JSON object string in `metadata.hparams`)
+    /// plus associated summary metrics into `hparam_metrics`. Mirrors
+    /// `SummaryWriter.add_hparams`.
+    pub fn log_hparams(&self, hparams_json: &str, metrics: &[(&str, f64)]) {
+        let wall = unix_now();
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('hparams', ?)",
+                params![hparams_json],
+            );
+            for (tag, value) in metrics {
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO hparam_metrics (metric_tag, value, step, wall_time) VALUES (?, ?, NULL, ?)",
+                    params![tag, value, wall],
+                );
+            }
+        }
+    }
+
+    /// Log a trace/timing event (forward, backward, optimizer, data_prep, …)
+    /// into `trace_events`. Mirrors `SummaryWriter.add_trace`. `details_json`
+    /// must be a valid JSON object string (use "{}" if none).
+    pub fn log_trace(&self, step: u64, phase: &str, duration_ms: f64, details_json: &str) {
+        let wall = unix_now();
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO trace_events (step, wall_time, phase, duration_ms, details) VALUES (?, ?, ?, ?, ?)",
+                params![step as i64, wall, phase, duration_ms, details_json],
+            );
+        }
+    }
+
     /// Update the session row's status. SerenityBoard schema constrains
     /// `status` to `running|complete|crashed`. We accept the colloquial
     /// "completed"/"failed" too and translate.

@@ -1066,6 +1066,15 @@ fn main() -> anyhow::Result<()> {
         .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"hidream_o1\",\"steps\":{},\"start_step\":{},\"rank\":{},\
+             \"lora_alpha\":{},\"lr\":{},\"optimizer\":\"{}\",\"flow_shift\":{},\"seed\":{}}}",
+            args.steps, start_step, args.rank, args.lora_alpha, args.lr,
+            opt_kind.as_str(), args.flow_shift, SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", (start_step + args.steps) as f64)]);
     }
 
     let t_start = std::time::Instant::now();
@@ -1414,9 +1423,10 @@ fn main() -> anyhow::Result<()> {
         flame_core::cuda_alloc_pool::clear_pool_cache();
 
         let step_num = step + 1;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "HiDreamO1-lora",
-            step,
+            local_step,
+            start_step,
             total_target_steps,
             cache_files.len(),
             1,

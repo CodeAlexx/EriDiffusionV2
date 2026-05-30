@@ -516,6 +516,17 @@ fn main() -> anyhow::Result<()> {
     .ok();
     if let Some(b) = &board {
         log::info!("[3/5] SerenityBoard writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"l2p\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"batch_size\":{},\"optimizer\":\"{}\",\"seed\":{},\"resolution\":{},\
+             \"clip_grad_norm\":{},\"start_step\":{},\"grad_checkpoint\":{}}}",
+            args.steps, args.lora_rank, args.lora_alpha, args.lr,
+            1, opt_kind.as_str(), args.seed, args.resolution,
+            args.clip_grad_norm, args.start_step, args.grad_checkpoint,
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     // The `--log-db` flag is preserved for forward-compat; BoardWriter::open
     // currently picks the path under `--output`. Surface a warning if the

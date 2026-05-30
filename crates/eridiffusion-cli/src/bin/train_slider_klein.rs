@@ -407,18 +407,44 @@ fn main() -> anyhow::Result<()> {
     );
     log::info!("[slider-setup] slider_scale={}", args.slider_scale);
 
-    let (sample_cap, sample_uncond, sample_vae_path) = if periodic {
+    // Config-driven sample set. Prompts come from the validation_prompts_file
+    // (CLI override OR config.validation_prompts_file), NOT hardcoded. Falls
+    // back to the single --sample-prompt only if no prompts file is given.
+    // Each entry: (label, encoded caption, encoded uncond). Qwen3 is already
+    // resident here (loaded above for the slider prompts), so we encode every
+    // prompt in the same lifetime before it is dropped.
+    let prompts_file = args
+        .validation_prompts_file
+        .clone()
+        .or_else(|| config.validation_prompts_file.clone());
+    // Each entry: (label, prompt_text, encoded caption, encoded uncond).
+    let mut sample_set: Vec<(String, String, flame_core::Tensor, flame_core::Tensor)> = Vec::new();
+    let sample_vae_path = if periodic {
         let vae_path = args.sample_vae.as_ref().unwrap().clone();
-        let cap = klein_encode_prompt(&qwen, &tok, &args.sample_prompt)?;
-        let unc = klein_encode_prompt(&qwen, &tok, &args.sample_neg_prompt)?;
-        log::info!(
-            "[sample-setup] cap={:?} uncond={:?}",
-            cap.shape().dims(),
-            unc.shape().dims()
-        );
-        (Some(cap), Some(unc), Some(vae_path))
+        let prompt_list: Vec<(String, String, String)> = if let Some(ref pf) = prompts_file {
+            let lib = SampleLibrary::from_file(pf)?;
+            log::info!("[sample-setup] {} prompt(s) from {}", lib.len(), pf.display());
+            lib.prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("p{}", i + 1), p.prompt.clone(), p.negative.clone()))
+                .collect()
+        } else {
+            vec![(
+                "p1".into(),
+                args.sample_prompt.clone(),
+                args.sample_neg_prompt.clone(),
+            )]
+        };
+        for (label, ptext, ntext) in &prompt_list {
+            let cap = klein_encode_prompt(&qwen, &tok, ptext)?;
+            let unc = klein_encode_prompt(&qwen, &tok, ntext)?;
+            log::info!("[sample-setup] {label} encoded cap={:?}", cap.shape().dims());
+            sample_set.push((label.clone(), ptext.clone(), cap, unc));
+        }
+        Some(vae_path)
     } else {
-        (None, None, None)
+        None
     };
     drop(qwen);
     flame_core::cuda_alloc_pool::clear_pool_cache();
@@ -649,21 +675,8 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Phase 2: optional sample-prompt library. When None, the trainer falls
-    // back to the single `--sample-prompt` / `--sample-seed` path that's been
-    // running since Phase 1.
-    let sample_library: Option<SampleLibrary> =
-        if let Some(p) = args.validation_prompts_file.as_ref() {
-            let lib = SampleLibrary::from_file(p)?;
-            log::info!(
-                "[sample-library] loaded {} prompt(s) from {}",
-                lib.len(),
-                p.display()
-            );
-            Some(lib)
-        } else {
-            None
-        };
+    // Sample-prompt library is consumed at startup into `sample_set` (every
+    // prompt encoded while Qwen3 was resident); no second load needed here.
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
@@ -687,6 +700,17 @@ fn main() -> anyhow::Result<()> {
     .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"klein-slider\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"warmup_steps\":{},\"batch_size\":{},\"optimizer\":\"{}\",\"timestep_shift\":{},\
+             \"slider_scale\":{},\"sample_size\":{},\"sample_steps\":{},\"sample_cfg\":{},\"seed\":{},\"offload\":{}}}",
+            args.steps, args.rank, args.lora_alpha, args.lr, args.warmup_steps,
+            args.batch_size, args.optimizer, config.timestep_shift,
+            args.slider_scale, args.sample_size, args.sample_steps, args.sample_cfg, SEED, args.offload
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
 
     // Phase 7: optional GPU health monitor. Spawned lazily — when the flag is
@@ -1076,9 +1100,10 @@ fn main() -> anyhow::Result<()> {
         AutogradContext::clear();
 
         let _ = total_loss;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "Klein-slider-lora",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             dataset_len,
             args.batch_size.max(1),
@@ -1165,44 +1190,17 @@ fn main() -> anyhow::Result<()> {
                 avg_so_far,
                 loss_val,
             );
-            // Phase 2: validation prompts library. Constraint: the inline
-            // sample path uses PRE-ENCODED `sample_cap`/`sample_uncond`
-            // tensors because re-loading Qwen3 8B at each sample step would
-            // OOM Klein 9B on 24 GB (see sample-setup comment). So we keep
-            // the existing single primary prompt encoding, but iterate the
-            // multi-SEED sweep when the library specifies seeds. Multi-PROMPT
-            // requires deferring Qwen3 encode-on-demand, which is a follow-up.
-            let cap = sample_cap.as_ref().unwrap();
-            let unc = sample_uncond.as_ref().unwrap();
+            // Render every config-driven prompt in `sample_set` (loaded from
+            // the prompts file, or the single --sample-prompt fallback). Each
+            // → sample_step{N}_{label}.png + board image/text. Qwen3 was
+            // already dropped after startup encoding, so all prompts were
+            // pre-encoded into `sample_set` while it was resident.
             let vae_path = sample_vae_path.as_ref().unwrap();
-            let mut seeds_to_render: Vec<u64> = vec![args.sample_seed];
-            if let Some(ref lib) = sample_library {
-                // Use the FIRST library entry's seed sweep against the
-                // existing primary cap/uncond. Per-prompt encoding deferred.
-                if let Some(first) = lib.prompts.first() {
-                    if !first.seeds.is_empty() {
-                        seeds_to_render = first.seeds.clone();
-                    }
-                }
-                if lib.prompts.len() > 1 {
-                    log::info!(
-                        "[sample-library] {} prompts loaded but only the first prompt's seed-sweep ({} seeds) is rendered: per-prompt encoding requires reloading Qwen3 (deferred follow-up)",
-                        lib.prompts.len(),
-                        seeds_to_render.len()
-                    );
-                }
-            }
-            for (si, seed) in seeds_to_render.iter().enumerate() {
-                let sample_out = if seeds_to_render.len() == 1 {
-                    args.output_dir.join(format!("sample_step{step_num}.png"))
-                } else {
-                    args.output_dir
-                        .join(format!("sample_step{step_num}_seed{si}.png"))
-                };
-                log::info!(
-                    "[sample step={step_num} seed={seed}] → {}",
-                    sample_out.display()
-                );
+            for (label, ptext, cap, unc) in &sample_set {
+                let sample_out = args
+                    .output_dir
+                    .join(format!("sample_step{step_num}_{label}.png"));
+                log::info!("[sample step={step_num} {label}] → {}", sample_out.display());
                 if let Err(e) = klein_inline_sample(
                     &mut model,
                     cap,
@@ -1212,10 +1210,13 @@ fn main() -> anyhow::Result<()> {
                     args.sample_size,
                     args.sample_steps,
                     args.sample_cfg,
-                    *seed,
+                    args.sample_seed,
                     &device,
                 ) {
-                    log::warn!("[sample step={step_num} seed={seed}] failed: {e}");
+                    log::warn!("[sample step={step_num} {label}] failed: {e}");
+                } else if let Some(b) = &board {
+                    b.log_image_png(&format!("samples/{label}"), step_num as u64, 0, &sample_out);
+                    b.log_text(&format!("prompts/{label}"), step_num as u64, ptext);
                 }
             }
         }
@@ -1294,32 +1295,35 @@ fn main() -> anyhow::Result<()> {
         avg_loss,
     );
 
-    // ── Final sample at the end of training ──────────────────────────────
+    // ── Final sample at the end of training (all config-driven prompts) ───
     if periodic {
-        let cap = sample_cap.as_ref().unwrap();
-        let unc = sample_uncond.as_ref().unwrap();
         let vae_path = sample_vae_path.as_ref().unwrap();
-        let sample_out = args
-            .output_dir
-            .join(format!("sample_step{}.png", args.steps));
-        log::info!(
-            "[sample step={} FINAL] → {}",
-            args.steps,
-            sample_out.display()
-        );
-        if let Err(e) = klein_inline_sample(
-            &mut model,
-            cap,
-            unc,
-            vae_path,
-            &sample_out,
-            args.sample_size,
-            args.sample_steps,
-            args.sample_cfg,
-            args.sample_seed,
-            &device,
-        ) {
-            log::warn!("[sample final] failed: {e}");
+        for (label, ptext, cap, unc) in &sample_set {
+            let sample_out = args
+                .output_dir
+                .join(format!("sample_step{}_{label}.png", args.steps));
+            log::info!(
+                "[sample step={} FINAL {label}] → {}",
+                args.steps,
+                sample_out.display()
+            );
+            if let Err(e) = klein_inline_sample(
+                &mut model,
+                cap,
+                unc,
+                vae_path,
+                &sample_out,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_seed,
+                &device,
+            ) {
+                log::warn!("[sample final {label}] failed: {e}");
+            } else if let Some(b) = &board {
+                b.log_image_png(&format!("samples/{label}"), args.steps as u64, 0, &sample_out);
+                b.log_text(&format!("prompts/{label}"), args.steps as u64, ptext);
+            }
         }
     }
     Ok(())

@@ -32,7 +32,8 @@ use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{
-    loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop,
+    loss_weight, lr_schedule, noise_modifiers, sample_library::SampleLibrary, timestep_bias,
+    validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::timestep_dist::{
     TimestepConfig, TimestepDistribution,
@@ -737,9 +738,8 @@ fn main() -> anyhow::Result<()> {
     if !args.multi_backend_cache_dirs.is_empty() || !args.multi_backend_weights.is_empty() {
         log::warn!("--multi-backend-* flags are Klein-only in Phase 2; ignored here");
     }
-    if args.validation_prompts_file.is_some() {
-        log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
-    }
+    // `--validation-prompts-file` is now consumed below for config-driven
+    // sampling (see `sample_set`); no longer a no-op warn for this trainer.
     std::fs::create_dir_all(&args.output_dir)?;
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
@@ -1069,6 +1069,17 @@ fn main() -> anyhow::Result<()> {
 
     // ── Periodic-sample setup ────────────────────────────────────────────
     let periodic = args.sample_every > 0;
+    // Config-driven sample set. When a prompts file (CLI override OR
+    // config.validation_prompts_file) is present, EVERY prompt (prompt +
+    // per-prompt negative) is encoded here while the text encoders are
+    // resident, and rendered at each checkpoint AND final. Otherwise we fall
+    // back to the single --sample-prompt path. Each entry:
+    // (label "p{i+1}", prompt text, cap, pooled, neg_context, neg_pooled).
+    let prompts_file = args
+        .validation_prompts_file
+        .clone()
+        .or_else(|| config.validation_prompts_file.clone());
+    let mut sample_set: Vec<(String, String, Tensor, Tensor, Tensor, Tensor)> = Vec::new();
     let (sample_cap, sample_uncond, sample_pooled, sample_neg_pooled, sample_vae_path) =
         if periodic {
             let clip_l_p = args
@@ -1148,6 +1159,40 @@ fn main() -> anyhow::Result<()> {
                 cap.dims(),
                 pool.dims()
             );
+            // Config-driven set: encode every (prompt, negative) pair from the
+            // prompts file while the text encoders are still resident.
+            if let Some(ref pf) = prompts_file {
+                let lib = SampleLibrary::from_file(pf)?;
+                log::info!(
+                    "[sample-setup] {} config-driven prompt(s) from {}",
+                    lib.len(),
+                    pf.display()
+                );
+                for (i, sp) in lib.prompts.iter().enumerate() {
+                    let label = format!("p{}", i + 1);
+                    let (c, pl) = encode_sd3_prompt(
+                        &sp.prompt, &clip_l, &clip_g, &mut t5, &tok_l, &tok_g, &tok_t5,
+                        args.sample_t5_max_len, &device,
+                    )?;
+                    let (nc, npl) = encode_sd3_prompt(
+                        &sp.negative, &clip_l, &clip_g, &mut t5, &tok_l, &tok_g, &tok_t5,
+                        args.sample_t5_max_len, &device,
+                    )?;
+                    log::info!("[sample-setup] {label} encoded cap={:?}", c.dims());
+                    sample_set.push((label, sp.prompt.clone(), c, pl, nc, npl));
+                }
+            }
+            // Fallback when no prompts file: render the single --sample-prompt.
+            if sample_set.is_empty() {
+                sample_set.push((
+                    "p1".into(),
+                    args.sample_prompt.clone(),
+                    cap.clone(),
+                    pool.clone(),
+                    unc.clone(),
+                    npool.clone(),
+                ));
+            }
             drop(clip_l);
             drop(clip_g);
             drop(t5);
@@ -1203,6 +1248,17 @@ fn main() -> anyhow::Result<()> {
     .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"sd35\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"warmup_steps\":{},\"batch_size\":{},\"optimizer\":\"{}\",\"timestep_shift\":{},\
+             \"sample_size\":{},\"sample_steps\":{},\"sample_cfg\":{},\"seed\":{}}}",
+            args.steps, args.rank, args.lora_alpha, args.lr, args.warmup_steps,
+            args.batch_size, opt_kind.as_str(), args.timestep_shift,
+            args.sample_size, args.sample_steps, args.sample_cfg, SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
@@ -1528,9 +1584,10 @@ fn main() -> anyhow::Result<()> {
         AutogradContext::clear();
 
         let _ = total_loss;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "SD3.5-lora",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             cache_files.len(),
             args.batch_size.max(1),
@@ -1715,29 +1772,35 @@ fn main() -> anyhow::Result<()> {
 
         // Inline sample (independent of save).
         if periodic && step_num % args.sample_every == 0 && step_num < args.steps {
-            let cap = sample_cap.as_ref().unwrap();
-            let unc = sample_uncond.as_ref().unwrap();
-            let pool = sample_pooled.as_ref().unwrap();
-            let npool = sample_neg_pooled.as_ref().unwrap();
             let vae_p = sample_vae_path.as_ref().unwrap();
-            let out_path = args.output_dir.join(format!("sample_step{step_num}.png"));
-            log::info!("[sample step={step_num}] → {}", out_path.display());
-            if let Err(e) = inline_sample(
-                &mut model,
-                cap,
-                pool,
-                unc,
-                npool,
-                vae_p,
-                &out_path,
-                args.sample_size,
-                args.sample_steps,
-                args.sample_cfg,
-                args.sample_shift,
-                args.sample_seed,
-                &device,
-            ) {
-                log::warn!("[sample step={step_num}] failed: {e}");
+            // Render EVERY config-driven prompt in `sample_set` (loaded from the
+            // prompts file, or the --sample-prompt fallback). Each →
+            // sample_step{N}_{label}.png + board image/text.
+            for (label, ptext, cap, pool, unc, npool) in &sample_set {
+                let out_path = args
+                    .output_dir
+                    .join(format!("sample_step{step_num}_{label}.png"));
+                log::info!("[sample step={step_num} {label}] → {}", out_path.display());
+                if let Err(e) = inline_sample(
+                    &mut model,
+                    cap,
+                    pool,
+                    unc,
+                    npool,
+                    vae_p,
+                    &out_path,
+                    args.sample_size,
+                    args.sample_steps,
+                    args.sample_cfg,
+                    args.sample_shift,
+                    args.sample_seed,
+                    &device,
+                ) {
+                    log::warn!("[sample step={step_num} {label}] failed: {e}");
+                } else if let Some(b) = &board {
+                    b.log_image_png(&format!("samples/{label}"), step_num as u64, 0, &out_path);
+                    b.log_text(&format!("prompts/{label}"), step_num as u64, ptext);
+                }
             }
         }
         if let (Some(backup), Some(ref e)) = (ema_backup, &ema) {
@@ -1811,35 +1874,37 @@ fn main() -> anyhow::Result<()> {
     }
 
     if periodic {
-        let cap = sample_cap.as_ref().unwrap();
-        let unc = sample_uncond.as_ref().unwrap();
-        let pool = sample_pooled.as_ref().unwrap();
-        let npool = sample_neg_pooled.as_ref().unwrap();
         let vae_p = sample_vae_path.as_ref().unwrap();
-        let out_path = args
-            .output_dir
-            .join(format!("sample_step{}.png", args.steps));
-        log::info!(
-            "[sample FINAL step={}] → {}",
-            args.steps,
-            out_path.display()
-        );
-        if let Err(e) = inline_sample(
-            &mut model,
-            cap,
-            pool,
-            unc,
-            npool,
-            vae_p,
-            &out_path,
-            args.sample_size,
-            args.sample_steps,
-            args.sample_cfg,
-            args.sample_shift,
-            args.sample_seed,
-            &device,
-        ) {
-            log::warn!("[sample final] failed: {e}");
+        // Final sample: render EVERY config-driven prompt.
+        for (label, ptext, cap, pool, unc, npool) in &sample_set {
+            let out_path = args
+                .output_dir
+                .join(format!("sample_step{}_{label}.png", args.steps));
+            log::info!(
+                "[sample FINAL step={} {label}] → {}",
+                args.steps,
+                out_path.display()
+            );
+            if let Err(e) = inline_sample(
+                &mut model,
+                cap,
+                pool,
+                unc,
+                npool,
+                vae_p,
+                &out_path,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_shift,
+                args.sample_seed,
+                &device,
+            ) {
+                log::warn!("[sample final {label}] failed: {e}");
+            } else if let Some(b) = &board {
+                b.log_image_png(&format!("samples/{label}"), args.steps as u64, 0, &out_path);
+                b.log_text(&format!("prompts/{label}"), args.steps as u64, ptext);
+            }
         }
     }
 

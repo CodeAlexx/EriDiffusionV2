@@ -21,7 +21,8 @@ use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{
-    loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop,
+    loss_weight, lr_schedule, noise_modifiers, sample_library::SampleLibrary, timestep_bias,
+    validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::timestep_dist::{
     TimestepConfig, TimestepDistribution,
@@ -687,7 +688,18 @@ fn main() -> anyhow::Result<()> {
     // Pre-encode cond/uncond prompts ONCE then drop the text encoder from VRAM.
     // VAE is loaded lazily per sample (small, cheap).
     let periodic = args.sample_every > 0;
-    let (sample_cap, sample_uncond, sample_vae_path) = if periodic {
+    // Config-driven sample set. Prompts come from --validation-prompts-file
+    // (CLI) OR config.validation_prompts_file, NOT hardcoded. Falls back to the
+    // single --sample-prompt only if no prompts file is given. Each entry:
+    // (label "p{i+1}", encoded caption, encoded uncond).
+    let prompts_file = args
+        .validation_prompts_file
+        .clone()
+        .or_else(|| config.validation_prompts_file.clone());
+    let mut sample_set: Vec<(String, Tensor, Tensor)> = Vec::new();
+    // Prompt texts kept alive parallel to `sample_set` for board log_text.
+    let mut sample_prompt_texts: Vec<String> = Vec::new();
+    let sample_vae_path = if periodic {
         let te_path = args
             .sample_text_ckpt
             .as_ref()
@@ -703,10 +715,10 @@ fn main() -> anyhow::Result<()> {
             .clone();
         const ERNIE_MAX_LEN: usize = 512;
         const ERNIE_PAD_ID: i32 = 11;
-        log::info!("[sample-setup] encoding prompt + uncond once with Mistral-3B...");
+        log::info!("[sample-setup] encoding sample prompts once with Mistral-3B...");
         let tok = tokenizers::Tokenizer::from_file(tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-        let encode = |text: &str| -> anyhow::Result<Vec<i32>> {
+        let encode_ids = |text: &str| -> anyhow::Result<Vec<i32>> {
             let e = tok.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
             let mut ids: Vec<i32> = e.get_ids().iter().map(|&x| x as i32).collect();
             if ids.len() > ERNIE_MAX_LEN {
@@ -714,54 +726,73 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(ids)
         };
-        let (cond_ids, unc_ids) = (
-            encode(&args.sample_prompt)?,
-            encode(&args.sample_neg_prompt)?,
-        );
+        // Resolve the prompt list: prefer the config/CLI prompts file.
+        let prompt_list: Vec<(String, String, String)> = if let Some(ref pf) = prompts_file {
+            let lib = SampleLibrary::from_file(pf)?;
+            log::info!("[sample-setup] {} prompt(s) from {}", lib.len(), pf.display());
+            lib.prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("p{}", i + 1), p.prompt.clone(), p.negative.clone()))
+                .collect()
+        } else {
+            vec![(
+                "p1".into(),
+                args.sample_prompt.clone(),
+                args.sample_neg_prompt.clone(),
+            )]
+        };
         let te = Mistral3bEncoder::load(te_path.to_str().unwrap(), &device)?;
-        let cap = te.encode_with_pad(&cond_ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
-        let unc = te.encode_with_pad(&unc_ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
-        let cap_len = cond_ids.len().max(1);
-        let unc_len = unc_ids.len().max(1);
-        let cap_trim = cap.narrow(1, 0, cap_len)?.contiguous()?;
-        let unc_trim = unc.narrow(1, 0, unc_len)?.contiguous()?;
-        log::info!(
-            "[sample-setup] cap={:?} uncond={:?}; dropping text encoder",
-            cap_trim.shape().dims(),
-            unc_trim.shape().dims()
-        );
+        for (label, ptext, ntext) in &prompt_list {
+            let cond_ids = encode_ids(ptext)?;
+            let unc_ids = encode_ids(ntext)?;
+            let cap = te.encode_with_pad(&cond_ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
+            let unc = te.encode_with_pad(&unc_ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
+            let cap_len = cond_ids.len().max(1);
+            let unc_len = unc_ids.len().max(1);
+            let cap_trim = cap.narrow(1, 0, cap_len)?.contiguous()?;
+            let unc_trim = unc.narrow(1, 0, unc_len)?.contiguous()?;
+            log::info!(
+                "[sample-setup] {label} cap={:?} uncond={:?}",
+                cap_trim.shape().dims(),
+                unc_trim.shape().dims()
+            );
+            sample_set.push((label.clone(), cap_trim, unc_trim));
+            sample_prompt_texts.push(ptext.clone());
+        }
         drop(te);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
         log::info!(
-            "[sample-setup] periodic sample enabled (every {} steps).",
+            "[sample-setup] {} prompt(s) ready; periodic sample enabled (every {} steps).",
+            sample_set.len(),
             args.sample_every
         );
-        (Some(cap_trim), Some(unc_trim), Some(vae_path))
+        Some(vae_path)
     } else {
-        (None, None, None)
+        None
     };
 
-    // Step-0 baseline sample (LoRA-init = base model output)
+    // Step-0 baseline sample (LoRA-init = base model output) — all prompts.
     if periodic {
-        let cap = sample_cap.as_ref().unwrap();
-        let unc = sample_uncond.as_ref().unwrap();
         let vae_path = sample_vae_path.as_ref().unwrap();
-        let out_path = args.output_dir.join("sample_step0_base.png");
-        log::info!("[sample step=0] BASELINE → {}", out_path.display());
-        if let Err(e) = ernie_inline_sample(
-            &mut model,
-            cap,
-            unc,
-            vae_path,
-            &out_path,
-            args.sample_size,
-            args.sample_steps,
-            args.sample_cfg,
-            args.sample_seed,
-            &device,
-        ) {
-            log::warn!("[sample step=0] failed: {e}");
+        for (label, cap, unc) in &sample_set {
+            let out_path = args.output_dir.join(format!("sample_step0_{label}.png"));
+            log::info!("[sample step=0 {label}] BASELINE → {}", out_path.display());
+            if let Err(e) = ernie_inline_sample(
+                &mut model,
+                cap,
+                unc,
+                vae_path,
+                &out_path,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_seed,
+                &device,
+            ) {
+                log::warn!("[sample step=0 {label}] failed: {e}");
+            }
         }
     }
 
@@ -778,6 +809,25 @@ fn main() -> anyhow::Result<()> {
     .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Run hyper-parameters → metadata.hparams + the dashboard's hparam
+        // panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"ernie\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"batch_size\":{},\"optimizer\":\"{}\",\"timestep_shift\":{},\
+             \"sample_size\":{},\"sample_steps\":{},\"sample_cfg\":{},\"seed\":{}}}",
+            args.steps,
+            args.rank,
+            args.lora_alpha,
+            args.lr,
+            1,
+            opt_kind.as_str(),
+            config.timestep_shift,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
@@ -1063,9 +1113,10 @@ fn main() -> anyhow::Result<()> {
         AutogradContext::clear();
 
         let _ = total_loss;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "ERNIE-lora",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             cache_files.len(),
             1,
@@ -1238,24 +1289,31 @@ fn main() -> anyhow::Result<()> {
             } else {
                 log::info!("[mid-save step {step_num}] {}", mid_ckpt.display());
             }
-            let cap = sample_cap.as_ref().unwrap();
-            let unc = sample_uncond.as_ref().unwrap();
             let vae_path = sample_vae_path.as_ref().unwrap();
-            let sample_out = args.output_dir.join(format!("sample_step{step_num}.png"));
-            log::info!("[sample step={step_num}] → {}", sample_out.display());
-            if let Err(e) = ernie_inline_sample(
-                &mut model,
-                cap,
-                unc,
-                vae_path,
-                &sample_out,
-                args.sample_size,
-                args.sample_steps,
-                args.sample_cfg,
-                args.sample_seed,
-                &device,
-            ) {
-                log::warn!("[sample step={step_num}] failed: {e}");
+            for (idx, (label, cap, unc)) in sample_set.iter().enumerate() {
+                let sample_out = args
+                    .output_dir
+                    .join(format!("sample_step{step_num}_{label}.png"));
+                log::info!("[sample step={step_num} {label}] → {}", sample_out.display());
+                if let Err(e) = ernie_inline_sample(
+                    &mut model,
+                    cap,
+                    unc,
+                    vae_path,
+                    &sample_out,
+                    args.sample_size,
+                    args.sample_steps,
+                    args.sample_cfg,
+                    args.sample_seed,
+                    &device,
+                ) {
+                    log::warn!("[sample step={step_num} {label}] failed: {e}");
+                } else if let Some(b) = &board {
+                    b.log_image_png(&format!("samples/{label}"), step_num as u64, 0, &sample_out);
+                    if let Some(t) = sample_prompt_texts.get(idx) {
+                        b.log_text(&format!("prompts/{label}"), step_num as u64, t);
+                    }
+                }
             }
         }
         if let (Some(backup), Some(ref e)) = (ema_backup, &ema) {
@@ -1328,32 +1386,37 @@ fn main() -> anyhow::Result<()> {
         log::info!("Saved checkpoint to {}", ckpt.display());
     }
 
-    // ── Final sample ───────────────────────────────────────────────────
+    // ── Final sample (all config-driven prompts) ────────────────────────
     if periodic {
-        let cap = sample_cap.as_ref().unwrap();
-        let unc = sample_uncond.as_ref().unwrap();
         let vae_path = sample_vae_path.as_ref().unwrap();
-        let sample_out = args
-            .output_dir
-            .join(format!("sample_step{}.png", args.steps));
-        log::info!(
-            "[sample step={} FINAL] → {}",
-            args.steps,
-            sample_out.display()
-        );
-        if let Err(e) = ernie_inline_sample(
-            &mut model,
-            cap,
-            unc,
-            vae_path,
-            &sample_out,
-            args.sample_size,
-            args.sample_steps,
-            args.sample_cfg,
-            args.sample_seed,
-            &device,
-        ) {
-            log::warn!("[sample final] failed: {e}");
+        for (idx, (label, cap, unc)) in sample_set.iter().enumerate() {
+            let sample_out = args
+                .output_dir
+                .join(format!("sample_step{}_{label}.png", args.steps));
+            log::info!(
+                "[sample step={} FINAL {label}] → {}",
+                args.steps,
+                sample_out.display()
+            );
+            if let Err(e) = ernie_inline_sample(
+                &mut model,
+                cap,
+                unc,
+                vae_path,
+                &sample_out,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_seed,
+                &device,
+            ) {
+                log::warn!("[sample final {label}] failed: {e}");
+            } else if let Some(b) = &board {
+                b.log_image_png(&format!("samples/{label}"), args.steps as u64, 0, &sample_out);
+                if let Some(t) = sample_prompt_texts.get(idx) {
+                    b.log_text(&format!("prompts/{label}"), args.steps as u64, t);
+                }
+            }
         }
     }
     Ok(())

@@ -49,7 +49,8 @@ use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::validation::ValidationLoop;
 use eridiffusion_core::training::features::{
-    caption_dropout, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+    caption_dropout, loss_weight, lr_schedule, noise_modifiers,
+    sample_library::SampleLibrary, timestep_bias,
 };
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::training_features::timestep_dist::{
@@ -178,6 +179,11 @@ struct Args {
     sample_prompt: Option<String>,
     #[arg(long, default_value = "")]
     sample_neg_prompt: String,
+    /// Config-driven sample prompt library (JSON). Overrides
+    /// config.validation_prompts_file. When set, every prompt is rendered at
+    /// each sample checkpoint instead of the single --sample-prompt.
+    #[arg(long)]
+    validation_prompts_file: Option<PathBuf>,
     /// Flux/Chroma VAE safetensors (decoder loaded inside chroma_sampler).
     #[arg(long)]
     sample_vae: Option<PathBuf>,
@@ -444,6 +450,7 @@ fn main() -> anyhow::Result<()> {
     config.lr_min_factor = args.lr_min_factor;
     config.validation_dataset_dir = args.validation_dataset_dir.clone();
     config.validation_every_steps = args.validation_every_steps;
+    config.validation_prompts_file = args.validation_prompts_file.clone();
     config.masked_loss_weight = args.masked_loss_weight;
     if args.masked_loss_weight > 0.0 {
         log::warn!(
@@ -510,10 +517,18 @@ fn main() -> anyhow::Result<()> {
     // encoder. T5-XXL ~10 GB + Chroma DiT ~17 GB cannot coexist on 24 GB
     // VRAM; mirrors qwen/sample_chroma load order.
     let periodic_sample = args.sample_every > 0;
-    let (sample_cond, sample_uncond, sample_vae_path) = if periodic_sample {
-        let prompt = args.sample_prompt.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("--sample-every>0 requires --sample-prompt")
-        })?;
+    // Config-driven sample set. Prompts come from --validation-prompts-file
+    // (CLI) OR config.validation_prompts_file, NOT hardcoded. Falls back to the
+    // single --sample-prompt only if no prompts file is given. Each entry:
+    // (label "p{i+1}", encoded cond, encoded uncond).
+    let prompts_file = args
+        .validation_prompts_file
+        .clone()
+        .or_else(|| config.validation_prompts_file.clone());
+    let mut sample_set: Vec<(String, Tensor, Tensor)> = Vec::new();
+    // Prompt texts kept alive parallel to `sample_set` for board log_text.
+    let mut sample_prompt_texts: Vec<String> = Vec::new();
+    let sample_vae_path = if periodic_sample {
         let vae_path = args.sample_vae.as_ref().ok_or_else(|| {
             anyhow::anyhow!("--sample-every>0 requires --sample-vae")
         })?;
@@ -523,37 +538,59 @@ fn main() -> anyhow::Result<()> {
         let t5_tok = args.sample_t5_tokenizer.as_ref().ok_or_else(|| {
             anyhow::anyhow!("--sample-every>0 requires --sample-t5-tokenizer")
         })?;
+        // Resolve the prompt list: prefer the config/CLI prompts file.
+        let prompt_list: Vec<(String, String, String)> = if let Some(ref pf) = prompts_file {
+            let lib = SampleLibrary::from_file(pf)?;
+            log::info!("[sample-setup] {} prompt(s) from {}", lib.len(), pf.display());
+            lib.prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("p{}", i + 1), p.prompt.clone(), p.negative.clone()))
+                .collect()
+        } else {
+            let prompt = args.sample_prompt.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--sample-every>0 requires --validation-prompts-file or --sample-prompt"
+                )
+            })?;
+            vec![("p1".into(), prompt.clone(), args.sample_neg_prompt.clone())]
+        };
         log::info!("[sample-setup] loading T5-XXL for prompt pre-encode...");
         let t5_path_str = t5_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("--sample-t5 not valid UTF-8"))?;
         let mut t5 = T5Encoder::load(t5_path_str, &device)
             .map_err(|e| anyhow::anyhow!("T5 load: {e}"))?;
-        let cond_tokens = tokenize_t5(t5_tok, prompt, T5_SEQ_LEN)?;
-        let cond = t5
-            .encode(&cond_tokens)
-            .map_err(|e| anyhow::anyhow!("T5 cond encode: {e}"))?
-            .to_dtype(DType::BF16)?;
-        let uncond_tokens = tokenize_t5(t5_tok, &args.sample_neg_prompt, T5_SEQ_LEN)?;
-        let uncond = t5
-            .encode(&uncond_tokens)
-            .map_err(|e| anyhow::anyhow!("T5 uncond encode: {e}"))?
-            .to_dtype(DType::BF16)?;
-        log::info!(
-            "[sample-setup] cond={:?} uncond={:?}; dropping T5",
-            cond.shape().dims(),
-            uncond.shape().dims()
-        );
+        for (label, ptext, ntext) in &prompt_list {
+            let cond_tokens = tokenize_t5(t5_tok, ptext, T5_SEQ_LEN)?;
+            let cond = t5
+                .encode(&cond_tokens)
+                .map_err(|e| anyhow::anyhow!("T5 cond encode: {e}"))?
+                .to_dtype(DType::BF16)?;
+            let uncond_tokens = tokenize_t5(t5_tok, ntext, T5_SEQ_LEN)?;
+            let uncond = t5
+                .encode(&uncond_tokens)
+                .map_err(|e| anyhow::anyhow!("T5 uncond encode: {e}"))?
+                .to_dtype(DType::BF16)?;
+            log::info!(
+                "[sample-setup] {label} cond={:?} uncond={:?}",
+                cond.shape().dims(),
+                uncond.shape().dims()
+            );
+            sample_set.push((label.clone(), cond, uncond));
+            sample_prompt_texts.push(ptext.clone());
+        }
         drop(t5);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
         log::info!(
-            "[sample-setup] periodic sample enabled (every {} steps).",
+            "[sample-setup] {} prompt(s) ready; periodic sample enabled (every {} steps).",
+            sample_set.len(),
             args.sample_every
         );
-        (Some(cond), Some(uncond), Some(vae_path.clone()))
+        Some(vae_path.clone())
     } else {
-        (None, None, None)
+        None
     };
 
     let mut model = if args.offload {
@@ -827,32 +864,58 @@ fn main() -> anyhow::Result<()> {
         .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Run hyper-parameters → metadata.hparams + the dashboard's hparam
+        // panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"chroma\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"batch_size\":{},\"optimizer\":\"{}\",\"timestep_shift\":{},\
+             \"sample_size\":{},\"sample_steps\":{},\"sample_cfg\":{},\"seed\":{}}}",
+            args.steps,
+            args.rank,
+            args.lora_alpha,
+            args.lr,
+            1,
+            opt_kind.as_str(),
+            args.timestep_shift,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
     let mut trained_steps = 0usize;
 
-    // Step-0 baseline sample (LoRA=identity).
+    // Step-0 baseline sample (LoRA=identity) — every config-driven prompt.
     if periodic_sample {
-        let cond = sample_cond.as_ref().unwrap();
-        let uncond = sample_uncond.as_ref().unwrap();
         let vae_path = sample_vae_path.as_ref().unwrap();
-        let out_path = args.output_dir.join("sample_step0_base.png");
-        log::info!("[sample step=0] BASELINE → {}", out_path.display());
-        if let Err(e) = chroma_sampler::sample_image(
-            &model,
-            cond,
-            uncond,
-            args.sample_size,
-            args.sample_size,
-            args.sample_steps,
-            args.sample_cfg,
-            args.sample_seed,
-            vae_path,
-            &out_path,
-            &device,
-        ) {
-            log::warn!("[sample step=0] failed: {e}");
+        for (idx, (label, cond, uncond)) in sample_set.iter().enumerate() {
+            let out_path = args
+                .output_dir
+                .join(format!("sample_step0_base_{label}.png"));
+            log::info!("[sample step=0 {label}] BASELINE → {}", out_path.display());
+            if let Err(e) = chroma_sampler::sample_image(
+                &model,
+                cond,
+                uncond,
+                args.sample_size,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_seed,
+                vae_path,
+                &out_path,
+                &device,
+            ) {
+                log::warn!("[sample step=0 {label}] failed: {e}");
+            } else if let Some(b) = &board {
+                b.log_image_png(&format!("samples/{label}"), 0, 0, &out_path);
+                if let Some(t) = sample_prompt_texts.get(idx) {
+                    b.log_text(&format!("prompts/{label}"), 0, t);
+                }
+            }
         }
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
@@ -1140,9 +1203,10 @@ fn main() -> anyhow::Result<()> {
 
         let _ = total_loss;
         trained_steps += 1;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "Chroma-lora",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             cache_files.len(),
             1,
@@ -1311,29 +1375,34 @@ fn main() -> anyhow::Result<()> {
                 log::info!("[save step {step_num}] {}", mid_ckpt.display());
             }
         }
-        // Periodic in-loop sample.
+        // Periodic in-loop sample — every config-driven prompt.
         if periodic_sample && step_num % args.sample_every == 0 && step_num < args.steps {
-            let cond = sample_cond.as_ref().unwrap();
-            let uncond = sample_uncond.as_ref().unwrap();
             let vae_path = sample_vae_path.as_ref().unwrap();
-            let out_path = args
-                .output_dir
-                .join(format!("sample_step{}.png", step_num));
-            log::info!("[sample step={}] → {}", step_num, out_path.display());
-            if let Err(e) = chroma_sampler::sample_image(
-                &model,
-                cond,
-                uncond,
-                args.sample_size,
-                args.sample_size,
-                args.sample_steps,
-                args.sample_cfg,
-                args.sample_seed,
-                vae_path,
-                &out_path,
-                &device,
-            ) {
-                log::warn!("[sample step={}] failed: {e}", step_num);
+            for (idx, (label, cond, uncond)) in sample_set.iter().enumerate() {
+                let out_path = args
+                    .output_dir
+                    .join(format!("sample_step{}_{label}.png", step_num));
+                log::info!("[sample step={} {label}] → {}", step_num, out_path.display());
+                if let Err(e) = chroma_sampler::sample_image(
+                    &model,
+                    cond,
+                    uncond,
+                    args.sample_size,
+                    args.sample_size,
+                    args.sample_steps,
+                    args.sample_cfg,
+                    args.sample_seed,
+                    vae_path,
+                    &out_path,
+                    &device,
+                ) {
+                    log::warn!("[sample step={} {label}] failed: {e}", step_num);
+                } else if let Some(b) = &board {
+                    b.log_image_png(&format!("samples/{label}"), step_num as u64, 0, &out_path);
+                    if let Some(t) = sample_prompt_texts.get(idx) {
+                        b.log_text(&format!("prompts/{label}"), step_num as u64, t);
+                    }
+                }
             }
             flame_core::cuda_alloc_pool::clear_pool_cache();
             flame_core::trim_cuda_mempool(0);
@@ -1411,6 +1480,43 @@ fn main() -> anyhow::Result<()> {
         log::warn!("save_weights returned: {e}");
     } else {
         log::info!("Saved checkpoint to {}", ckpt.display());
+    }
+
+    // ── Final sample at the end of training (all config-driven prompts) ───
+    if periodic_sample {
+        let vae_path = sample_vae_path.as_ref().unwrap();
+        for (idx, (label, cond, uncond)) in sample_set.iter().enumerate() {
+            let out_path = args
+                .output_dir
+                .join(format!("sample_step{}_{label}.png", args.steps));
+            log::info!(
+                "[sample step={} FINAL {label}] → {}",
+                args.steps,
+                out_path.display()
+            );
+            if let Err(e) = chroma_sampler::sample_image(
+                &model,
+                cond,
+                uncond,
+                args.sample_size,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_seed,
+                vae_path,
+                &out_path,
+                &device,
+            ) {
+                log::warn!("[sample final {label}] failed: {e}");
+            } else if let Some(b) = &board {
+                b.log_image_png(&format!("samples/{label}"), args.steps as u64, 0, &out_path);
+                if let Some(t) = sample_prompt_texts.get(idx) {
+                    b.log_text(&format!("prompts/{label}"), args.steps as u64, t);
+                }
+            }
+        }
+        flame_core::cuda_alloc_pool::clear_pool_cache();
+        flame_core::trim_cuda_mempool(0);
     }
     Ok(())
 }

@@ -35,7 +35,8 @@ use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{
-    loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop,
+    loss_weight, lr_schedule, noise_modifiers, sample_library::SampleLibrary, timestep_bias,
+    validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::timestep_dist::{
     TimestepConfig, TimestepDistribution,
@@ -440,9 +441,8 @@ fn main() -> anyhow::Result<()> {
     if !args.multi_backend_cache_dirs.is_empty() || !args.multi_backend_weights.is_empty() {
         log::warn!("--multi-backend-* flags are Klein-only in Phase 2; ignored here");
     }
-    if args.validation_prompts_file.is_some() {
-        log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
-    }
+    // `--validation-prompts-file` (CLI) OR config.validation_prompts_file is
+    // resolved into the periodic-sample prompt set below (SampleLibrary).
     if args.masked_loss_weight > 0.0 {
         log::warn!(
             "[masked-loss] --masked-loss-weight={:.3} requested but Z-Image's prepare_zimage cache schema has no `latent_mask` field; flag is a no-op for this trainer.",
@@ -765,6 +765,15 @@ fn main() -> anyhow::Result<()> {
         );
         effective_caption_dropout_prob = 0.0;
     }
+    // Prompt texts kept alive (parallel to `sample_prompts`) so periodic
+    // samples can log the prompt string to the board alongside the PNG.
+    let mut sample_prompt_texts: Vec<String> = Vec::new();
+    // Config-driven prompt source: --validation-prompts-file (CLI) OR
+    // train_config.validation_prompts_file, loaded as a SampleLibrary.
+    let validation_prompts_file = args
+        .validation_prompts_file
+        .clone()
+        .or_else(|| train_config.validation_prompts_file.clone());
     let (sample_prompts, sample_uncond, sample_uncond_mask, sample_vae_path): (
         Option<Vec<(Tensor, Tensor)>>,
         Option<Tensor>,
@@ -831,30 +840,57 @@ fn main() -> anyhow::Result<()> {
         // (single str) is the first entry if non-empty. `--sample-prompts-file`
         // (newline-separated) appends the rest. Result: Vec<(cap, cap_mask)>.
         let mut prompts_text: Vec<String> = Vec::new();
-        if !args.sample_prompt.trim().is_empty() {
-            prompts_text.push(args.sample_prompt.clone());
-        }
-        if let Some(pf) = args.sample_prompts_file.as_ref() {
-            let raw = std::fs::read_to_string(pf)
-                .map_err(|e| anyhow::anyhow!("read sample-prompts-file {}: {e}", pf.display()))?;
-            for line in raw.lines() {
-                let l = line.trim();
-                if l.is_empty() || l.starts_with('#') {
-                    continue;
+        // Shared negative: --sample-neg-prompt by default; overridden by the
+        // first SampleLibrary entry's negative when a prompts file is given
+        // (Z-Image's sampler uses a single shared uncond, not per-prompt).
+        let mut neg_text = args.sample_neg_prompt.clone();
+        if let Some(ref pf) = validation_prompts_file {
+            let lib = SampleLibrary::from_file(pf)?;
+            log::info!(
+                "[sample-setup] {} prompt(s) from {} (config-driven)",
+                lib.len(),
+                pf.display()
+            );
+            if let Some(first_neg) = lib
+                .prompts
+                .iter()
+                .map(|p| p.negative.clone())
+                .find(|n| !n.trim().is_empty())
+            {
+                neg_text = first_neg;
+            }
+            for p in &lib.prompts {
+                prompts_text.push(p.prompt.clone());
+            }
+        } else {
+            if !args.sample_prompt.trim().is_empty() {
+                prompts_text.push(args.sample_prompt.clone());
+            }
+            if let Some(pf) = args.sample_prompts_file.as_ref() {
+                let raw = std::fs::read_to_string(pf).map_err(|e| {
+                    anyhow::anyhow!("read sample-prompts-file {}: {e}", pf.display())
+                })?;
+                for line in raw.lines() {
+                    let l = line.trim();
+                    if l.is_empty() || l.starts_with('#') {
+                        continue;
+                    }
+                    prompts_text.push(l.to_string());
                 }
-                prompts_text.push(l.to_string());
             }
         }
         if prompts_text.is_empty() {
             anyhow::bail!(
-                "--sample-every > 0 requires either --sample-prompt or --sample-prompts-file"
+                "--sample-every > 0 requires --validation-prompts-file, --sample-prompt, or --sample-prompts-file"
             );
         }
         let mut encoded: Vec<(Tensor, Tensor)> = Vec::with_capacity(prompts_text.len());
         for p in &prompts_text {
             encoded.push(encode(p)?);
         }
-        let (unc, unc_mask) = encode(&args.sample_neg_prompt)?;
+        // Retain prompt texts for board logging (parallel to `encoded`).
+        sample_prompt_texts = prompts_text.clone();
+        let (unc, unc_mask) = encode(&neg_text)?;
         log::info!(
             "[sample-setup] {} prompt(s) encoded; uncond={:?}; dropping Qwen3",
             encoded.len(),
@@ -919,6 +955,25 @@ fn main() -> anyhow::Result<()> {
     .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Run hyper-parameters → metadata.hparams + the dashboard's hparam
+        // panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"zimage\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"batch_size\":{},\"optimizer\":\"{}\",\"timestep_shift\":{},\
+             \"sample_size\":{},\"sample_steps\":{},\"sample_cfg\":{},\"seed\":{}}}",
+            args.steps,
+            args.rank,
+            args.lora_alpha,
+            args.lr,
+            args.batch_size,
+            opt_kind.as_str(),
+            args.timestep_shift,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
@@ -1308,9 +1363,10 @@ fn main() -> anyhow::Result<()> {
         if forward_only_bench {
             AutogradContext::clear();
             // Still emit the per-step progress log so we get s/step timing.
-            eridiffusion_core::training::progress::log_step(
+            eridiffusion_core::training::progress::log_step_with_resume(
                 "Z-Image-fwd-only",
-                step,
+                step - start_step,
+                start_step,
                 args.steps,
                 cache_files.len(),
                 args.batch_size.max(1),
@@ -1508,9 +1564,10 @@ fn main() -> anyhow::Result<()> {
         model.refresh_lora_cache();
 
         let _ = total_loss;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "Z-Image-lora",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             cache_files.len(),
             args.batch_size.max(1),
@@ -1800,6 +1857,12 @@ fn main() -> anyhow::Result<()> {
                     &device,
                 ) {
                     log::warn!("[sample step={step_num} p{idx}] failed: {e}");
+                } else if let Some(b) = &board {
+                    let label = format!("p{idx}");
+                    b.log_image_png(&format!("samples/{label}"), step_num as u64, 0, &sample_out);
+                    if let Some(t) = sample_prompt_texts.get(idx) {
+                        b.log_text(&format!("prompts/{label}"), step_num as u64, t);
+                    }
                 }
             }
             if let Err(e) = opt.exit_eval_mode(&params) {
@@ -1902,6 +1965,12 @@ fn main() -> anyhow::Result<()> {
                 &device,
             ) {
                 log::warn!("[sample final p{idx}] failed: {e}");
+            } else if let Some(b) = &board {
+                let label = format!("p{idx}");
+                b.log_image_png(&format!("samples/{label}"), args.steps as u64, 0, &sample_out);
+                if let Some(t) = sample_prompt_texts.get(idx) {
+                    b.log_text(&format!("prompts/{label}"), args.steps as u64, t);
+                }
             }
         }
         if let Err(e) = opt.exit_eval_mode(&params) {

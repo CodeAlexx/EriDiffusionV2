@@ -871,6 +871,16 @@ fn main() -> anyhow::Result<()> {
         .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"wan22\",\"variant\":\"{}\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\
+             \"lr\":{},\"warmup_steps\":{},\"batch_size\":{},\"optimizer\":\"{}\",\"shift\":{},\
+             \"seed\":{}}}",
+            variant.as_str(), steps, args.rank, args.lora_alpha, args.lr,
+            args.warmup_steps, args.batch_size, args.optimizer, args.shift, SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", steps as f64)]);
     }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;

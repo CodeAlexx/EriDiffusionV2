@@ -727,6 +727,22 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| log::warn!("board.db open failed: {e}"))
     .ok();
+    if let Some(b) = &board {
+        log::info!("[asymflow] SerenityBoard writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"asymflow-klein9b\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"warmup_steps\":{},\"batch_size\":{},\"optimizer\":\"{}\",\"seed\":{},\
+             \"adam_beta1\":{},\"adam_beta2\":{},\"weight_decay\":{},\"offload\":{},\
+             \"sigma_min\":{}}}",
+            args.steps, args.rank, args.lora_alpha, args.lr, args.warmup_steps,
+            args.batch_size, opt_kind.as_str(), args.seed,
+            args.adam_beta1, args.adam_beta2, args.weight_decay, args.offload,
+            args.sigma_min,
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
+    }
 
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
@@ -969,9 +985,13 @@ fn main() -> anyhow::Result<()> {
         }
         AutogradContext::clear();
 
-        eridiffusion_core::training::progress::log_step(
+        // Resume-aware: when --resume-full set `start_step`, log against the
+        // cumulative step so SerenityBoard scalars and the progress bar use
+        // the absolute step number (run-local rate / ETA preserved).
+        eridiffusion_core::training::progress::log_step_with_resume(
             "AsymFlow-Klein9B",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             dataset_len,
             bs,
@@ -1087,6 +1107,9 @@ fn main() -> anyhow::Result<()> {
         } else if let Err(e) = model.save_weights(&ckpt.to_string_lossy()) {
             log::warn!("save_weights failed: {e}");
         }
+    }
+    if let Some(b) = &board {
+        b.set_status("completed");
     }
     Ok(())
 }

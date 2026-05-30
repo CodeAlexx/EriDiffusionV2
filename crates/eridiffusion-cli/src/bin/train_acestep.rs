@@ -660,6 +660,16 @@ fn main() -> anyhow::Result<()> {
     .ok();
     if let Some(b) = &board {
         log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"acestep\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"batch_size\":{},\"optimizer\":\"{}\",\"timestep_distribution\":\"{}\",\
+             \"cfg_ratio\":{},\"seed\":{}}}",
+            args.steps, args.rank, args.lora_alpha, args.lr,
+            1, opt_kind.as_str(), args.timestep_distribution, args.cfg_ratio, args.seed
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
     }
     let t_start = std::time::Instant::now();
 
@@ -907,9 +917,10 @@ fn main() -> anyhow::Result<()> {
 
         let _ = loss_sum;
         let _ = loss_count;
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             "AceStep-lora",
-            step,
+            step - start_step,
+            start_step,
             args.steps,
             cache_files.len(),
             1,
