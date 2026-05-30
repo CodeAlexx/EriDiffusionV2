@@ -311,10 +311,44 @@ pub struct TrainConfig {
     /// it into model forward.
     #[serde(default = "default_tread_keep_ratio")]
     pub tread_keep_ratio: f32,
+
+    // ── Phase 5 — step-count + inline-sampler block ──
+    // OT's schema is epoch-based; step-driven trainers (train_l2p and any
+    // future single-cycle trainer) need an explicit total-step count and a
+    // self-contained sampler config so the JSON fully describes a run with
+    // NO tunable params on the command line. All default to 0 / sentinel so
+    // existing epoch-based configs and the 16 other trainers are byte-identical.
+    /// Total training steps. `0` = unset (caller falls back to its own default
+    /// or `epochs`). train_l2p reads this as the authoritative step count.
+    #[serde(default = "default_zero_u64")]
+    pub steps: u64,
+    /// Render an inline validation sample every N steps (plus at the first
+    /// step). `0` = no inline sampling.
+    #[serde(default = "default_zero_u64")]
+    pub sample_every: u64,
+    /// Square sample resolution in px. `0` = use caller default.
+    #[serde(default = "default_zero_u64")]
+    pub sample_size: u64,
+    /// Sampler denoise steps (Euler). `0` = use caller default.
+    #[serde(default = "default_zero_u64")]
+    pub sample_steps: u64,
+    /// Sampler CFG scale. `0.0` = use caller default.
+    #[serde(default = "default_zero_f32")]
+    pub sample_cfg: f32,
+    /// Sampler sigma-schedule shift. `0.0` = use caller default.
+    #[serde(default = "default_zero_f32")]
+    pub sample_shift: f32,
+    /// Sampler noise seed. Distinct sentinel: `None` = use caller default.
+    #[serde(default)]
+    pub sample_seed: Option<u64>,
 }
 
 fn default_tread_keep_ratio() -> f32 {
     1.0
+}
+
+fn default_zero_f32() -> f32 {
+    0.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +486,14 @@ impl Default for TrainConfig {
             // Phase 4
             tread_route_pattern: None,
             tread_keep_ratio: 1.0,
+            // Phase 5 — step-count + sampler block (all sentinel = unset)
+            steps: 0,
+            sample_every: 0,
+            sample_size: 0,
+            sample_steps: 0,
+            sample_cfg: 0.0,
+            sample_shift: 0.0,
+            sample_seed: None,
         }
     }
 }
