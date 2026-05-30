@@ -7,6 +7,7 @@ pub mod chroma;
 pub mod ernie;
 pub mod flux;
 pub mod klein;
+pub mod l2p;
 pub mod ltx2;
 pub mod qwenimage;
 pub mod sd35;

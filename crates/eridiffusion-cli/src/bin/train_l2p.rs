@@ -51,8 +51,12 @@ use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use rand::Rng as _;
 
-use inference_flame::lora::{LoraStack, Slot, TrainEntry};
-use inference_flame::models::l2p::{weight_loader::translate_l2p_keys, L2pDiT};
+use eridiffusion_core::models::l2p::sampling::{
+    build_l2p_sigma_schedule, init_l2p_noise, l2p_euler_step,
+};
+use eridiffusion_core::models::l2p::{
+    weight_loader::translate_l2p_keys, L2pDiT, LoraStack, Slot, TrainEntry,
+};
 
 // -------------------------------------------------------------------------
 // Hyperparameters mirroring Z-Image preset / L2P train_run.sh
@@ -65,6 +69,16 @@ const SEED: u64 = 42;
 const DIM: usize = 3840;
 const MLP_HIDDEN: usize = 10240;
 const NUM_LAYERS: usize = 30;
+
+// Sample-prompt text-encoding constants — MUST match prepare_l2p exactly
+// (chat template, pad token, pad length, extract layer) so the inline
+// sampler's cap_feats share the training-time distribution.
+const ZIMAGE_TEMPLATE_PRE: &str = "<|im_start|>user\n";
+const ZIMAGE_TEMPLATE_POST: &str = "<|im_end|>\n<|im_start|>assistant\n";
+const PAD_TOKEN_ID: i32 = 151643;
+const TXT_PAD_LEN: usize = 512;
+/// Z-Image canonical extract layer: layer 34 of Qwen3-4B (penultimate).
+const QWEN3_EXTRACT_LAYER: usize = 34;
 
 #[derive(Parser)]
 struct Args {
@@ -155,11 +169,54 @@ struct Args {
     /// grad → F32 moments via the default `GradDtypePolicy::CastToF32`).
     #[arg(long, default_value = "adamw")]
     optimizer: String,
+
+    // ── Inline sampling (config-driven, mirrors train_klein) ─────────────
+    /// Render a validation image every N steps (and at the first training
+    /// step + at the end). `0` disables inline sampling entirely. Requires
+    /// `--validation-prompts-file`, `--sample-qwen3`, `--sample-tokenizer`
+    /// when > 0.
+    #[arg(long, default_value_t = 0)]
+    sample_every: usize,
+    /// JSON prompt library (`SampleLibrary`) for periodic + final samples.
+    /// When absent, inline sampling is skipped (L2P had no sampler before,
+    /// so absent = no inline sample — byte-identical to the prior trainer).
+    #[arg(long)]
+    validation_prompts_file: Option<PathBuf>,
+    /// Qwen3-4B text encoder (single file or shard dir) used ONLY to encode
+    /// the validation prompts at startup. Dropped before the DiT loads.
+    /// Default matches prepare_l2p's encoder path.
+    #[arg(
+        long,
+        default_value = "/home/alex/.serenity/models/text_encoders/qwen_3_4b.safetensors"
+    )]
+    sample_qwen3: PathBuf,
+    /// Tokenizer.json (Qwen3 BPE). Shared with Z-Image / prepare_l2p.
+    #[arg(
+        long,
+        default_value = "/home/alex/.serenity/models/zimage_base/tokenizer/tokenizer.json"
+    )]
+    sample_tokenizer: PathBuf,
+    /// Square sample resolution. L2P inference reference is 1024².
+    #[arg(long, default_value_t = 1024)]
+    sample_size: usize,
+    /// Sampler steps (Euler). ai-toolkit ZImage-L2P recipe = 30.
+    #[arg(long, default_value_t = 30)]
+    sample_steps: usize,
+    /// CFG scale for sampling. L2P README / ai-toolkit recipe = 2.0.
+    #[arg(long, default_value_t = 2.0)]
+    sample_cfg: f32,
+    /// Inference sigma-schedule shift. L2P uses 3.0 (FLUX-shift form).
+    #[arg(long, default_value_t = 3.0)]
+    sample_shift: f32,
+    /// Seed for sample noise.
+    #[arg(long, default_value_t = 42)]
+    sample_seed: u64,
 }
 
-// (build_timestep_config removed 2026-05-22 — L2P uses uniform-over-warped-schedule
-//  sampling per Python `FlowMatchSFTLoss`, not LOGIT_NORMAL. See
-//  build_l2p_training_sigma_table in inference_flame::sampling::l2p_sampling.)
+// (build_timestep_config removed 2026-05-22 — L2P uses uniform unshifted
+//  sigma sampling per the Ostris ai-toolkit ZImage-L2P recipe
+//  (timestep_type='linear'), NOT LOGIT_NORMAL. Inference sigma schedule
+//  lives in eridiffusion_core::models::l2p::sampling::build_l2p_sigma_schedule.)
 
 // -------------------------------------------------------------------------
 // LoRA target table — per-block weight keys + (in, out) dims + slot
@@ -377,6 +434,67 @@ fn main() -> anyhow::Result<()> {
     let device = flame_core::global_cuda_device();
 
     // -------------------------------------------------------------------
+    // 0. Inline-sample setup (config-driven, mirrors train_klein).
+    //
+    // MUST run BEFORE the L2P DiT load: the merged L2P checkpoint (~10 GB
+    // BF16-resident) + Qwen3-4B (~8 GB) do not co-reside comfortably on a
+    // 24 GB card. Encode all validation prompts now, drop Qwen3, then load
+    // the DiT. `sample_set`: (label, cap_feats, cap_feats_uncond).
+    //
+    // Inline sampling is gated on BOTH `--sample-every > 0` AND a prompts
+    // file being present. If either is absent, sampling is skipped — L2P
+    // had no sampler before, so absent = no-op (byte-identical behaviour).
+    // -------------------------------------------------------------------
+    let periodic = args.sample_every > 0 && args.validation_prompts_file.is_some();
+    // (label, cap_feats, cap_feats_uncond, prompt_text). prompt_text is kept
+    // so the board can log_text it alongside each rendered sample.
+    let mut sample_set: Vec<(String, Tensor, Tensor, String)> = Vec::new();
+    if periodic {
+        use eridiffusion_core::encoders::qwen3::Qwen3Encoder;
+        use eridiffusion_core::training::features::sample_library::SampleLibrary;
+        let prompts_file = args.validation_prompts_file.as_ref().unwrap();
+        log::info!(
+            "[sample-setup] loading Qwen3 + tokenizer to encode sample prompts (before DiT load)..."
+        );
+        let qwen_w = l2p_load_qwen3(&args.sample_qwen3, &device)?;
+        let mut qcfg = Qwen3Encoder::config_from_weights(&qwen_w)?;
+        // Z-Image / L2P canonical extract layer = 34 (penultimate). Must match
+        // prepare_l2p so sample cap_feats share the training distribution.
+        qcfg.extract_layers = vec![QWEN3_EXTRACT_LAYER];
+        let qwen = Qwen3Encoder::new(qwen_w, qcfg, device.clone());
+        let tok = tokenizers::Tokenizer::from_file(&args.sample_tokenizer)
+            .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+
+        let lib = SampleLibrary::from_file(prompts_file)?;
+        log::info!(
+            "[sample-setup] {} prompt(s) from {}",
+            lib.len(),
+            prompts_file.display()
+        );
+        for (i, p) in lib.prompts.iter().enumerate() {
+            let label = format!("p{}", i + 1);
+            let cap = l2p_encode_prompt(&qwen, &tok, &p.prompt)?;
+            // Unconditional embedding = the prompt's negative (empty by
+            // default in SampleLibrary). CFG uses pred_uncond + cfg*(cond-uncond).
+            let unc = l2p_encode_prompt(&qwen, &tok, &p.negative)?;
+            log::info!("[sample-setup] {label} encoded cap={:?}", cap.shape().dims());
+            sample_set.push((label, cap, unc));
+        }
+        drop(qwen);
+        flame_core::trim_cuda_mempool(0);
+        log::info!(
+            "[sample-setup] Qwen3 dropped; {} prompt(s) ready. Sample every {} steps.",
+            sample_set.len(),
+            args.sample_every
+        );
+    } else if args.sample_every > 0 {
+        log::warn!(
+            "[sample-setup] --sample-every={} but no --validation-prompts-file; inline sampling DISABLED.",
+            args.sample_every
+        );
+    }
+
+    // -------------------------------------------------------------------
     // 1. Load + translate + construct L2pDiT.
     // -------------------------------------------------------------------
     log::info!("[1/5] Loading L2P safetensors from {}...", args.model.display());
@@ -499,7 +617,6 @@ fn main() -> anyhow::Result<()> {
     // training mass near low sigma (near-clean), biasing the LoRA toward
     // identity. ai-toolkit's `timestep_type='linear'` is the production-
     // tested choice (commit 6102370 `Add support for ZImage L2P`).
-    let _ = inference_flame::sampling::l2p_sampling::build_l2p_training_sigma_table; // keep symbol live for callers
     log::info!(
         "[3/5] Training sigma sampling: uniform t_int in 1..={} → sigma = t_int / {} (unshifted, ai-toolkit recipe)",
         args.train_num_steps,
@@ -826,6 +943,44 @@ fn main() -> anyhow::Result<()> {
                 log::info!("[save step {step_num}] {}", path.display());
             }
         }
+
+        // ── Periodic inline sample (config-driven) ──────────────────────
+        // Sample-at-start (first training step) + every `--sample-every`
+        // steps. Skipped on the final step (a final sample fires after the
+        // loop). Mirrors train_klein's cadence. `sample_set` is empty when
+        // inline sampling is disabled → loop is a no-op.
+        if periodic
+            && (step == 0 || step_num % args.sample_every == 0)
+            && (step + 1) < args.steps
+        {
+            for (label, cap, unc) in &sample_set {
+                let sample_out = args
+                    .output
+                    .join(format!("sample_step{step_num}_{label}.png"));
+                log::info!("[sample step={step_num} {label}] → {}", sample_out.display());
+                if let Err(e) = l2p_inline_sample(
+                    &mut model,
+                    cap,
+                    unc,
+                    &sample_out,
+                    args.sample_size,
+                    args.sample_steps,
+                    args.sample_cfg,
+                    args.sample_shift,
+                    args.sample_seed,
+                    &device,
+                ) {
+                    log::warn!("[sample step={step_num} {label}] failed: {e}");
+                } else if let Some(b) = board.as_ref() {
+                    b.log_image_png(
+                        &format!("samples/{label}"),
+                        step_num as u64,
+                        0,
+                        &sample_out,
+                    );
+                }
+            }
+        }
     }
 
     // ── Final save ────────────────────────────────────────────────────
@@ -845,6 +1000,38 @@ fn main() -> anyhow::Result<()> {
         avg_loss,
         final_path.display()
     );
+
+    // ── Final inline sample (all config-driven prompts) ─────────────────
+    if periodic {
+        for (label, cap, unc) in &sample_set {
+            let sample_out = args
+                .output
+                .join(format!("sample_step{}_{label}.png", final_step));
+            log::info!("[sample final {label}] → {}", sample_out.display());
+            if let Err(e) = l2p_inline_sample(
+                &mut model,
+                cap,
+                unc,
+                &sample_out,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_shift,
+                args.sample_seed,
+                &device,
+            ) {
+                log::warn!("[sample final {label}] failed: {e}");
+            } else if let Some(b) = board.as_ref() {
+                b.log_image_png(
+                    &format!("samples/{label}"),
+                    final_step as u64,
+                    0,
+                    &sample_out,
+                );
+            }
+        }
+    }
+
     if let Some(b) = &board {
         b.set_status("completed");
     }
@@ -970,5 +1157,123 @@ fn load_lora_resume(
     } else {
         log::info!("[resume] loaded all {} LoRA tensors", hit);
     }
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// Inline sampling helpers (config-driven, mirrors train_klein).
+// -------------------------------------------------------------------------
+
+/// Load Qwen3-4B weights from a single safetensors file OR a shard
+/// directory. Mirror of prepare_l2p's `load_qwen3_weights`.
+fn l2p_load_qwen3(
+    path: &std::path::Path,
+    device: &Arc<flame_core::CudaDevice>,
+) -> anyhow::Result<HashMap<String, Tensor>> {
+    if path.is_file() {
+        return Ok(flame_core::serialization::load_file(path, device)?);
+    }
+    let mut all = HashMap::new();
+    for entry in std::fs::read_dir(path)? {
+        let p = entry?.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            let part = flame_core::serialization::load_file(&p, device)?;
+            all.extend(part);
+        }
+    }
+    if all.is_empty() {
+        anyhow::bail!("no safetensors found at Qwen3 path {}", path.display());
+    }
+    Ok(all)
+}
+
+/// Encode one prompt to `cap_feats` `[1, valid_len, 2560]` BF16, exactly as
+/// prepare_l2p does: Z-Image chat template, pad to `TXT_PAD_LEN` with the
+/// pad token, encode, then strip pad positions (`narrow(1, 0, valid_len)`).
+/// An empty prompt (the SampleLibrary default negative) yields the
+/// unconditional embedding.
+fn l2p_encode_prompt(
+    qwen: &eridiffusion_core::encoders::qwen3::Qwen3Encoder,
+    tok: &tokenizers::Tokenizer,
+    prompt: &str,
+) -> anyhow::Result<Tensor> {
+    let wrapped = format!("{ZIMAGE_TEMPLATE_PRE}{}{ZIMAGE_TEMPLATE_POST}", prompt.trim());
+    let enc = tok
+        .encode(wrapped.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+    let valid_len = ids.len().min(TXT_PAD_LEN);
+    ids.resize(TXT_PAD_LEN, PAD_TOKEN_ID);
+    let text_hidden = qwen.encode(&ids)?.to_dtype(DType::BF16)?;
+    Ok(text_hidden.narrow(1, 0, valid_len)?.contiguous()?)
+}
+
+/// Self-contained L2P inline sampler: Euler denoise loop in pixel-space,
+/// then NCHW float [-1,1] → packed RGB u8 → PNG. Mirrors the orchestration
+/// in `inference-flame/src/bin/l2p_infer.rs` (denoise + PNG) and klein's
+/// `klein_inline_sample` (self-contained, defined in the trainer).
+///
+/// Runs under `AutogradContext::no_grad` so the multi-step denoise graph is
+/// never retained — sampling must not pollute the training tape or leak
+/// activation memory across the ~30 denoise steps.
+#[allow(clippy::too_many_arguments)]
+fn l2p_inline_sample(
+    model: &mut L2pDiT,
+    cap_feats: &Tensor,
+    cap_feats_uncond: &Tensor,
+    out_png: &std::path::Path,
+    size: usize,
+    steps: usize,
+    cfg_scale: f32,
+    shift: f32,
+    seed: u64,
+    device: &Arc<flame_core::CudaDevice>,
+) -> anyhow::Result<()> {
+    let _g = AutogradContext::no_grad();
+
+    // F32 noise per L2P convention → cast to BF16 (the DiT debug-asserts BF16).
+    let x_f32 = init_l2p_noise(size, size, seed, device)?;
+    let mut x = x_f32.to_dtype(DType::BF16)?;
+    drop(x_f32);
+
+    let sigmas = build_l2p_sigma_schedule(steps, shift);
+    let uncond_ref = if cfg_scale > 1.0 {
+        Some(cap_feats_uncond)
+    } else {
+        None
+    };
+    for step in 0..steps {
+        x = l2p_euler_step(
+            model,
+            &x,
+            sigmas[step],
+            sigmas[step + 1],
+            cap_feats,
+            uncond_ref,
+            cfg_scale,
+        )?;
+    }
+
+    // Pixel-space [-1,1] BF16 → F32 → packed RGB u8 (NCHW). Identical to
+    // l2p_infer.rs:343-357.
+    let rgb_f32 = x.to_dtype(DType::F32)?;
+    drop(x);
+    let data = rgb_f32.to_vec()?;
+    let d = rgb_f32.shape().dims();
+    let (out_h, out_w) = (d[2], d[3]);
+    let mut pixels = vec![0u8; out_h * out_w * 3];
+    for y in 0..out_h {
+        for xp in 0..out_w {
+            for c in 0..3 {
+                let idx = c * out_h * out_w + y * out_w + xp;
+                let val = (127.5 * (data[idx].clamp(-1.0, 1.0) + 1.0)) as u8;
+                pixels[(y * out_w + xp) * 3 + c] = val;
+            }
+        }
+    }
+    let img = image::RgbImage::from_raw(out_w as u32, out_h as u32, pixels)
+        .ok_or_else(|| anyhow::anyhow!("failed to build RgbImage"))?;
+    img.save(out_png)
+        .map_err(|e| anyhow::anyhow!("save PNG {}: {e}", out_png.display()))?;
     Ok(())
 }
