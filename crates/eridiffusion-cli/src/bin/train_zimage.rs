@@ -375,6 +375,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     use_autograd_v2: bool,
 
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the Z-Image
+    /// default as of 2026-05-30 (gate-on Stage 6a — a 150-step v2-vs-v3 smoke
+    /// matched within 0.02%); v3 is kept available indefinitely as the
+    /// reference engine. `--use-autograd-v2` remains accepted as a back-compat
+    /// no-op.
+    #[arg(long, default_value_t = false, conflicts_with = "use_autograd_v2")]
+    use_autograd_v3: bool,
+
     /// Same-batch parity probe (HANDOFF_2026-05-24 next-action). When set,
     /// override step 0's (latent, latent_noise, scaled_noisy_latent_image,
     /// timestep, sigma, flow_target, text_encoder_output) with values
@@ -635,7 +643,7 @@ fn main() -> anyhow::Result<()> {
     // `Clone` but its `grad_dtype_policy` field is per-instance (data and
     // grad are Arc<Mutex<...>>, shared) — so mutating the trainer-owned `params`
     // Vec is sufficient. AdamW dispatch reads each param's policy at step time.
-    if args.use_autograd_v2 {
+    if !args.use_autograd_v3 {
         for p in &mut params {
             p.set_grad_dtype_policy(flame_core::parameter::GradDtypePolicy::MatchParamDtype);
         }
@@ -1379,11 +1387,11 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
-        // backward entry to construct a `MatchInsertedDtype` GradientMap;
-        // the returned grads are at loss.dtype() (BF16 end-to-end). v3
-        // path is the default and byte-equivalent to pre-flag behaviour.
-        let mut grads = if args.use_autograd_v2 {
+        // Phase 5b / gate-on 6a: Route (ii) bridge. v2 is the default; backward
+        // constructs a `MatchInsertedDtype` GradientMap (grads at loss.dtype(),
+        // BF16 end-to-end) unless `--use-autograd-v3` opts into the legacy v3
+        // backward (byte-equivalent to pre-flag behaviour).
+        let mut grads = if !args.use_autograd_v3 {
             #[cfg(feature = "autograd_v2")]
             {
                 flame_core::AutogradContext::backward_v2(&loss)?
@@ -1477,7 +1485,7 @@ fn main() -> anyhow::Result<()> {
             .as_deref()
             .map(|v| matches!(v, "1" | "true" | "TRUE"))
             .unwrap_or(false)
-            && !args.use_autograd_v2;
+            && args.use_autograd_v3;
 
         if mt_scale_enabled && scale < 1.0 {
             // Multi-tensor in-place scale. Extract device pointers as u64
