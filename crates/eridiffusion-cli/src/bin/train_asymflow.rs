@@ -248,6 +248,11 @@ struct Args {
     /// only; sigma proper is unclamped.
     #[arg(long, default_value_t = SIGMA_MIN)]
     sigma_min: f32,
+
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the default
+    /// as of 2026-05-30 (gate-on Stage 6a); v3 kept as the reference engine.
+    #[arg(long, default_value_t = false)]
+    use_autograd_v3: bool,
 }
 
 fn collect_klein_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -589,7 +594,18 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let params = model.parameters();
+    let mut params = model.parameters();
+    // Gate-on 6a: under v2 (default), flip LoRA params to MatchParamDtype so
+    // BF16 grads from the bridge stay BF16 (Class A). --use-autograd-v3 skips.
+    if !args.use_autograd_v3 {
+        for p in &mut params {
+            p.set_grad_dtype_policy(flame_core::parameter::GradDtypePolicy::MatchParamDtype);
+        }
+        log::info!(
+            "[autograd_v2] flipped {} params to MatchParamDtype grad policy",
+            params.len()
+        );
+    }
     if params.is_empty() {
         anyhow::bail!("No trainable parameters — KleinModel produced empty LoRA list");
     }
@@ -922,7 +938,23 @@ fn main() -> anyhow::Result<()> {
         }
 
         // ── Backward + grad clip + step ────────────────────────────────────
-        let mut grads = loss.backward()?;
+        // Gate-on 6a: v2 is the default; backward goes through `backward_v2`
+        // unless `--use-autograd-v3` opts into the legacy v3 backward.
+        let mut grads = if !args.use_autograd_v3 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "autograd v2 is the default but this binary was built without the \
+                     `autograd_v2` feature. Rebuild with the feature, or pass --use-autograd-v3."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
         let grad_refs: Vec<&flame_core::Tensor> = params
             .iter()
             .filter_map(|p| grads.get(p.id()))

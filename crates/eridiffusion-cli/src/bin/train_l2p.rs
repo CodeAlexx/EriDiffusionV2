@@ -47,6 +47,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use eridiffusion_core::config::{GradientCheckpointing, TrainConfig};
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use rand::Rng as _;
@@ -211,6 +212,21 @@ struct Args {
     /// Seed for sample noise.
     #[arg(long, default_value_t = 42)]
     sample_seed: u64,
+
+    /// OT-compatible JSON `TrainConfig`. When provided, its fields OVERRIDE
+    /// the corresponding CLI defaults below (the merge happens in `main`
+    /// right after parse). This is the same `--config` mechanism every other
+    /// EdV2 trainer uses (commit `82db138`) — L2P was the lone trainer that
+    /// hardcoded its hyperparameters with no config-file path. Fields OT's
+    /// TrainConfig does NOT carry (`steps`, the `sample_*` knobs) stay as
+    /// CLI flags, identical to `train_zimage`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the default
+    /// as of 2026-05-30 (gate-on Stage 6a); v3 kept as the reference engine.
+    #[arg(long, default_value_t = false)]
+    use_autograd_v3: bool,
 }
 
 // (build_timestep_config removed 2026-05-22 — L2P uses uniform unshifted
@@ -427,7 +443,81 @@ fn main() -> anyhow::Result<()> {
     }
 
     env_logger::init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // -------------------------------------------------------------------
+    // Config-file merge (parity with every other EdV2 trainer; commit
+    // `82db138`). When `--config <json>` is given, the OT-compatible
+    // `TrainConfig` is the source of truth for the training hyperparameters
+    // it carries — they OVERRIDE the CLI defaults. This removes L2P's status
+    // as the lone trainer that could only be configured via source-baked
+    // CLI defaults. `steps` and the `sample_*` knobs are not part of OT's
+    // TrainConfig schema, so they remain CLI flags (same as `train_zimage`).
+    // -------------------------------------------------------------------
+    if let Some(ref cfg_path) = args.config {
+        let c = TrainConfig::from_json_path(&cfg_path.to_string_lossy())
+            .map_err(|e| anyhow::anyhow!("--config {}: {e}", cfg_path.display()))?;
+        args.lr = c.learning_rate as f32;
+        args.lora_rank = c.lora_rank as usize;
+        args.lora_alpha = c.lora_alpha as f32;
+        args.clip_grad_norm = c.clip_grad_norm as f32;
+        args.save_every = c.save_every as usize;
+        args.train_shift = c.timestep_shift as f32;
+        args.grad_checkpoint = matches!(c.gradient_checkpointing, GradientCheckpointing::On);
+        if !c.optimizer.name.is_empty() {
+            args.optimizer = c.optimizer.name.clone();
+        }
+        // Step count + the full inline-sampler block now live in the config
+        // (sentinel 0 / None = "not specified", keep the CLI default). With a
+        // complete config, the launch command carries NO tunable params —
+        // only `--config` + per-run paths. This is the whole point: nothing
+        // tunable is hardcoded on the command line.
+        if c.steps > 0 {
+            args.steps = c.steps as usize;
+        }
+        args.sample_every = c.sample_every as usize;
+        if c.sample_size > 0 {
+            args.sample_size = c.sample_size as usize;
+        }
+        if c.sample_steps > 0 {
+            args.sample_steps = c.sample_steps as usize;
+        }
+        if c.sample_cfg > 0.0 {
+            args.sample_cfg = c.sample_cfg;
+        }
+        if c.sample_shift > 0.0 {
+            args.sample_shift = c.sample_shift;
+        }
+        if let Some(seed) = c.sample_seed {
+            args.sample_seed = seed;
+        }
+        // CLI `--validation-prompts-file` wins if explicitly given; otherwise
+        // take it from the config so a single file fully describes a run.
+        if args.validation_prompts_file.is_none() {
+            args.validation_prompts_file = c.validation_prompts_file.clone();
+        }
+        log::info!(
+            "[config] {} → steps={} lr={} rank={} alpha={} clip={} save_every={} optimizer={} grad_ckpt={}",
+            cfg_path.display(),
+            args.steps,
+            args.lr,
+            args.lora_rank,
+            args.lora_alpha,
+            args.clip_grad_norm,
+            args.save_every,
+            args.optimizer,
+            args.grad_checkpoint,
+        );
+        log::info!(
+            "[config]   sampler → every={} size={} steps={} cfg={} shift={} seed={}",
+            args.sample_every,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            args.sample_shift,
+            args.sample_seed,
+        );
+    }
     std::fs::create_dir_all(&args.output)?;
 
     flame_core::config::set_default_dtype(DType::BF16);
@@ -478,7 +568,7 @@ fn main() -> anyhow::Result<()> {
             // default in SampleLibrary). CFG uses pred_uncond + cfg*(cond-uncond).
             let unc = l2p_encode_prompt(&qwen, &tok, &p.negative)?;
             log::info!("[sample-setup] {label} encoded cap={:?}", cap.shape().dims());
-            sample_set.push((label, cap, unc));
+            sample_set.push((label, cap, unc, p.prompt.clone()));
         }
         drop(qwen);
         flame_core::trim_cuda_mempool(0);
@@ -580,6 +670,18 @@ fn main() -> anyhow::Result<()> {
         total_entries,
         train_map.len(),
     );
+
+    // Gate-on 6a: under v2 (default), flip LoRA params to MatchParamDtype so
+    // BF16 grads from the bridge stay BF16 (Class A). --use-autograd-v3 skips.
+    if !args.use_autograd_v3 {
+        for p in &mut params {
+            p.set_grad_dtype_policy(flame_core::parameter::GradDtypePolicy::MatchParamDtype);
+        }
+        log::info!(
+            "[autograd_v2] flipped {} params to MatchParamDtype grad policy",
+            params.len()
+        );
+    }
 
     // Optional: resume LoRA weights from a previous checkpoint. Adam state
     // is NOT restored (acceptable tradeoff — Adam recovers in ~50 steps).
@@ -773,7 +875,23 @@ fn main() -> anyhow::Result<()> {
         total_loss += loss_val;
 
         // ── Backward ─────────────────────────────────────────────────
-        let mut grads = loss.backward()?;
+        // Gate-on 6a: v2 is the default; backward goes through `backward_v2`
+        // unless `--use-autograd-v3` opts into the legacy v3 backward.
+        let mut grads = if !args.use_autograd_v3 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "autograd v2 is the default but this binary was built without the \
+                     `autograd_v2` feature. Rebuild with the feature, or pass --use-autograd-v3."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
 
         // Grad-flow check at step 1 (LoRA-B is zero-init so step-0
         // through `delta = down @ up` is identically zero; backward
@@ -953,11 +1071,11 @@ fn main() -> anyhow::Result<()> {
             && (step == 0 || step_num % args.sample_every == 0)
             && (step + 1) < args.steps
         {
-            for (label, cap, unc) in &sample_set {
+            for (label, cap, unc, prompt) in &sample_set {
                 let sample_out = args
                     .output
                     .join(format!("sample_step{step_num}_{label}.png"));
-                log::info!("[sample step={step_num} {label}] → {}", sample_out.display());
+                log::info!("[sample step={step_num} {label}] \"{prompt}\" → {}", sample_out.display());
                 if let Err(e) = l2p_inline_sample(
                     &mut model,
                     cap,
@@ -1003,11 +1121,11 @@ fn main() -> anyhow::Result<()> {
 
     // ── Final inline sample (all config-driven prompts) ─────────────────
     if periodic {
-        for (label, cap, unc) in &sample_set {
+        for (label, cap, unc, prompt) in &sample_set {
             let sample_out = args
                 .output
                 .join(format!("sample_step{}_{label}.png", final_step));
-            log::info!("[sample final {label}] → {}", sample_out.display());
+            log::info!("[sample final {label}] \"{prompt}\" → {}", sample_out.display());
             if let Err(e) = l2p_inline_sample(
                 &mut model,
                 cap,

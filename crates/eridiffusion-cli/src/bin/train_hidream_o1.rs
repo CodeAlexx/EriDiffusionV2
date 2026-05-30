@@ -277,6 +277,11 @@ struct Args {
     /// (`1.0`); use lower values only for explicit debug strength sweeps.
     #[arg(long, default_value_t = 1.0)]
     export_scale: f32,
+
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the default
+    /// as of 2026-05-30 (gate-on Stage 6a); v3 kept as the reference engine.
+    #[arg(long, default_value_t = false)]
+    use_autograd_v3: bool,
 }
 
 /// Distribution mode for `t` sampling. `Shift` mirrors the reference
@@ -933,7 +938,18 @@ fn main() -> anyhow::Result<()> {
     };
 
     // ── Flatten registry into a Vec<Parameter> for the optimizer.
-    let params: Vec<Parameter> = lora.parameters();
+    let mut params: Vec<Parameter> = lora.parameters();
+    // Gate-on 6a: under v2 (default), flip LoRA params to MatchParamDtype so
+    // BF16 grads from the bridge stay BF16 (Class A). --use-autograd-v3 skips.
+    if !args.use_autograd_v3 {
+        for p in &mut params {
+            p.set_grad_dtype_policy(flame_core::parameter::GradDtypePolicy::MatchParamDtype);
+        }
+        log::info!(
+            "[autograd_v2] flipped {} params to MatchParamDtype grad policy",
+            params.len()
+        );
+    }
     log::info!("[hidream_o1] {} trainable parameters", params.len());
     if params.is_empty() {
         anyhow::bail!("LoRA registry produced no trainable parameters");
@@ -1341,8 +1357,23 @@ fn main() -> anyhow::Result<()> {
         }
         total_loss += loss_val;
 
-        // ── Backward.
-        let grads = loss.backward()?;
+        // ── Backward. Gate-on 6a: v2 is the default; backward goes through
+        // `backward_v2` unless `--use-autograd-v3` opts into the legacy v3.
+        let grads = if !args.use_autograd_v3 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "autograd v2 is the default but this binary was built without the \
+                     `autograd_v2` feature. Rebuild with the feature, or pass --use-autograd-v3."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
         let named_lora_params = lora.named_parameters();
         if args.allow_missing_lora_grads {
             log::warn!(
