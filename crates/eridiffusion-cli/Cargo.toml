@@ -5,10 +5,6 @@ edition = "2021"
 description = "EriDiffusion Rust port — CLI"
 
 [[bin]]
-name = "eridiffusion"
-path = "src/main.rs"
-
-[[bin]]
 name = "prepare_l2p"
 path = "src/bin/prepare_l2p.rs"
 

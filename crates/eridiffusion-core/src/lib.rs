@@ -6,7 +6,6 @@ pub mod encoders;
 pub mod lora;
 pub mod lycoris;
 pub mod models;
-pub mod pipeline;
 pub mod sampler;
 pub mod training;
 pub mod utils;
