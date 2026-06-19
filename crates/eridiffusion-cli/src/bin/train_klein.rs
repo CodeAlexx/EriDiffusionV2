@@ -29,7 +29,6 @@ use eridiffusion_core::training::features::{
 };
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::health::GpuHealthMonitor;
-use eridiffusion_core::training::features::lr_schedule;
 use eridiffusion_core::training::features::webhook::WebhookClient;
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
@@ -1759,14 +1758,14 @@ fn main() -> anyhow::Result<()> {
         // `learning_rate_scheduler`. Default `Constant` is byte-identical to
         // the legacy `constant_with_warmup` Klein has used since launch —
         // see lr_schedule::tests::constant_lr_matches_legacy_constant_with_warmup.
-        let cur_lr = lr_schedule::dispatch_lr(
-            &config.learning_rate_scheduler,
+        // Lever dispatch (bit-identical to the legacy inline dispatch_lr —
+        // levers::lr binds the cfg args and forwards to the same fn).
+        let cur_lr = eridiffusion_core::training::levers::lr(
+            &config,
             args.lr,
             step,
             args.steps,
             args.warmup_steps,
-            config.lr_min_factor,
-            config.learning_rate_cycles as f32,
         );
         {
             let _g = AutogradContext::no_grad();

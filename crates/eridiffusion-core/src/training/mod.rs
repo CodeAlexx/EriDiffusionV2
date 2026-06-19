@@ -4,6 +4,7 @@ pub mod checkpoint;
 pub mod ema;
 pub mod features;
 pub mod grad_coverage;
+pub mod levers;
 pub mod logging;
 pub mod offload;
 pub mod progress;
