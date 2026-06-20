@@ -82,8 +82,9 @@ fn apply_rope_owned(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     x.mul(&cos4)?.add(&rot.mul(&sin4)?)
 }
 
-/// Per-block LoRA adapters in target order: [qkv, o, w1, w2, w3].
-type BlockLoras = [Option<LoRALinear>; 5];
+/// Per-block LoRA adapters in target order: [qkv, o, w1, w2, w3, adaln_modulation].
+/// Matches the ai-toolkit Ideogram-4 LoRA's 6 per-layer targets.
+type BlockLoras = [Option<LoRALinear>; 6];
 
 /// Standalone fused-QKV attention (owned weights + LoRA), for the checkpoint closure.
 #[allow(clippy::too_many_arguments)]
@@ -133,10 +134,11 @@ fn block_standalone(
 ) -> Result<Tensor> {
     let h = hidden;
     let p = format!("layers.{li}.");
-    let m = lin(
+    let m = lin_lora(
         &adaln,
         gw(&lw, &format!("{p}adaln_modulation.weight"))?,
         Some(gw(&lw, &format!("{p}adaln_modulation.bias"))?),
+        loras[5].as_ref(),
     )?;
     let scale_msa = m.narrow(2, 0, h)?.affine(1.0, 1.0)?;
     let gate_msa = m.narrow(2, h, h)?.tanh()?;
@@ -216,13 +218,15 @@ impl IdeogramDit {
     /// `blocks` preset: qkv, o, feed_forward.w1/w2/w3. Returns the trainable params.
     pub fn attach_block_loras(&mut self, rank: usize, alpha: f32) -> Result<Vec<Parameter>> {
         let h = self.hidden;
-        // (suffix, in, out)
-        let targets: [(&str, usize, usize); 5] = [
+        // (suffix, in, out) — the ai-toolkit Ideogram-4 6 per-layer targets.
+        // adaln_modulation: in=adaln_dim=512, out=4*hidden=18432.
+        let targets: [(&str, usize, usize); 6] = [
             ("attention.qkv", h, 3 * h),
             ("attention.o", h, h),
             ("feed_forward.w1", h, 12288),
             ("feed_forward.w2", 12288, h),
             ("feed_forward.w3", h, 12288),
+            ("adaln_modulation", 512, 4 * h),
         ];
         let mut params = Vec::new();
         let mut seed = 0u64;
@@ -236,6 +240,27 @@ impl IdeogramDit {
             }
         }
         Ok(params)
+    }
+
+    /// Export the trained LoRA in **ai-toolkit Ideogram-4 key format**, F16:
+    /// `diffusion_model.layers.{N}.{module}.lora_A.weight` (down, [rank,in]) +
+    /// `.lora_B.weight` (up, [out,rank]). Directly loadable by ai-toolkit /
+    /// serenitymojo ideogram4_generate_lora. (lora_a = lora_A, lora_b = lora_B.)
+    pub fn export_lora_aitoolkit(&self) -> Result<WMap> {
+        let mut out = WMap::with_capacity(self.loras.len() * 2);
+        for (key, lora) in &self.loras {
+            // key = "layers.{li}.{module}"  ->  "diffusion_model.layers.{li}.{module}"
+            let base = format!("diffusion_model.{key}");
+            out.insert(
+                format!("{base}.lora_A.weight"),
+                lora.lora_a.tensor()?.to_dtype(DType::F16)?,
+            );
+            out.insert(
+                format!("{base}.lora_B.weight"),
+                lora.lora_b.tensor()?.to_dtype(DType::F16)?,
+            );
+        }
+        Ok(out)
     }
 
     /// EmbedScalar sinusoid (sin-first, prescale 1e4, /(half-1)) + F64 trig reduction.
@@ -357,6 +382,7 @@ impl IdeogramDit {
                 self.loras.get(&format!("layers.{li}.feed_forward.w1")).cloned(),
                 self.loras.get(&format!("layers.{li}.feed_forward.w2")).cloned(),
                 self.loras.get(&format!("layers.{li}.feed_forward.w3")).cloned(),
+                self.loras.get(&format!("layers.{li}.adaln_modulation")).cloned(),
             ];
             // clone the resident layer handles (Arc bumps, no GPU copy) for the closure.
             let lw: WMap = self.layers[li].iter().map(|(k, v)| (k.clone(), v.clone())).collect();

@@ -167,5 +167,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     log::info!("Training complete: {} steps", args.steps);
+
+    // Save the LoRA in ai-toolkit Ideogram-4 key format (loadable by ai-toolkit /
+    // serenitymojo ideogram4_generate_lora).
+    let lora_out = dit.export_lora_aitoolkit()?;
+    let out_path = args.output_dir.join("ideogram4_lora.safetensors");
+    flame_core::serialization::save_file(&lora_out, &out_path)?;
+    log::info!(
+        "Saved LoRA ({} tensors, ai-toolkit keys) → {}",
+        lora_out.len(),
+        out_path.display()
+    );
     Ok(())
 }
