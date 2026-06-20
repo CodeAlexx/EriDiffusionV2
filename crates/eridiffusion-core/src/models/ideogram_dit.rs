@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
-use flame_core::{DType, FlameError, Result, Shape, Tensor};
+use flame_core::{parameter::Parameter, DType, FlameError, Result, Shape, Tensor};
+
+use crate::lora::LoRALinear;
 
 const EPS5: f32 = 1.0e-5;
 const EPS6: f32 = 1.0e-6;
@@ -65,6 +67,9 @@ pub struct IdeogramDit {
     num_heads: usize,
     head_dim: usize,
     hidden: usize,
+    /// LoRA adapters keyed by full weight name (e.g. `layers.0.attention.qkv`).
+    /// Empty = pure inference. B=0 at init → identity overlay.
+    loras: std::collections::HashMap<String, LoRALinear>,
 }
 
 impl IdeogramDit {
@@ -83,7 +88,43 @@ impl IdeogramDit {
             num_heads: 18,
             head_dim: 256,
             hidden: 4608,
+            loras: std::collections::HashMap::new(),
         })
+    }
+
+    /// Attach LoRA (B=0 → identity at init) to each block's linears, per the OT
+    /// `blocks` preset: qkv, o, feed_forward.w1/w2/w3. Returns the trainable params.
+    pub fn attach_block_loras(&mut self, rank: usize, alpha: f32) -> Result<Vec<Parameter>> {
+        let h = self.hidden;
+        // (suffix, in, out)
+        let targets: [(&str, usize, usize); 5] = [
+            ("attention.qkv", h, 3 * h),
+            ("attention.o", h, h),
+            ("feed_forward.w1", h, 12288),
+            ("feed_forward.w2", 12288, h),
+            ("feed_forward.w3", h, 12288),
+        ];
+        let mut params = Vec::new();
+        let mut seed = 0u64;
+        for li in 0..self.num_layers {
+            for (suf, inf, outf) in targets {
+                let key = format!("layers.{li}.{suf}");
+                let lora = LoRALinear::new(inf, outf, rank, alpha, self.device.clone(), seed)?;
+                seed += 1;
+                params.extend(lora.parameters());
+                self.loras.insert(key, lora);
+            }
+        }
+        Ok(params)
+    }
+
+    /// `lin` + optional LoRA delta for the linear identified by `key`.
+    fn lin_l(&self, x: &Tensor, w: &Tensor, b: Option<&Tensor>, key: &str) -> Result<Tensor> {
+        let mut out = lin(x, w, b)?;
+        if let Some(lora) = self.loras.get(key) {
+            out = out.add(&lora.forward_delta(x)?)?;
+        }
+        Ok(out)
     }
 
     fn load_layer(&self, li: usize) -> Result<WMap> {
@@ -114,7 +155,7 @@ impl IdeogramDit {
         let d = x.shape().dims().to_vec(); // [1,L,hidden]
         let (l, hidden) = (d[1], d[2]);
         let (nh, dh) = (self.num_heads, self.head_dim);
-        let qkv = lin(x, gw(lw, &format!("{p}qkv.weight"))?, None)?; // [1,L,3*hidden]
+        let qkv = self.lin_l(x, gw(lw, &format!("{p}qkv.weight"))?, None, &format!("{p}qkv"))?; // [1,L,3*hidden]
         let qkv5 = qkv.reshape(&[1, l, 3, nh, dh])?;
         let q = qkv5.narrow(2, 0, 1)?.reshape(&[1, l, nh, dh])?;
         let k = qkv5.narrow(2, 1, 1)?.reshape(&[1, l, nh, dh])?;
@@ -129,7 +170,7 @@ impl IdeogramDit {
         let v = v.permute(&[0, 2, 1, 3])?.to_dtype(DType::BF16)?;
         let attn = flame_core::attention::sdpa(&q, &k, &v, None)?; // [1,H,L,Dh]
         let merged = attn.permute(&[0, 2, 1, 3])?.reshape(&[1, l, hidden])?;
-        lin(&merged, gw(lw, &format!("{p}o.weight"))?, None)
+        self.lin_l(&merged, gw(lw, &format!("{p}o.weight"))?, None, &format!("{p}o"))
     }
 
     fn block(&self, x: &Tensor, lw: &WMap, p: &str, adaln: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -152,10 +193,10 @@ impl IdeogramDit {
 
         let fn1 = flame_core::norm::rms_norm(&x1, &[h], Some(gw(lw, &format!("{p}ffn_norm1.weight"))?), EPS5)?;
         let mlp_in = fn1.mul(&scale_mlp)?;
-        let gg = lin(&mlp_in, gw(lw, &format!("{p}feed_forward.w1.weight"))?, None)?;
-        let uu = lin(&mlp_in, gw(lw, &format!("{p}feed_forward.w3.weight"))?, None)?;
+        let gg = self.lin_l(&mlp_in, gw(lw, &format!("{p}feed_forward.w1.weight"))?, None, &format!("{p}feed_forward.w1"))?;
+        let uu = self.lin_l(&mlp_in, gw(lw, &format!("{p}feed_forward.w3.weight"))?, None, &format!("{p}feed_forward.w3"))?;
         let act = gg.silu()?.mul(&uu)?; // swiglu
-        let ff = lin(&act, gw(lw, &format!("{p}feed_forward.w2.weight"))?, None)?;
+        let ff = self.lin_l(&act, gw(lw, &format!("{p}feed_forward.w2.weight"))?, None, &format!("{p}feed_forward.w2"))?;
         let fn2 = flame_core::norm::rms_norm(&ff, &[h], Some(gw(lw, &format!("{p}ffn_norm2.weight"))?), EPS5)?;
         x1.add(&gate_mlp.mul(&fn2)?)
     }
@@ -219,6 +260,7 @@ impl IdeogramDit {
         cos: &Tensor,
         sin: &Tensor,
         mut dbg: Option<&mut WMap>,
+        max_layers: usize, // 0 = all 34; >0 truncates (cheap backward derisk)
     ) -> Result<Tensor> {
         let l = x_in.shape().dims()[1];
         let hidden = self.hidden;
@@ -265,7 +307,8 @@ impl IdeogramDit {
         }
 
         // 34 blocks, weights streamed per-layer (OT residency model).
-        for li in 0..self.num_layers {
+        let n_layers = if max_layers == 0 { self.num_layers } else { max_layers.min(self.num_layers) };
+        for li in 0..n_layers {
             let lw = self.load_layer(li)?;
             h = self.block(&h, &lw, &format!("layers.{li}."), &adaln, cos, sin)?;
             if let Some(d) = dbg.as_deref_mut() {

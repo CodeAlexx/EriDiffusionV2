@@ -123,7 +123,7 @@ fn run() -> anyhow::Result<bool> {
     let x_bf = packed.x.to_dtype(flame_core::DType::BF16)?;
     let llm_bf = packed.llm_full.to_dtype(flame_core::DType::BF16)?;
     let mut dbg = std::collections::HashMap::new();
-    let out = dit.forward(&x_bf, &llm_bf, model_t, &packed.indicator, &mrope_cos, &mrope_sin, Some(&mut dbg))?; // [1,seq,128] f32
+    let out = dit.forward(&x_bf, &llm_bf, model_t, &packed.indicator, &mrope_cos, &mrope_sin, Some(&mut dbg), 0)?; // [1,seq,128] f32
 
     // localize: compare DiT intermediates (input_proj → h_pre → block0 → block1).
     let mut interm = ParityHarness::load(INTERMEDIATES, device.clone())
