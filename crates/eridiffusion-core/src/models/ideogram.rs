@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
 use flame_core::{Result, Shape, Tensor};
+use half::bf16;
 
 // ── architecture constants (from Ideogram4Sampler.mojo) ──
 pub const NUM_LAYERS: usize = 34;
@@ -33,6 +34,59 @@ pub fn add_noise(clean: &Tensor, noise: &Tensor, t: f32) -> Result<Tensor> {
 /// Flow-match loss target: `target = noise - clean` (ai-toolkit get_loss_target).
 pub fn flow_target(noise: &Tensor, clean: &Tensor) -> Result<Tensor> {
     noise.sub(clean)
+}
+
+/// Ideogram-4 interleaved MRoPE (1:1 from `Ideogram4MRoPE.forward`).
+/// `position_ids`: [1, L, 3] F32 (t, h, w). Returns (cos, sin) [1, L, head_dim] F32.
+///
+/// Computed host-side because two numeric details dominate at the 65536 image
+/// positions: `inv_freq` is **bf16-rounded** (the real bf16 model's buffer, which
+/// `forward` upcasts to f32), and the trig needs an **F64 range reduction** (F32
+/// trig is wrong at pos ~ 65536). Per-index axis: t by default, H at d%3==1 &
+/// d<section[1]*3, W at d%3==2 & d<section[2]*3; `emb = cat(freqs, freqs)`.
+pub fn build_mrope(
+    position_ids: &Tensor,
+    head_dim: usize,
+    sections: [usize; 3],
+    theta: f32,
+    device: Arc<CudaDevice>,
+) -> Result<(Tensor, Tensor)> {
+    let pos = position_ids.to_vec_f32()?; // [L*3], rows (t, h, w)
+    let l = pos.len() / 3;
+    let half_dim = head_dim / 2;
+    let sec_h = sections[1] * 3;
+    let sec_w = sections[2] * 3;
+    let log_theta = (theta as f64).ln();
+    let two_pi = std::f64::consts::TAU;
+
+    let mut cos_v = vec![0f32; l * head_dim];
+    let mut sin_v = vec![0f32; l * head_dim];
+    for li in 0..l {
+        for dd in 0..head_dim {
+            let d = if dd < half_dim { dd } else { dd - half_dim }; // cat(freqs, freqs) undo
+            let axis = if d % 3 == 1 && d < sec_h {
+                1
+            } else if d % 3 == 2 && d < sec_w {
+                2
+            } else {
+                0
+            };
+            let pos_val = pos[li * 3 + axis];
+            // inv = base^(-d/half), bf16-rounded to match the real model's buffer.
+            let inv_f32 = ((-(d as f64) / half_dim as f64) * log_theta).exp() as f32;
+            let inv = bf16::from_f32(inv_f32).to_f32();
+            // F64 range reduction → accurate trig at large angle.
+            let angle = (pos_val * inv) as f64;
+            let k = (angle / two_pi + 0.5).floor();
+            let reduced = angle - k * two_pi;
+            let idx = li * head_dim + dd;
+            cos_v[idx] = reduced.cos() as f32;
+            sin_v[idx] = reduced.sin() as f32;
+        }
+    }
+    let cos = Tensor::from_vec(cos_v, Shape::from_dims(&[1, l, head_dim]), device.clone())?;
+    let sin = Tensor::from_vec(sin_v, Shape::from_dims(&[1, l, head_dim]), device)?;
+    Ok((cos, sin))
 }
 
 /// The four packed tensors `ideogram4_forward` consumes (the `predict_velocity`

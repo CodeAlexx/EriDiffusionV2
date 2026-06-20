@@ -14,6 +14,8 @@ use flame_core::parity::{ParityHarness, ParityTolerance};
 
 const FIXTURE: &str =
     "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/ideogram4_fx_predict.safetensors";
+const MROPE_FIXTURE: &str =
+    "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/ideogram4_fx_mrope.safetensors";
 const T_FLOW: f32 = 0.7;
 const GH: usize = 16;
 const GW: usize = 16;
@@ -76,6 +78,37 @@ fn run() -> anyhow::Result<bool> {
             if ok { "OK" } else { "FAIL" }
         );
     }
+
+    // stage 3: interleaved MRoPE vs its own torch fixture.
+    let (mrope_cos, mrope_sin) = ideogram::build_mrope(
+        &packed.position_ids,
+        ideogram::HEAD_DIM,
+        ideogram::MROPE_SECTION,
+        ideogram::MROPE_THETA,
+        device.clone(),
+    )?;
+    let mut mrope = ParityHarness::load(MROPE_FIXTURE, device.clone())
+        .map_err(|e| anyhow::anyhow!("ParityHarness::load mrope: {e}"))?
+        .with_tolerance(ParityTolerance {
+            min_cos: MIN_COS,
+            max_abs_ratio: 1.0,
+        });
+    for (name, ours) in [("mrope_cos", &mrope_cos), ("mrope_sin", &mrope_sin)] {
+        let r = mrope
+            .compare(name, ours)
+            .map_err(|e| anyhow::anyhow!("compare {name}: {e}"))?;
+        let ok = r.cos >= MIN_COS && r.note.is_none();
+        all_ok &= ok;
+        println!(
+            "{:<18} {:>10.6} {:>12.4e} {:>12.4e}  {}",
+            name,
+            r.cos,
+            r.max_abs,
+            r.mean_abs,
+            if ok { "OK" } else { "FAIL" }
+        );
+    }
+
     Ok(all_ok)
 }
 
