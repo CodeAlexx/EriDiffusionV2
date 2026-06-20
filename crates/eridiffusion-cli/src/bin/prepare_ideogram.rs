@@ -110,6 +110,11 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("[3/3] {} pairs → encoding", pairs.len());
 
+    // Caching is pure inference — disable autograd so the VAE + Qwen3-VL encode
+    // ops don't accumulate on the global tape (saved activations across images
+    // OOM'd after ~14 without this; pool-clear alone didn't help). Mirrors prepare_klein.
+    let _no_grad = flame_core::autograd::AutogradContext::no_grad();
+
     let res = args.resolution;
     let mut written = 0usize;
     for (img_path, cap_path) in &pairs {
@@ -149,6 +154,12 @@ fn main() -> anyhow::Result<()> {
         let stem = img_path.file_stem().unwrap().to_string_lossy();
         save_file(&tensors, &args.output_dir.join(format!("{stem}.safetensors")))?;
         written += 1;
+        // Free per-image GPU tensors + return the flame mempool's cached blocks
+        // to the driver. Without this the Qwen3-VL encode activations accumulate
+        // in the infinite-caching pool and OOM after ~15 images (measured).
+        drop(tensors);
+        drop(img_t);
+        flame_core::cuda_alloc_pool::clear_pool_cache();
         log::info!("  cached {stem} (L={l})");
     }
     log::info!("Done: wrote {written}");
