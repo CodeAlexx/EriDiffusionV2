@@ -6,6 +6,7 @@ pub mod anima;
 pub mod chroma;
 pub mod ernie;
 pub mod flux;
+pub mod ideogram;
 pub mod klein;
 pub mod l2p;
 pub mod ltx2;
