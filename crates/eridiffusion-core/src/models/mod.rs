@@ -7,6 +7,7 @@ pub mod chroma;
 pub mod ernie;
 pub mod flux;
 pub mod ideogram;
+pub mod ideogram_dit;
 pub mod klein;
 pub mod l2p;
 pub mod ltx2;
