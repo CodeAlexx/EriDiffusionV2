@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
+use flame_core::autograd::AutogradContext;
 use flame_core::{parameter::Parameter, DType, FlameError, Result, Shape, Tensor};
 
 use crate::lora::LoRALinear;
@@ -59,9 +60,111 @@ fn lin(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
     Ok(out)
 }
 
+/// `lin` + optional LoRA delta (the delta connects the autograd graph to A/B).
+fn lin_lora(x: &Tensor, w: &Tensor, b: Option<&Tensor>, lora: Option<&LoRALinear>) -> Result<Tensor> {
+    let mut out = lin(x, w, b)?;
+    if let Some(l) = lora {
+        out = out.add(&l.forward_delta(x)?)?;
+    }
+    Ok(out)
+}
+
+/// Half-split RoPE: `roped = x*cos + rotate_half(x)*sin`. x [1,L,H,Dh] bf16.
+fn apply_rope_owned(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let d = x.shape().dims().to_vec();
+    let (l, dh) = (d[1], d[3]);
+    let half = dh / 2;
+    let cos4 = cos.to_dtype(DType::BF16)?.reshape(&[1, l, 1, dh])?;
+    let sin4 = sin.to_dtype(DType::BF16)?.reshape(&[1, l, 1, dh])?;
+    let x1 = x.narrow(3, 0, half)?;
+    let x2 = x.narrow(3, half, half)?;
+    let rot = Tensor::cat(&[&x2.mul_scalar(-1.0)?, &x1], 3)?;
+    x.mul(&cos4)?.add(&rot.mul(&sin4)?)
+}
+
+/// Per-block LoRA adapters in target order: [qkv, o, w1, w2, w3].
+type BlockLoras = [Option<LoRALinear>; 5];
+
+/// Standalone fused-QKV attention (owned weights + LoRA), for the checkpoint closure.
+#[allow(clippy::too_many_arguments)]
+fn attention_standalone(
+    x: &Tensor,
+    lw: &WMap,
+    p: &str,
+    qkv_lora: Option<&LoRALinear>,
+    o_lora: Option<&LoRALinear>,
+    cos: &Tensor,
+    sin: &Tensor,
+    nh: usize,
+    dh: usize,
+) -> Result<Tensor> {
+    let d = x.shape().dims().to_vec();
+    let (l, hidden) = (d[1], d[2]);
+    let qkv = lin_lora(x, gw(lw, &format!("{p}qkv.weight"))?, None, qkv_lora)?;
+    let qkv5 = qkv.reshape(&[1, l, 3, nh, dh])?;
+    let q = qkv5.narrow(2, 0, 1)?.reshape(&[1, l, nh, dh])?;
+    let k = qkv5.narrow(2, 1, 1)?.reshape(&[1, l, nh, dh])?;
+    let v = qkv5.narrow(2, 2, 1)?.reshape(&[1, l, nh, dh])?;
+    let q = flame_core::norm::rms_norm(&q, &[dh], Some(gw(lw, &format!("{p}norm_q.weight"))?), EPS5)?;
+    let k = flame_core::norm::rms_norm(&k, &[dh], Some(gw(lw, &format!("{p}norm_k.weight"))?), EPS5)?;
+    let q = apply_rope_owned(&q, cos, sin)?;
+    let k = apply_rope_owned(&k, cos, sin)?;
+    let q = q.permute(&[0, 2, 1, 3])?.to_dtype(DType::BF16)?;
+    let k = k.permute(&[0, 2, 1, 3])?.to_dtype(DType::BF16)?;
+    let v = v.permute(&[0, 2, 1, 3])?.to_dtype(DType::BF16)?;
+    let attn = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    let merged = attn.permute(&[0, 2, 1, 3])?.reshape(&[1, l, hidden])?;
+    lin_lora(&merged, gw(lw, &format!("{p}o.weight"))?, None, o_lora)
+}
+
+/// Standalone transformer block (owned weights + LoRA) — the checkpoint closure body.
+#[allow(clippy::too_many_arguments)]
+fn block_standalone(
+    x: Tensor,
+    lw: WMap,
+    loras: BlockLoras,
+    adaln: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    nh: usize,
+    dh: usize,
+    hidden: usize,
+    li: usize,
+) -> Result<Tensor> {
+    let h = hidden;
+    let p = format!("layers.{li}.");
+    let m = lin(
+        &adaln,
+        gw(&lw, &format!("{p}adaln_modulation.weight"))?,
+        Some(gw(&lw, &format!("{p}adaln_modulation.bias"))?),
+    )?;
+    let scale_msa = m.narrow(2, 0, h)?.affine(1.0, 1.0)?;
+    let gate_msa = m.narrow(2, h, h)?.tanh()?;
+    let scale_mlp = m.narrow(2, 2 * h, h)?.affine(1.0, 1.0)?;
+    let gate_mlp = m.narrow(2, 3 * h, h)?.tanh()?;
+
+    let an1 = flame_core::norm::rms_norm(&x, &[h], Some(gw(&lw, &format!("{p}attention_norm1.weight"))?), EPS5)?;
+    let attn_in = an1.mul(&scale_msa)?;
+    let attn_out = attention_standalone(
+        &attn_in, &lw, &format!("{p}attention."),
+        loras[0].as_ref(), loras[1].as_ref(), &cos, &sin, nh, dh,
+    )?;
+    let an2 = flame_core::norm::rms_norm(&attn_out, &[h], Some(gw(&lw, &format!("{p}attention_norm2.weight"))?), EPS5)?;
+    let x1 = x.add(&gate_msa.mul(&an2)?)?;
+
+    let fn1 = flame_core::norm::rms_norm(&x1, &[h], Some(gw(&lw, &format!("{p}ffn_norm1.weight"))?), EPS5)?;
+    let mlp_in = fn1.mul(&scale_mlp)?;
+    let gg = lin_lora(&mlp_in, gw(&lw, &format!("{p}feed_forward.w1.weight"))?, None, loras[2].as_ref())?;
+    let uu = lin_lora(&mlp_in, gw(&lw, &format!("{p}feed_forward.w3.weight"))?, None, loras[4].as_ref())?;
+    let act = gg.silu()?.mul(&uu)?;
+    let ff = lin_lora(&act, gw(&lw, &format!("{p}feed_forward.w2.weight"))?, None, loras[3].as_ref())?;
+    let fn2 = flame_core::norm::rms_norm(&ff, &[h], Some(gw(&lw, &format!("{p}ffn_norm2.weight"))?), EPS5)?;
+    x1.add(&gate_mlp.mul(&fn2)?)
+}
+
 pub struct IdeogramDit {
-    path: String,
-    cond: WMap, // non-layer (conditioning + final) weights, bf16, loaded once
+    cond: WMap,        // non-layer (conditioning + final) weights, bf16, resident
+    layers: Vec<WMap>, // per-layer weights, bf16, RESIDENT (loaded once, never re-read)
     device: Arc<CudaDevice>,
     num_layers: usize,
     num_heads: usize,
@@ -73,18 +176,35 @@ pub struct IdeogramDit {
 }
 
 impl IdeogramDit {
-    /// Load only the conditioning/final weights (small); layers stream per-block.
+    /// Load the whole transformer ONCE (fp8 → bf16) and keep it resident: `cond`
+    /// (conditioning/final) + `layers[li]` (per-block). The per-step forward
+    /// clones the resident Arc-backed handles into the checkpoint closure — no
+    /// per-step disk read, no weight copy.
     pub fn load(path: &str, device: Arc<CudaDevice>) -> Result<Self> {
-        let raw = flame_core::serialization::load_file_filtered(
-            std::path::Path::new(path),
-            &device,
-            |k: &str| !k.starts_with("layers."),
-        )?;
+        let num_layers = 34;
+        let raw = flame_core::serialization::load_file(std::path::Path::new(path), &device)?;
+        let all = cast_map(raw)?;
+        let mut cond = WMap::new();
+        let mut layers: Vec<WMap> = (0..num_layers).map(|_| WMap::new()).collect();
+        for (k, t) in all {
+            if let Some(rest) = k.strip_prefix("layers.") {
+                // rest = "<idx>.<suffix>"
+                if let Some((idx, _)) = rest.split_once('.') {
+                    if let Ok(li) = idx.parse::<usize>() {
+                        if li < num_layers {
+                            layers[li].insert(k, t);
+                            continue;
+                        }
+                    }
+                }
+            }
+            cond.insert(k, t);
+        }
         Ok(Self {
-            path: path.to_string(),
-            cond: cast_map(raw)?,
+            cond,
+            layers,
             device,
-            num_layers: 34,
+            num_layers,
             num_heads: 18,
             head_dim: 256,
             hidden: 4608,
@@ -116,89 +236,6 @@ impl IdeogramDit {
             }
         }
         Ok(params)
-    }
-
-    /// `lin` + optional LoRA delta for the linear identified by `key`.
-    fn lin_l(&self, x: &Tensor, w: &Tensor, b: Option<&Tensor>, key: &str) -> Result<Tensor> {
-        let mut out = lin(x, w, b)?;
-        if let Some(lora) = self.loras.get(key) {
-            out = out.add(&lora.forward_delta(x)?)?;
-        }
-        Ok(out)
-    }
-
-    fn load_layer(&self, li: usize) -> Result<WMap> {
-        let pfx = format!("layers.{li}.");
-        let raw = flame_core::serialization::load_file_filtered(
-            std::path::Path::new(&self.path),
-            &self.device,
-            move |k: &str| k.starts_with(pfx.as_str()),
-        )?;
-        cast_map(raw)
-    }
-
-    /// Half-split RoPE: `roped = x*cos + rotate_half(x)*sin`.
-    fn apply_rope(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let d = x.shape().dims().to_vec(); // [1,L,H,Dh]
-        let (l, dh) = (d[1], d[3]);
-        let half = dh / 2;
-        let cos4 = cos.to_dtype(DType::BF16)?.reshape(&[1, l, 1, dh])?;
-        let sin4 = sin.to_dtype(DType::BF16)?.reshape(&[1, l, 1, dh])?;
-        let x1 = x.narrow(3, 0, half)?;
-        let x2 = x.narrow(3, half, half)?;
-        let rot = Tensor::cat(&[&x2.mul_scalar(-1.0)?, &x1], 3)?; // [-x2, x1]
-        x.mul(&cos4)?.add(&rot.mul(&sin4)?)
-    }
-
-    /// Fused-QKV attention. `lw` = this layer's weights, `p` = `layers.N.attention.`
-    fn attention(&self, x: &Tensor, lw: &WMap, p: &str, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let d = x.shape().dims().to_vec(); // [1,L,hidden]
-        let (l, hidden) = (d[1], d[2]);
-        let (nh, dh) = (self.num_heads, self.head_dim);
-        let qkv = self.lin_l(x, gw(lw, &format!("{p}qkv.weight"))?, None, &format!("{p}qkv"))?; // [1,L,3*hidden]
-        let qkv5 = qkv.reshape(&[1, l, 3, nh, dh])?;
-        let q = qkv5.narrow(2, 0, 1)?.reshape(&[1, l, nh, dh])?;
-        let k = qkv5.narrow(2, 1, 1)?.reshape(&[1, l, nh, dh])?;
-        let v = qkv5.narrow(2, 2, 1)?.reshape(&[1, l, nh, dh])?;
-        let q = flame_core::norm::rms_norm(&q, &[dh], Some(gw(lw, &format!("{p}norm_q.weight"))?), EPS5)?;
-        let k = flame_core::norm::rms_norm(&k, &[dh], Some(gw(lw, &format!("{p}norm_k.weight"))?), EPS5)?;
-        let q = self.apply_rope(&q, cos, sin)?;
-        let k = self.apply_rope(&k, cos, sin)?;
-        // [1,L,H,Dh] -> [1,H,L,Dh] (sdpa layout), bf16.
-        let q = q.permute(&[0, 2, 1, 3])?.to_dtype(DType::BF16)?;
-        let k = k.permute(&[0, 2, 1, 3])?.to_dtype(DType::BF16)?;
-        let v = v.permute(&[0, 2, 1, 3])?.to_dtype(DType::BF16)?;
-        let attn = flame_core::attention::sdpa(&q, &k, &v, None)?; // [1,H,L,Dh]
-        let merged = attn.permute(&[0, 2, 1, 3])?.reshape(&[1, l, hidden])?;
-        self.lin_l(&merged, gw(lw, &format!("{p}o.weight"))?, None, &format!("{p}o"))
-    }
-
-    fn block(&self, x: &Tensor, lw: &WMap, p: &str, adaln: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let h = self.hidden;
-        let m = lin(
-            adaln,
-            gw(lw, &format!("{p}adaln_modulation.weight"))?,
-            Some(gw(lw, &format!("{p}adaln_modulation.bias"))?),
-        )?; // [1,1,4h]
-        let scale_msa = m.narrow(2, 0, h)?.affine(1.0, 1.0)?; // +1
-        let gate_msa = m.narrow(2, h, h)?.tanh()?;
-        let scale_mlp = m.narrow(2, 2 * h, h)?.affine(1.0, 1.0)?;
-        let gate_mlp = m.narrow(2, 3 * h, h)?.tanh()?;
-
-        let an1 = flame_core::norm::rms_norm(x, &[h], Some(gw(lw, &format!("{p}attention_norm1.weight"))?), EPS5)?;
-        let attn_in = an1.mul(&scale_msa)?;
-        let attn_out = self.attention(&attn_in, lw, &format!("{p}attention."), cos, sin)?;
-        let an2 = flame_core::norm::rms_norm(&attn_out, &[h], Some(gw(lw, &format!("{p}attention_norm2.weight"))?), EPS5)?;
-        let x1 = x.add(&gate_msa.mul(&an2)?)?;
-
-        let fn1 = flame_core::norm::rms_norm(&x1, &[h], Some(gw(lw, &format!("{p}ffn_norm1.weight"))?), EPS5)?;
-        let mlp_in = fn1.mul(&scale_mlp)?;
-        let gg = self.lin_l(&mlp_in, gw(lw, &format!("{p}feed_forward.w1.weight"))?, None, &format!("{p}feed_forward.w1"))?;
-        let uu = self.lin_l(&mlp_in, gw(lw, &format!("{p}feed_forward.w3.weight"))?, None, &format!("{p}feed_forward.w3"))?;
-        let act = gg.silu()?.mul(&uu)?; // swiglu
-        let ff = self.lin_l(&act, gw(lw, &format!("{p}feed_forward.w2.weight"))?, None, &format!("{p}feed_forward.w2"))?;
-        let fn2 = flame_core::norm::rms_norm(&ff, &[h], Some(gw(lw, &format!("{p}ffn_norm2.weight"))?), EPS5)?;
-        x1.add(&gate_mlp.mul(&fn2)?)
     }
 
     /// EmbedScalar sinusoid (sin-first, prescale 1e4, /(half-1)) + F64 trig reduction.
@@ -306,11 +343,34 @@ impl IdeogramDit {
             d.insert("h_pre".into(), h.to_dtype(DType::F32)?);
         }
 
-        // 34 blocks, weights streamed per-layer (OT residency model).
+        // 34 blocks, each wrapped in AutogradContext::checkpoint (klein's pattern):
+        // weights are RESIDENT (loaded once); the closure clones the layer's
+        // Arc-backed handles (cheap, shared GPU buffer — NO disk, NO copy) and
+        // recomputes the block in backward, so (a) only block-boundary activations
+        // are retained (full retention OOMs 24GB) and (b) forward_delta runs inside
+        // the checkpoint, connecting LoRA A/B to backward_v2.
         let n_layers = if max_layers == 0 { self.num_layers } else { max_layers.min(self.num_layers) };
         for li in 0..n_layers {
-            let lw = self.load_layer(li)?;
-            h = self.block(&h, &lw, &format!("layers.{li}."), &adaln, cos, sin)?;
+            let loras: BlockLoras = [
+                self.loras.get(&format!("layers.{li}.attention.qkv")).cloned(),
+                self.loras.get(&format!("layers.{li}.attention.o")).cloned(),
+                self.loras.get(&format!("layers.{li}.feed_forward.w1")).cloned(),
+                self.loras.get(&format!("layers.{li}.feed_forward.w2")).cloned(),
+                self.loras.get(&format!("layers.{li}.feed_forward.w3")).cloned(),
+            ];
+            // clone the resident layer handles (Arc bumps, no GPU copy) for the closure.
+            let lw: WMap = self.layers[li].iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let adaln_c = adaln.clone();
+            let cos_c = cos.clone();
+            let sin_c = sin.clone();
+            let (nh, dh, hid) = (self.num_heads, self.head_dim, self.hidden);
+            let h_in = h.clone();
+            h = AutogradContext::checkpoint(&[h.clone()], move || {
+                block_standalone(
+                    h_in.clone(), lw.clone(), loras.clone(), adaln_c.clone(),
+                    cos_c.clone(), sin_c.clone(), nh, dh, hid, li,
+                )
+            })?;
             if let Some(d) = dbg.as_deref_mut() {
                 match li {
                     0 => { d.insert("block0_out".into(), h.to_dtype(DType::F32)?); }

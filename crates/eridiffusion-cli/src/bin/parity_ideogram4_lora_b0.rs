@@ -90,9 +90,14 @@ fn run() -> anyhow::Result<bool> {
     // autograd-leaf wiring, mirrored here once that's settled.
     let back_diag = (|| -> anyhow::Result<String> {
         let out2 = dit.forward(&x_bf, &llm_bf, model_t, &packed.indicator, &cos, &sin, None, 2)?;
+        println!("    [probe] out2.requires_grad = {}", out2.requires_grad());
         let vel2 = velocity(&out2, nt)?;
+        println!("    [probe] vel2.requires_grad = {}", vel2.requires_grad());
         let tgt = target.to_dtype(DType::F32)?;
-        let loss = vel2.sub(&tgt)?.square()?.mean_all()?;
+        let diff = vel2.sub(&tgt)?;
+        println!("    [probe] diff.requires_grad = {}", diff.requires_grad());
+        let loss = diff.square()?.mean()?; // mean() preserves grad; mean_all() detaches (klein uses mean())
+        println!("    [probe] loss.requires_grad = {}", loss.requires_grad());
         let loss_val = loss.to_vec_f32()?[0];
         let grads = AutogradContext::backward_v2(&loss)?;
         accumulate_parameter_grads(&params, &grads)?;
